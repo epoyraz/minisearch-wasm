@@ -47,6 +47,41 @@ fn mini_search() -> MiniSearch {
 }
 
 #[test]
+fn binary_snapshot_round_trips() {
+    let search = mini_search();
+    let bytes = search.to_bytes().unwrap();
+    let reloaded = MiniSearch::from_bytes(&bytes).unwrap();
+
+    assert_eq!(reloaded.document_count(), search.document_count());
+    assert_eq!(reloaded.term_count(), search.term_count());
+
+    for query in ["zen art motorcycle", "ishmael", "neuro", "zaen", "archery"] {
+        let mut options = SearchOptions::default();
+        options.prefix = true;
+        options.fuzzy = Some(FuzzySetting::Distance(0.3));
+        assert_eq!(
+            reloaded.search(query, options.clone()),
+            search.search(query, options),
+            "query={query}"
+        );
+    }
+}
+
+#[test]
+fn binary_snapshot_round_trips_after_discard() {
+    let mut search = mini_search();
+    search.discard(&serde_json::json!(2)).unwrap();
+    let bytes = search.to_bytes().unwrap();
+    let reloaded = MiniSearch::from_bytes(&bytes).unwrap();
+
+    let query = "zen art motorcycle";
+    assert_eq!(
+        reloaded.search(query, SearchOptions::default()),
+        search.search(query, SearchOptions::default()),
+    );
+}
+
+#[test]
 fn adds_documents_and_returns_stored_fields() {
     let search = mini_search();
     let results = search.search("zen art motorcycle", SearchOptions::default());

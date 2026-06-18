@@ -237,58 +237,8 @@ pub struct MiniSearch {
     dirt_count: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct BinarySnapshot {
-    version: u32,
-    options: SnapshotMiniSearchOptions,
-    index: SearchableMap<FieldTermData>,
-    document_count: usize,
-    next_id: ShortId,
-    document_ids: HashMap<ShortId, SnapshotValue>,
-    id_to_short_id: HashMap<String, ShortId>,
-    field_ids: BTreeMap<String, FieldId>,
-    field_length: HashMap<ShortId, Vec<usize>>,
-    average_field_length: Vec<f64>,
-    stored_fields: HashMap<ShortId, BTreeMap<String, SnapshotValue>>,
-    dirt_count: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct SnapshotMiniSearchOptions {
-    fields: Vec<String>,
-    id_field: String,
-    store_fields: Vec<String>,
-    tokenizer: TokenizerMode,
-    search_options: SnapshotSearchOptions,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct SnapshotSearchOptions {
-    fields: Option<Vec<String>>,
-    boost: BTreeMap<String, f64>,
-    weights: Weights,
-    prefix: bool,
-    fuzzy: Option<SnapshotFuzzySetting>,
-    max_fuzzy: usize,
-    combine_with: CombineWith,
-    bm25: Bm25Params,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-enum SnapshotFuzzySetting {
-    Enabled(bool),
-    Distance(f64),
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-enum SnapshotValue {
-    Null,
-    Bool(bool),
-    Number(String),
-    String(String),
-    Array(Vec<SnapshotValue>),
-    Object(BTreeMap<String, SnapshotValue>),
-}
+/// Binary snapshot format version. Bump when the layout in `to_bytes` changes.
+const SNAPSHOT_VERSION: u64 = 2;
 
 impl MiniSearch {
     pub fn new(options: MiniSearchOptions) -> Self {
@@ -554,6 +504,20 @@ impl MiniSearch {
         self.run_search_packed(query, &options)
     }
 
+    /// Diagnostic: run the compact query with prefix/fuzzy overridden and return
+    /// only the hit count. Used to profile where search time goes (exact vs
+    /// prefix vs fuzzy expansion). Not part of the public engine contract.
+    pub fn search_count_opts(&self, query: &str, prefix: bool, fuzzy: bool) -> usize {
+        let mut options = self.options.search_options.clone();
+        options.prefix = prefix;
+        options.fuzzy = if fuzzy {
+            Some(FuzzySetting::Distance(0.2))
+        } else {
+            None
+        };
+        self.execute_query_compact(query, &options).len()
+    }
+
     fn run_search_packed(&self, query: &str, options: &SearchOptions) -> PackedSearchResults {
         let raw_results = self.execute_query_compact(query, options);
         let mut results: Vec<(ShortId, f64, Vec<String>)> = raw_results
@@ -597,15 +561,217 @@ impl MiniSearch {
         self.index.len()
     }
 
+    /// Compact, compression-friendly binary snapshot. Integers are LEB128
+    /// varints; posting doc-ids are sorted and delta-encoded; terms are
+    /// front-coded against the previous (sorted) term. The reverse id map is not
+    /// stored — it is rebuilt on load. This keeps the byte stream low-entropy so
+    /// brotli/gzip shrink it well (much smaller on the wire than raw `u32`s).
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        bincode::serialize(&BinarySnapshot::from(self)).map_err(|err| err.to_string())
+        let mut buf = Vec::new();
+        write_uvarint(&mut buf, SNAPSHOT_VERSION);
+
+        // Options as a small JSON blob (handles the untagged fuzzy enum cleanly).
+        let options_json = serde_json::to_string(&self.options).map_err(|e| e.to_string())?;
+        write_str(&mut buf, &options_json);
+
+        write_uvarint(&mut buf, self.document_count as u64);
+        write_uvarint(&mut buf, self.next_id as u64);
+        write_uvarint(&mut buf, self.dirt_count as u64);
+
+        // field_ids
+        write_uvarint(&mut buf, self.field_ids.len() as u64);
+        for (name, id) in &self.field_ids {
+            write_str(&mut buf, name);
+            write_uvarint(&mut buf, *id as u64);
+        }
+
+        // average_field_length
+        write_uvarint(&mut buf, self.average_field_length.len() as u64);
+        for value in &self.average_field_length {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+
+        // document_ids, sorted by short id with delta-encoded keys
+        let mut documents: Vec<(&ShortId, &Value)> = self.document_ids.iter().collect();
+        documents.sort_by_key(|(short_id, _)| **short_id);
+        write_uvarint(&mut buf, documents.len() as u64);
+        let mut previous = 0u64;
+        for (short_id, value) in documents {
+            write_uvarint(&mut buf, *short_id as u64 - previous);
+            previous = *short_id as u64;
+            write_value(&mut buf, value);
+        }
+
+        // field_length, sorted by short id with delta-encoded keys
+        let mut lengths: Vec<(&ShortId, &Vec<usize>)> = self.field_length.iter().collect();
+        lengths.sort_by_key(|(short_id, _)| **short_id);
+        write_uvarint(&mut buf, lengths.len() as u64);
+        previous = 0;
+        for (short_id, field_lengths) in lengths {
+            write_uvarint(&mut buf, *short_id as u64 - previous);
+            previous = *short_id as u64;
+            write_uvarint(&mut buf, field_lengths.len() as u64);
+            for length in field_lengths {
+                write_uvarint(&mut buf, *length as u64);
+            }
+        }
+
+        // stored_fields, sorted by short id
+        let mut stored: Vec<(&ShortId, &BTreeMap<String, Value>)> =
+            self.stored_fields.iter().collect();
+        stored.sort_by_key(|(short_id, _)| **short_id);
+        write_uvarint(&mut buf, stored.len() as u64);
+        for (short_id, fields) in stored {
+            write_uvarint(&mut buf, *short_id as u64);
+            write_uvarint(&mut buf, fields.len() as u64);
+            for (name, value) in fields {
+                write_str(&mut buf, name);
+                write_value(&mut buf, value);
+            }
+        }
+
+        // index: front-coded sorted terms; postings as delta-varint doc-ids.
+        let entries = self.index.sorted_entries();
+        write_uvarint(&mut buf, entries.len() as u64);
+        let mut previous_term = String::new();
+        for (term, field_term_data) in &entries {
+            let shared = shared_prefix_bytes(&previous_term, term);
+            write_uvarint(&mut buf, shared as u64);
+            write_str(&mut buf, &term[shared..]);
+
+            let mut fields: Vec<(&FieldId, &HashMap<ShortId, u32>)> =
+                field_term_data.iter().collect();
+            fields.sort_by_key(|(field_id, _)| **field_id);
+            write_uvarint(&mut buf, fields.len() as u64);
+            for (field_id, freqs) in fields {
+                write_uvarint(&mut buf, *field_id as u64);
+                let mut postings: Vec<(&ShortId, &u32)> = freqs.iter().collect();
+                postings.sort_by_key(|(doc_id, _)| **doc_id);
+                write_uvarint(&mut buf, postings.len() as u64);
+                let mut previous_doc = 0u64;
+                for (doc_id, freq) in postings {
+                    write_uvarint(&mut buf, *doc_id as u64 - previous_doc);
+                    previous_doc = *doc_id as u64;
+                    write_uvarint(&mut buf, *freq as u64);
+                }
+            }
+            previous_term = (*term).clone();
+        }
+
+        Ok(buf)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let snapshot: BinarySnapshot =
-            bincode::deserialize(bytes).map_err(|err| err.to_string())?;
+        let mut pos = 0usize;
+        let version = read_uvarint(bytes, &mut pos)?;
+        if version != SNAPSHOT_VERSION {
+            return Err(format!(
+                "unsupported minisearch-rust binary snapshot version {version}"
+            ));
+        }
 
-        snapshot.try_into()
+        let options: MiniSearchOptions =
+            serde_json::from_str(&read_str(bytes, &mut pos)?).map_err(|e| e.to_string())?;
+
+        let document_count = read_uvarint(bytes, &mut pos)? as usize;
+        let next_id = read_uvarint(bytes, &mut pos)? as ShortId;
+        let dirt_count = read_uvarint(bytes, &mut pos)? as usize;
+
+        let field_id_count = read_uvarint(bytes, &mut pos)? as usize;
+        let mut field_ids = BTreeMap::new();
+        for _ in 0..field_id_count {
+            let name = read_str(bytes, &mut pos)?;
+            let id = read_uvarint(bytes, &mut pos)? as FieldId;
+            field_ids.insert(name, id);
+        }
+
+        let avg_count = read_uvarint(bytes, &mut pos)? as usize;
+        let mut average_field_length = Vec::with_capacity(avg_count);
+        for _ in 0..avg_count {
+            average_field_length.push(read_f64(bytes, &mut pos)?);
+        }
+
+        let document_count_entries = read_uvarint(bytes, &mut pos)? as usize;
+        let mut document_ids = HashMap::with_capacity(document_count_entries);
+        let mut id_to_short_id = HashMap::with_capacity(document_count_entries);
+        let mut previous = 0u64;
+        for _ in 0..document_count_entries {
+            previous += read_uvarint(bytes, &mut pos)?;
+            let short_id = previous as ShortId;
+            let value = read_value(bytes, &mut pos)?;
+            id_to_short_id.insert(id_key(&value)?, short_id);
+            document_ids.insert(short_id, value);
+        }
+
+        let field_length_entries = read_uvarint(bytes, &mut pos)? as usize;
+        let mut field_length = HashMap::with_capacity(field_length_entries);
+        previous = 0;
+        for _ in 0..field_length_entries {
+            previous += read_uvarint(bytes, &mut pos)?;
+            let short_id = previous as ShortId;
+            let count = read_uvarint(bytes, &mut pos)? as usize;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(read_uvarint(bytes, &mut pos)? as usize);
+            }
+            field_length.insert(short_id, values);
+        }
+
+        let stored_entries = read_uvarint(bytes, &mut pos)? as usize;
+        let mut stored_fields = HashMap::with_capacity(stored_entries);
+        for _ in 0..stored_entries {
+            let short_id = read_uvarint(bytes, &mut pos)? as ShortId;
+            let count = read_uvarint(bytes, &mut pos)? as usize;
+            let mut fields = BTreeMap::new();
+            for _ in 0..count {
+                let name = read_str(bytes, &mut pos)?;
+                fields.insert(name, read_value(bytes, &mut pos)?);
+            }
+            stored_fields.insert(short_id, fields);
+        }
+
+        let term_count = read_uvarint(bytes, &mut pos)? as usize;
+        let mut index = SearchableMap::new();
+        let mut previous_term = String::new();
+        for _ in 0..term_count {
+            let shared = read_uvarint(bytes, &mut pos)? as usize;
+            let suffix = read_str(bytes, &mut pos)?;
+            let mut term = String::with_capacity(shared + suffix.len());
+            term.push_str(&previous_term[..shared]);
+            term.push_str(&suffix);
+
+            let field_count = read_uvarint(bytes, &mut pos)? as usize;
+            let mut field_term_data: FieldTermData = HashMap::with_capacity(field_count);
+            for _ in 0..field_count {
+                let field_id = read_uvarint(bytes, &mut pos)? as FieldId;
+                let posting_count = read_uvarint(bytes, &mut pos)? as usize;
+                let mut freqs = HashMap::with_capacity(posting_count);
+                let mut previous_doc = 0u64;
+                for _ in 0..posting_count {
+                    previous_doc += read_uvarint(bytes, &mut pos)?;
+                    let freq = read_uvarint(bytes, &mut pos)? as u32;
+                    freqs.insert(previous_doc as ShortId, freq);
+                }
+                field_term_data.insert(field_id, freqs);
+            }
+
+            index.set(&term, field_term_data);
+            previous_term = term;
+        }
+
+        Ok(Self {
+            options,
+            index,
+            document_count,
+            next_id,
+            document_ids,
+            id_to_short_id,
+            field_ids,
+            field_length,
+            average_field_length,
+            stored_fields,
+            dirt_count,
+        })
     }
 
     fn execute_query(&self, query: &str, options: &SearchOptions) -> RawResult {
@@ -1074,202 +1240,140 @@ impl MiniSearch {
     }
 }
 
-impl From<&MiniSearch> for BinarySnapshot {
-    fn from(index: &MiniSearch) -> Self {
-        Self {
-            version: 1,
-            options: SnapshotMiniSearchOptions::from(&index.options),
-            index: index.index.clone(),
-            document_count: index.document_count,
-            next_id: index.next_id,
-            document_ids: index
-                .document_ids
-                .iter()
-                .map(|(short_id, document_id)| (*short_id, SnapshotValue::from(document_id)))
-                .collect(),
-            id_to_short_id: index.id_to_short_id.clone(),
-            field_ids: index.field_ids.clone(),
-            field_length: index.field_length.clone(),
-            average_field_length: index.average_field_length.clone(),
-            stored_fields: index
-                .stored_fields
-                .iter()
-                .map(|(short_id, fields)| {
-                    (
-                        *short_id,
-                        fields
-                            .iter()
-                            .map(|(field, value)| (field.clone(), SnapshotValue::from(value)))
-                            .collect(),
-                    )
-                })
-                .collect(),
-            dirt_count: index.dirt_count,
+// ---- compact snapshot encoding helpers -----------------------------------
+
+/// Byte length of the shared leading prefix (at a char boundary) of two terms,
+/// for front-coding the sorted term list.
+fn shared_prefix_bytes(previous: &str, current: &str) -> usize {
+    let mut shared = 0;
+    for (left, right) in previous.chars().zip(current.chars()) {
+        if left != right {
+            break;
+        }
+        shared += left.len_utf8();
+    }
+    shared
+}
+
+fn write_uvarint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            break;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(*pos).ok_or("unexpected end of snapshot")?;
+        *pos += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err("varint overflow in snapshot".to_owned());
         }
     }
 }
 
-impl TryFrom<BinarySnapshot> for MiniSearch {
-    type Error = String;
-
-    fn try_from(snapshot: BinarySnapshot) -> Result<Self, Self::Error> {
-        if snapshot.version != 1 {
-            return Err(format!(
-                "unsupported minisearch-rust binary snapshot version {}",
-                snapshot.version
-            ));
-        }
-
-        let document_ids = snapshot
-            .document_ids
-            .into_iter()
-            .map(|(short_id, value)| Ok((short_id, Value::try_from(value)?)))
-            .collect::<Result<_, String>>()?;
-
-        let stored_fields = snapshot
-            .stored_fields
-            .into_iter()
-            .map(|(short_id, fields)| {
-                let fields = fields
-                    .into_iter()
-                    .map(|(field, value)| Ok((field, Value::try_from(value)?)))
-                    .collect::<Result<_, String>>()?;
-
-                Ok((short_id, fields))
-            })
-            .collect::<Result<_, String>>()?;
-
-        Ok(Self {
-            options: MiniSearchOptions::from(snapshot.options),
-            index: snapshot.index,
-            document_count: snapshot.document_count,
-            next_id: snapshot.next_id,
-            document_ids,
-            id_to_short_id: snapshot.id_to_short_id,
-            field_ids: snapshot.field_ids,
-            field_length: snapshot.field_length,
-            average_field_length: snapshot.average_field_length,
-            stored_fields,
-            dirt_count: snapshot.dirt_count,
-        })
-    }
+fn write_str(buf: &mut Vec<u8>, value: &str) {
+    write_uvarint(buf, value.len() as u64);
+    buf.extend_from_slice(value.as_bytes());
 }
 
-impl From<&MiniSearchOptions> for SnapshotMiniSearchOptions {
-    fn from(options: &MiniSearchOptions) -> Self {
-        Self {
-            fields: options.fields.clone(),
-            id_field: options.id_field.clone(),
-            store_fields: options.store_fields.clone(),
-            tokenizer: options.tokenizer,
-            search_options: SnapshotSearchOptions::from(&options.search_options),
-        }
-    }
+fn read_str(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
+    let len = read_uvarint(bytes, pos)? as usize;
+    let end = pos.checked_add(len).ok_or("length overflow in snapshot")?;
+    let slice = bytes.get(*pos..end).ok_or("unexpected end of snapshot")?;
+    let text = std::str::from_utf8(slice)
+        .map_err(|err| err.to_string())?
+        .to_owned();
+    *pos = end;
+    Ok(text)
 }
 
-impl From<SnapshotMiniSearchOptions> for MiniSearchOptions {
-    fn from(options: SnapshotMiniSearchOptions) -> Self {
-        Self {
-            fields: options.fields,
-            id_field: options.id_field,
-            store_fields: options.store_fields,
-            tokenizer: options.tokenizer,
-            search_options: SearchOptions::from(options.search_options),
-        }
-    }
+fn read_f64(bytes: &[u8], pos: &mut usize) -> Result<f64, String> {
+    let end = pos.checked_add(8).ok_or("length overflow in snapshot")?;
+    let slice = bytes.get(*pos..end).ok_or("unexpected end of snapshot")?;
+    let array: [u8; 8] = slice
+        .try_into()
+        .map_err(|_| "bad f64 in snapshot".to_owned())?;
+    *pos = end;
+    Ok(f64::from_le_bytes(array))
 }
 
-impl From<&SearchOptions> for SnapshotSearchOptions {
-    fn from(options: &SearchOptions) -> Self {
-        Self {
-            fields: options.fields.clone(),
-            boost: options.boost.clone(),
-            weights: options.weights,
-            prefix: options.prefix,
-            fuzzy: options.fuzzy.map(SnapshotFuzzySetting::from),
-            max_fuzzy: options.max_fuzzy,
-            combine_with: options.combine_with,
-            bm25: options.bm25,
+fn write_value(buf: &mut Vec<u8>, value: &Value) {
+    match value {
+        Value::Null => buf.push(0),
+        Value::Bool(false) => buf.push(1),
+        Value::Bool(true) => buf.push(2),
+        Value::Number(number) => {
+            buf.push(3);
+            write_str(buf, &number.to_string());
         }
-    }
-}
-
-impl From<SnapshotSearchOptions> for SearchOptions {
-    fn from(options: SnapshotSearchOptions) -> Self {
-        Self {
-            fields: options.fields,
-            boost: options.boost,
-            weights: options.weights,
-            prefix: options.prefix,
-            fuzzy: options.fuzzy.map(FuzzySetting::from),
-            max_fuzzy: options.max_fuzzy,
-            combine_with: options.combine_with,
-            bm25: options.bm25,
+        Value::String(string) => {
+            buf.push(4);
+            write_str(buf, string);
         }
-    }
-}
-
-impl From<FuzzySetting> for SnapshotFuzzySetting {
-    fn from(setting: FuzzySetting) -> Self {
-        match setting {
-            FuzzySetting::Enabled(value) => SnapshotFuzzySetting::Enabled(value),
-            FuzzySetting::Distance(value) => SnapshotFuzzySetting::Distance(value),
-        }
-    }
-}
-
-impl From<SnapshotFuzzySetting> for FuzzySetting {
-    fn from(setting: SnapshotFuzzySetting) -> Self {
-        match setting {
-            SnapshotFuzzySetting::Enabled(value) => FuzzySetting::Enabled(value),
-            SnapshotFuzzySetting::Distance(value) => FuzzySetting::Distance(value),
-        }
-    }
-}
-
-impl From<&Value> for SnapshotValue {
-    fn from(value: &Value) -> Self {
-        match value {
-            Value::Null => SnapshotValue::Null,
-            Value::Bool(value) => SnapshotValue::Bool(*value),
-            Value::Number(value) => SnapshotValue::Number(value.to_string()),
-            Value::String(value) => SnapshotValue::String(value.clone()),
-            Value::Array(values) => {
-                SnapshotValue::Array(values.iter().map(SnapshotValue::from).collect())
+        Value::Array(values) => {
+            buf.push(5);
+            write_uvarint(buf, values.len() as u64);
+            for value in values {
+                write_value(buf, value);
             }
-            Value::Object(values) => SnapshotValue::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), SnapshotValue::from(value)))
-                    .collect(),
-            ),
+        }
+        Value::Object(values) => {
+            buf.push(6);
+            write_uvarint(buf, values.len() as u64);
+            for (key, value) in values {
+                write_str(buf, key);
+                write_value(buf, value);
+            }
         }
     }
 }
 
-impl TryFrom<SnapshotValue> for Value {
-    type Error = String;
-
-    fn try_from(value: SnapshotValue) -> Result<Self, Self::Error> {
-        match value {
-            SnapshotValue::Null => Ok(Value::Null),
-            SnapshotValue::Bool(value) => Ok(Value::Bool(value)),
-            SnapshotValue::Number(value) => match serde_json::from_str::<Value>(&value) {
+fn read_value(bytes: &[u8], pos: &mut usize) -> Result<Value, String> {
+    let tag = *bytes.get(*pos).ok_or("unexpected end of snapshot")?;
+    *pos += 1;
+    match tag {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Bool(false)),
+        2 => Ok(Value::Bool(true)),
+        3 => {
+            let text = read_str(bytes, pos)?;
+            match serde_json::from_str::<Value>(&text) {
                 Ok(Value::Number(number)) => Ok(Value::Number(number)),
-                _ => Err(format!("invalid numeric value in binary snapshot: {value}")),
-            },
-            SnapshotValue::String(value) => Ok(Value::String(value)),
-            SnapshotValue::Array(values) => values
-                .into_iter()
-                .map(Value::try_from)
-                .collect::<Result<Vec<_>, _>>()
-                .map(Value::Array),
-            SnapshotValue::Object(values) => values
-                .into_iter()
-                .map(|(key, value)| Ok((key, Value::try_from(value)?)))
-                .collect::<Result<JsonMap<String, Value>, String>>()
-                .map(Value::Object),
+                _ => Err(format!("invalid numeric value in snapshot: {text}")),
+            }
         }
+        4 => Ok(Value::String(read_str(bytes, pos)?)),
+        5 => {
+            let len = read_uvarint(bytes, pos)? as usize;
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(read_value(bytes, pos)?);
+            }
+            Ok(Value::Array(values))
+        }
+        6 => {
+            let len = read_uvarint(bytes, pos)? as usize;
+            let mut map = JsonMap::new();
+            for _ in 0..len {
+                let key = read_str(bytes, pos)?;
+                map.insert(key, read_value(bytes, pos)?);
+            }
+            Ok(Value::Object(map))
+        }
+        other => Err(format!("invalid value tag {other} in snapshot")),
     }
 }
 

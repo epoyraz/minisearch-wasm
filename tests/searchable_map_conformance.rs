@@ -1,6 +1,101 @@
 use minisearch_rust::SearchableMap;
 
 #[test]
+fn fuzzy_bit_parallel_matches_dp_reference() {
+    // The bit-parallel (Myers) fuzzy path in `for_each_fuzzy` must return exactly
+    // the same matches and distances as the banded-DP reference (`fuzzy_get`).
+    let words = [
+        "software",
+        "softer",
+        "soften",
+        "engineer",
+        "engine",
+        "engineering",
+        "java",
+        "javascript",
+        "lava",
+        "guava",
+        "kava",
+        "python",
+        "pylon",
+        "react",
+        "reactor",
+        "reaction",
+        "kubernetes",
+        "kubernet",
+        "cloud",
+        "cloudy",
+        "zürich",
+        "zurich",
+        "münchen",
+        "muenchen",
+        "café",
+        "cafe",
+        "naïve",
+        "naive",
+        "straße",
+        "strasse",
+        "manager",
+        "managed",
+        "manage",
+        "data",
+        "date",
+        "dato",
+        "database",
+        "developer",
+        "develop",
+        "devops",
+    ];
+    let mut map = SearchableMap::new();
+    for (index, word) in words.iter().enumerate() {
+        map.set(word, index);
+    }
+
+    let queries = [
+        "software",
+        "enginer",
+        "javasript",
+        "jaba",
+        "reactor",
+        "kubernates",
+        "cloud",
+        "zurich",
+        "zürich",
+        "munchen",
+        "cafe",
+        "naive",
+        "strasse",
+        "manger",
+        "databse",
+        "devloper",
+        "x",
+        "softwarexyz",
+    ];
+
+    for query in queries {
+        for max_distance in 0..=3 {
+            let mut myers: Vec<(String, usize)> = Vec::new();
+            map.for_each_fuzzy(query, max_distance, |term, _value, distance| {
+                myers.push((term.to_owned(), distance));
+            });
+            myers.sort();
+
+            let mut reference: Vec<(String, usize)> = map
+                .fuzzy_get(query, max_distance)
+                .into_iter()
+                .map(|hit| (hit.key, hit.distance))
+                .collect();
+            reference.sort();
+
+            assert_eq!(
+                myers, reference,
+                "query={query:?} max_distance={max_distance}"
+            );
+        }
+    }
+}
+
+#[test]
 fn set_get_has_and_delete_match_reference_behavior() {
     let mut map = SearchableMap::new();
 

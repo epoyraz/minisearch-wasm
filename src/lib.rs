@@ -115,6 +115,13 @@ impl MiniSearchWasm {
         self.inner.search_packed_default(query, or_mode).ids.len() as f64
     }
 
+    /// Diagnostic probe: hit count for a query with prefix/fuzzy toggled, to
+    /// profile where search time goes.
+    #[wasm_bindgen(js_name = searchCountOpts)]
+    pub fn search_count_opts_js(&self, query: &str, prefix: bool, fuzzy: bool) -> f64 {
+        self.inner.search_count_opts(query, prefix, fuzzy) as f64
+    }
+
     #[wasm_bindgen(js_name = toJSON)]
     pub fn to_json_js(&self) -> Result<JsValue, JsValue> {
         to_json_compatible_value(&self.inner).map_err(|err| JsValue::from_str(&err))

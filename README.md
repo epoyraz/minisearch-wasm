@@ -56,10 +56,48 @@ for (let i = 0; i < r.count; i++) {
 // Compatibility path — MiniSearch-shaped result objects (slower, see above):
 const full = mini.search("software engineer", { combineWith: "AND" });
 
-// Persistence: binary snapshot is ~10x faster to write and load than JSON.
+// Persistence: compact binary snapshot — smaller on the wire than JSON and
+// faster to load.
 const bytes = mini.toBytes();            // Uint8Array
 const loaded = MiniSearchWasm.loadBytes(bytes);
 ```
+
+## Differences from MiniSearch
+
+This is a from-scratch reimplementation. It matches MiniSearch's **ranking** —
+identical BM25 scores, verified to float epsilon (`max delta ≈ 1e-14`) on a
+21k-document corpus — but deliberately diverges from its API and internals:
+
+- **No JavaScript callbacks.** MiniSearch takes user functions for
+  `extractField`, `tokenize`, `processTerm`, and search-time `filter` /
+  `boostDocument`. To keep the JS↔Wasm boundary coarse, this port has none:
+  tokenization and term processing are built-in Rust modes (`"default"`,
+  `"jobboard"`), fields are read by name from JSON, and nothing calls back into
+  JS per token/document. Custom tokenizers/filters must be added Rust-side.
+- **Serialization is not interoperable.** `toJSON`/`toBytes` use this crate's
+  own formats (a Rust-struct JSON and a compact varint binary snapshot). You
+  cannot load a MiniSearch v1/v2 index here, nor load one of these indexes into
+  JS MiniSearch. Persist and reload with the same engine.
+- **Equal-score ties order differently.** Scores and the result *set* are
+  identical; results with exactly equal scores are ordered by internal document
+  id, whereas MiniSearch keeps them in first-scored order. This affects only
+  ties (≈1 query in 30 on the test corpus).
+- **Term length is counted in code points.** Prefix/fuzzy weighting uses
+  `chars().count()`, which equals JS `String.length` for all BMP text; it
+  differs only for astral-plane characters (emoji, etc.), where JS counts UTF-16
+  code units.
+- **Search never mutates the index.** MiniSearch lazily removes stale postings
+  mid-query when it meets a discarded document; this port just skips them (and
+  skips the liveness check entirely on a clean index).
+- **Not implemented (yet).** `autoSuggest`, wildcard queries
+  (`MiniSearch.wildcard`) and nested query-expression trees, async indexing
+  (`addAllAsync`), `vacuum`, and batch `removeAll`/`discardAll`. The query is a
+  plain string plus options, not a query tree. See `PORTING.md`.
+- **Added beyond MiniSearch.** `searchJoined` (compact columnar results for a
+  thin Wasm boundary), `addAllJSON` (index straight from a raw JSON string),
+  `toBytes`/`loadBytes` (compact binary snapshot), the `"jobboard"` tokenizer,
+  and — internally, with identical results — a bit-parallel (Myers) fuzzy
+  traversal and `HashMap`-backed postings.
 
 ## Benchmark results
 
@@ -70,13 +108,17 @@ expect some run-to-run variance.
 
 | Category | Rust vs JS MiniSearch |
 |---|---|
-| **Search — app workload** (`{id, score, terms}`, end to end) | **~1.3–1.4× faster** (pure engine ~1.6×) |
-| Load prebuilt index — `loadBytes` vs `loadJSON` | ~8× faster |
-| Load prebuilt index — `loadJSON` vs `loadJSON` | ~2.4× faster |
-| Serialize index — `toBytes` vs `JSON.stringify` | ~12× faster |
-| Serialize index — `toJSONString` vs `JSON.stringify` | ~10× faster |
+| **Search — app workload** (`{id, score, terms}`, end to end) | **~1.5–1.6× faster** (pure engine ~1.9–2×) |
+| **Index download** (prebuilt, brotli) | **~0.73× — smaller on the wire than JS** |
+| Load prebuilt index — `loadBytes` vs `loadJSON` | ~2.4× faster |
+| Serialize index — `toBytes` vs `JSON.stringify` | ~8× faster |
 | Build index — `addAllJSON` vs `addAll` | ~1.3× faster |
 | Full compat `search()` vs JS `search()` | ~0.5× (slower by design — see Design) |
+
+The compact binary snapshot is delta+varint encoded, so it is both smaller than
+the JSON index and low-entropy enough to compress well; `loadBytes` rebuilds the
+term tree from the sorted terms (hence ~2.4× rather than ~8×, but still far
+ahead of JS `loadJSON`).
 
 **Truthfulness:** the benchmark verifies the two engines return identical
 results — `set-identical 30/30`, `max score delta ≈ 1e-14` (float epsilon),

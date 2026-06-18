@@ -114,19 +114,51 @@ impl<T> SearchableMap<T> {
         F: FnMut(&str, &T, usize),
     {
         let query_chars: Vec<char> = query.chars().collect();
-        let columns = query_chars.len() + 1;
+        let m = query_chars.len();
+
+        // Bit-parallel (Myers) path for queries up to 64 chars — the common case
+        // for search terms. The DP column is carried as two bit vectors (vp/vn)
+        // in registers instead of a matrix in memory; the column for the next
+        // character is computed with a handful of word ops. Produces exactly the
+        // same matches and edit distances as the banded-matrix fallback below.
+        if (1..=64).contains(&m) {
+            let mut peq: Vec<(char, u64)> = Vec::with_capacity(m);
+            for (index, &character) in query_chars.iter().enumerate() {
+                match peq.iter_mut().find(|(c, _)| *c == character) {
+                    Some(entry) => entry.1 |= 1u64 << index,
+                    None => peq.push((character, 1u64 << index)),
+                }
+            }
+            let high_bit = 1u64 << (m - 1);
+            let vp = if m == 64 { u64::MAX } else { (1u64 << m) - 1 };
+            let mut key = String::new();
+            fuzzy_visit_myers(
+                &self.root,
+                &peq,
+                m,
+                high_bit,
+                max_distance,
+                vp,
+                0,
+                m,
+                0,
+                &mut key,
+                &mut visitor,
+            );
+            return;
+        }
+
+        // Fallback for empty or >64-char queries: banded DP matrix.
+        let columns = m + 1;
         let rows = columns + max_distance;
         let sentinel = (max_distance + 1).min(u16::MAX as usize) as u16;
         let mut matrix = vec![sentinel; rows * columns];
-
         for j in 0..columns {
             matrix[j] = j as u16;
         }
-
         for i in 1..rows {
             matrix[i * columns] = i as u16;
         }
-
         let mut key = String::new();
         fuzzy_visit(
             &self.root,
@@ -138,6 +170,32 @@ impl<T> SearchableMap<T> {
             &mut key,
             &mut visitor,
         );
+    }
+
+    /// All (key, &value) entries sorted by key. Used by the compact serializer:
+    /// sorting clusters shared term prefixes so front-coding + brotli are
+    /// effective. Borrows values (no clone of the postings).
+    pub fn sorted_entries(&self) -> Vec<(String, &T)> {
+        let mut entries = Vec::new();
+        collect_entries_ref(&self.root, String::new(), &mut entries);
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+}
+
+fn collect_entries_ref<'a, T>(
+    node: &'a RadixNode<T>,
+    prefix: String,
+    entries: &mut Vec<(String, &'a T)>,
+) {
+    if let Some(value) = &node.leaf {
+        entries.push((prefix.clone(), value));
+    }
+
+    for (child_key, child) in &node.children {
+        let mut key = prefix.clone();
+        key.push_str(child_key);
+        collect_entries_ref(child, key, entries);
     }
 }
 
@@ -541,6 +599,109 @@ fn fuzzy_visit<T, F>(
                 matrix,
                 i,
                 columns,
+                prefix,
+                visitor,
+            );
+            prefix.truncate(prefix_len);
+        }
+    }
+}
+
+/// Bit-parallel (Myers) fuzzy traversal. `vp`/`vn` are the Myers vertical
+/// positive/negative bit vectors encoding the DP column; `score` is the bottom
+/// cell D[m][depth] = edit distance between the query and the path string so
+/// far. Pruning uses the exact column minimum (a strict lower bound on the
+/// distance of any extension), so the set of visited nodes — and therefore the
+/// matches and distances — is identical to the banded-matrix implementation.
+#[allow(clippy::too_many_arguments)]
+fn fuzzy_visit_myers<T, F>(
+    node: &RadixNode<T>,
+    peq: &[(char, u64)],
+    m: usize,
+    high_bit: u64,
+    max_distance: usize,
+    vp: u64,
+    vn: u64,
+    score: usize,
+    depth: usize,
+    prefix: &mut String,
+    visitor: &mut F,
+) where
+    F: FnMut(&str, &T, usize),
+{
+    if let Some(value) = &node.leaf {
+        if score <= max_distance {
+            visitor(prefix, value, score);
+        }
+    }
+
+    let k = max_distance as i64;
+
+    for (child_key, child) in &node.children {
+        let mut cvp = vp;
+        let mut cvn = vn;
+        let mut cscore = score;
+        let mut cdepth = depth;
+        let mut pruned = false;
+
+        for character in child_key.chars() {
+            // Myers transition (Hyyrö): advance the DP column by one text char.
+            let eq = peq
+                .iter()
+                .find(|(c, _)| *c == character)
+                .map(|(_, mask)| *mask)
+                .unwrap_or(0);
+            let xv = eq | cvn;
+            let xh = (((eq & cvp).wrapping_add(cvp)) ^ cvp) | eq;
+            let mut ph = cvn | !(xh | cvp);
+            let mut mh = cvp & xh;
+            if ph & high_bit != 0 {
+                cscore += 1;
+            }
+            if mh & high_bit != 0 {
+                cscore -= 1;
+            }
+            ph = (ph << 1) | 1;
+            mh <<= 1;
+            cvp = mh | !(xv | ph);
+            cvn = ph & xv;
+            cdepth += 1;
+
+            // Prune when the whole DP column exceeds k: no extension of this
+            // path can reach distance <= k. Scan only until a cell <= k is found
+            // (cheap for real matches; full scan only when about to prune).
+            let mut col = cdepth as i64;
+            let mut within = col <= k;
+            let mut index = 1;
+            while index <= m && !within {
+                let bit = 1u64 << (index - 1);
+                if cvp & bit != 0 {
+                    col += 1;
+                } else if cvn & bit != 0 {
+                    col -= 1;
+                }
+                within = col <= k;
+                index += 1;
+            }
+            if !within {
+                pruned = true;
+                break;
+            }
+        }
+
+        if !pruned {
+            let prefix_len = prefix.len();
+            prefix.push_str(child_key);
+            fuzzy_visit_myers(
+                child,
+                peq,
+                m,
+                high_bit,
+                max_distance,
+                cvp,
+                cvn,
+                cscore,
+                cdepth,
                 prefix,
                 visitor,
             );
