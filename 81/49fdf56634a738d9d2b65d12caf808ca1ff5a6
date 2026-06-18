@@ -1,0 +1,37 @@
+tests/minisearch_conformance.rs
+  s_5e33b574be96ba::t_88c29532da908c 50-83
+src/mini_search.rs
+  s_5e33b574be96ba::t_f481049e63137c 507-520
+  s_5e33b574be96ba::t_fbe1e21de6e78d 240-241
+  s_5e33b574be96ba::t_c0ecae395d12d2 1243,1245-1251,1253,1255,1258-1264,1266,1270-1278,1280-1282,1287-1289,1292-1300,1303-1310,1313-1338,1344-1353,1355-1374,1376
+  s_5e33b574be96ba::t_6ba3d2c8cf1af3 564-568,570-661,665-731,733-774
+src/searchable_map.rs
+  s_5e33b574be96ba::t_57879c7718ce2f 117-135,147-152
+  s_5e33b574be96ba::t_68c72508cb2d48 136-146,696-706
+  s_5e33b574be96ba::t_404988e3db38da 609-695,707-711
+  s_5e33b574be96ba::t_56a17dacfe3a63 174-199
+src/lib.rs
+  s_5e33b574be96ba::t_7728bea24b44ce 118-124
+tests/searchable_map_conformance.rs
+  s_5e33b574be96ba::t_606f8259cf8425 4-7,48-54,73-89,94-97
+  s_5e33b574be96ba::t_68c72508cb2d48 8-47,55-72,90-93
+README.md
+  s_5e33b574be96ba::t_ec7cf0df63721d 59-60,65-100
+  s_5e33b574be96ba::t_c35fc6f0de220b 111-114,118-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "8149fdf56634a738d9d2b65d12caf808ca1ff5a6",
+  "prompts": {},
+  "sessions": {
+    "s_5e33b574be96ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8aad8b23-18e2-4a4e-b4da-7a2318dc6c84",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
