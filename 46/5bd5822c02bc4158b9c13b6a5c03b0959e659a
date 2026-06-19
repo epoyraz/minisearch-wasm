@@ -1,0 +1,22 @@
+src/searchable_map.rs
+  s_7bd1e3c1cb7ce5::t_63648885739f62 657
+  s_7bd1e3c1cb7ce5::t_d3c4fa00eca18f 125
+  s_7bd1e3c1cb7ce5::t_f6220cd8dda479 604-647
+  s_7bd1e3c1cb7ce5::t_2a752cf16ca261 687
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "465bd5822c02bc4158b9c13b6a5c03b0959e659a",
+  "prompts": {},
+  "sessions": {
+    "s_7bd1e3c1cb7ce5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cf200ad-c548-4ac9-8a24-e2cd5b0265ca",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
