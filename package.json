@@ -1,6 +1,6 @@
 {
   "name": "minisearch-wasm-build",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Build orchestration for the minisearch-wasm npm package (not published; the publishable artifact is pkg/).",
   "type": "module",

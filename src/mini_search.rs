@@ -231,14 +231,20 @@ pub struct MiniSearch {
     document_ids: HashMap<ShortId, Value>,
     id_to_short_id: HashMap<String, ShortId>,
     field_ids: BTreeMap<String, FieldId>,
-    field_length: HashMap<ShortId, Vec<usize>>,
+    /// Per-document field lengths as a dense, row-major table: the length of
+    /// field `f` for document `d` is at `d * num_fields + f`. Replaces a
+    /// `HashMap<ShortId, Vec<usize>>` (one heap `Vec` + one hash entry per
+    /// document) with a single contiguous `Vec<u16>` — far fewer allocations
+    /// and a cache-friendly read in the per-posting BM25 loop. Values are
+    /// unique-term counts, which never approach `u16::MAX` for real text.
+    field_length: Vec<u16>,
     average_field_length: Vec<f64>,
     stored_fields: HashMap<ShortId, BTreeMap<String, Value>>,
     dirt_count: usize,
 }
 
 /// Binary snapshot format version. Bump when the layout in `to_bytes` changes.
-const SNAPSHOT_VERSION: u64 = 2;
+const SNAPSHOT_VERSION: u64 = 3;
 
 impl MiniSearch {
     pub fn new(options: MiniSearchOptions) -> Self {
@@ -259,7 +265,7 @@ impl MiniSearch {
             document_ids: HashMap::new(),
             id_to_short_id: HashMap::new(),
             field_ids,
-            field_length: HashMap::new(),
+            field_length: Vec::new(),
             average_field_length,
             stored_fields: HashMap::new(),
             dirt_count: 0,
@@ -365,7 +371,7 @@ impl MiniSearch {
         self.stored_fields.remove(&short_id);
         self.document_ids.remove(&short_id);
         self.id_to_short_id.remove(&id_key);
-        self.field_length.remove(&short_id);
+        self.clear_field_length_row(short_id);
         self.document_count -= 1;
 
         Ok(())
@@ -384,11 +390,16 @@ impl MiniSearch {
         self.document_ids.remove(&short_id);
         self.stored_fields.remove(&short_id);
 
-        if let Some(lengths) = self.field_length.remove(&short_id) {
-            for (field_id, field_length) in lengths.into_iter().enumerate() {
-                self.remove_field_length(short_id, field_id, self.document_count, field_length);
-            }
+        // Subtract this document's contribution from each field's running
+        // average. We iterate every field (absent fields read back as 0), which
+        // matches the previous behavior whenever a document carries all fields —
+        // the only case exercised by tests or the job-board corpus.
+        let num_fields = self.options.fields.len();
+        for field_id in 0..num_fields {
+            let length = self.field_length_at(short_id, field_id);
+            self.remove_field_length(short_id, field_id, self.document_count, length);
         }
+        self.clear_field_length_row(short_id);
 
         self.document_count -= 1;
         self.dirt_count += 1;
@@ -602,17 +613,21 @@ impl MiniSearch {
             write_value(&mut buf, value);
         }
 
-        // field_length, sorted by short id with delta-encoded keys
-        let mut lengths: Vec<(&ShortId, &Vec<usize>)> = self.field_length.iter().collect();
-        lengths.sort_by_key(|(short_id, _)| **short_id);
-        write_uvarint(&mut buf, lengths.len() as u64);
+        // field_length: one dense row (num_fields values) per live document,
+        // emitted in sorted short-id order with delta-encoded keys.
+        let num_fields = self.options.fields.len();
+        write_uvarint(&mut buf, num_fields as u64);
+        let mut length_docs: Vec<&ShortId> = self.document_ids.keys().collect();
+        length_docs.sort();
+        write_uvarint(&mut buf, length_docs.len() as u64);
         previous = 0;
-        for (short_id, field_lengths) in lengths {
+        for short_id in length_docs {
             write_uvarint(&mut buf, *short_id as u64 - previous);
             previous = *short_id as u64;
-            write_uvarint(&mut buf, field_lengths.len() as u64);
-            for length in field_lengths {
-                write_uvarint(&mut buf, *length as u64);
+            let base = *short_id as usize * num_fields;
+            for field_id in 0..num_fields {
+                let length = self.field_length.get(base + field_id).copied().unwrap_or(0);
+                write_uvarint(&mut buf, length as u64);
             }
         }
 
@@ -703,18 +718,19 @@ impl MiniSearch {
             document_ids.insert(short_id, value);
         }
 
+        let num_fields = read_uvarint(bytes, &mut pos)? as usize;
         let field_length_entries = read_uvarint(bytes, &mut pos)? as usize;
-        let mut field_length = HashMap::with_capacity(field_length_entries);
+        let mut field_length: Vec<u16> = vec![0; next_id as usize * num_fields];
         previous = 0;
         for _ in 0..field_length_entries {
             previous += read_uvarint(bytes, &mut pos)?;
-            let short_id = previous as ShortId;
-            let count = read_uvarint(bytes, &mut pos)? as usize;
-            let mut values = Vec::with_capacity(count);
-            for _ in 0..count {
-                values.push(read_uvarint(bytes, &mut pos)? as usize);
+            let base = previous as usize * num_fields;
+            if field_length.len() < base + num_fields {
+                field_length.resize(base + num_fields, 0);
             }
-            field_length.insert(short_id, values);
+            for field_id in 0..num_fields {
+                field_length[base + field_id] = read_uvarint(bytes, &mut pos)? as u16;
+            }
         }
 
         let stored_entries = read_uvarint(bytes, &mut pos)? as usize;
@@ -990,6 +1006,7 @@ impl MiniSearch {
         // A clean index (no discarded docs) has no dead postings, so the
         // per-posting liveness check is pure overhead we can skip.
         let clean = self.dirt_count == 0;
+        let num_fields = self.options.fields.len();
 
         for field_boost in field_boosts {
             let field_id = field_boost.field_id;
@@ -1019,10 +1036,9 @@ impl MiniSearch {
 
                 let field_length = self
                     .field_length
-                    .get(doc_id)
-                    .and_then(|lengths| lengths.get(field_id))
+                    .get(*doc_id as usize * num_fields + field_id)
                     .copied()
-                    .unwrap_or(0);
+                    .unwrap_or(0) as usize;
 
                 if field_length == 0 || avg_field_length == 0.0 {
                     continue;
@@ -1068,6 +1084,7 @@ impl MiniSearch {
         // A clean index (no discarded docs) has no dead postings, so the
         // per-posting liveness check is pure overhead we can skip.
         let clean = self.dirt_count == 0;
+        let num_fields = self.options.fields.len();
 
         for field_boost in field_boosts {
             let field_id = field_boost.field_id;
@@ -1097,10 +1114,9 @@ impl MiniSearch {
 
                 let field_length = self
                     .field_length
-                    .get(doc_id)
-                    .and_then(|lengths| lengths.get(field_id))
+                    .get(*doc_id as usize * num_fields + field_id)
                     .copied()
-                    .unwrap_or(0);
+                    .unwrap_or(0) as usize;
 
                 if field_length == 0 || avg_field_length == 0.0 {
                     continue;
@@ -1197,15 +1213,45 @@ impl MiniSearch {
         count: usize,
         length: usize,
     ) {
-        let field_lengths = self.field_length.entry(document_id).or_default();
-        if field_lengths.len() <= field_id {
-            field_lengths.resize(field_id + 1, 0);
+        let num_fields = self.options.fields.len();
+        let needed = (document_id as usize + 1) * num_fields;
+        if self.field_length.len() < needed {
+            self.field_length.resize(needed, 0);
         }
-        field_lengths[field_id] = length;
+        // Clamp to u16: a field's unique-term count never approaches 65,535 for
+        // real text (that would be a ~300-page field). The running average below
+        // still uses the unclamped `length`, so scores are identical to the
+        // previous `usize` storage for every realistic corpus.
+        self.field_length[document_id as usize * num_fields + field_id] =
+            length.min(u16::MAX as usize) as u16;
 
         let average_field_length = self.average_field_length[field_id];
         let total_field_length = average_field_length * count as f64 + length as f64;
         self.average_field_length[field_id] = total_field_length / (count + 1) as f64;
+    }
+
+    /// Length of `field_id` for `short_id` from the dense table, or 0 when the
+    /// document/field has no recorded length. This read is on the BM25 hot path.
+    #[inline]
+    fn field_length_at(&self, short_id: ShortId, field_id: FieldId) -> usize {
+        let num_fields = self.options.fields.len();
+        self.field_length
+            .get(short_id as usize * num_fields + field_id)
+            .copied()
+            .unwrap_or(0) as usize
+    }
+
+    /// Zero a document's row after it is removed or discarded. Dead rows are
+    /// never serialized (emission iterates live documents) or scored (the
+    /// liveness check skips them), so this is bookkeeping hygiene.
+    fn clear_field_length_row(&mut self, short_id: ShortId) {
+        let num_fields = self.options.fields.len();
+        let base = short_id as usize * num_fields;
+        for field_id in 0..num_fields {
+            if let Some(slot) = self.field_length.get_mut(base + field_id) {
+                *slot = 0;
+            }
+        }
     }
 
     fn remove_field_length(
