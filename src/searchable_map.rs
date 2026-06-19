@@ -122,13 +122,7 @@ impl<T> SearchableMap<T> {
         // character is computed with a handful of word ops. Produces exactly the
         // same matches and edit distances as the banded-matrix fallback below.
         if (1..=64).contains(&m) {
-            let mut peq: Vec<(char, u64)> = Vec::with_capacity(m);
-            for (index, &character) in query_chars.iter().enumerate() {
-                match peq.iter_mut().find(|(c, _)| *c == character) {
-                    Some(entry) => entry.1 |= 1u64 << index,
-                    None => peq.push((character, 1u64 << index)),
-                }
-            }
+            let peq = PeqMasks::build(&query_chars);
             let high_bit = 1u64 << (m - 1);
             let vp = if m == 64 { u64::MAX } else { (1u64 << m) - 1 };
             let mut key = String::new();
@@ -607,6 +601,50 @@ fn fuzzy_visit<T, F>(
     }
 }
 
+/// Per-character equality bitmasks for the Myers DP (the `Peq` table): bit `i`
+/// of `get(c)` is set iff query character `i` equals `c`. Looked up for every
+/// character of every trie edge visited during fuzzy traversal — the hottest
+/// inner loop — so it must be O(1), not a linear scan over the query's distinct
+/// characters. ASCII (the overwhelming common case) hits a flat array; the rare
+/// non-ASCII query character falls back to a tiny linear list.
+struct PeqMasks {
+    ascii: [u64; 128],
+    other: Vec<(char, u64)>,
+}
+
+impl PeqMasks {
+    fn build(query_chars: &[char]) -> Self {
+        let mut masks = PeqMasks {
+            ascii: [0u64; 128],
+            other: Vec::new(),
+        };
+        for (index, &character) in query_chars.iter().enumerate() {
+            let bit = 1u64 << index;
+            if (character as u32) < 128 {
+                masks.ascii[character as usize] |= bit;
+            } else if let Some(entry) = masks.other.iter_mut().find(|(c, _)| *c == character) {
+                entry.1 |= bit;
+            } else {
+                masks.other.push((character, bit));
+            }
+        }
+        masks
+    }
+
+    #[inline]
+    fn get(&self, character: char) -> u64 {
+        if (character as u32) < 128 {
+            self.ascii[character as usize]
+        } else {
+            self.other
+                .iter()
+                .find(|(c, _)| *c == character)
+                .map(|(_, mask)| *mask)
+                .unwrap_or(0)
+        }
+    }
+}
+
 /// Bit-parallel (Myers) fuzzy traversal. `vp`/`vn` are the Myers vertical
 /// positive/negative bit vectors encoding the DP column; `score` is the bottom
 /// cell D[m][depth] = edit distance between the query and the path string so
@@ -616,7 +654,7 @@ fn fuzzy_visit<T, F>(
 #[allow(clippy::too_many_arguments)]
 fn fuzzy_visit_myers<T, F>(
     node: &RadixNode<T>,
-    peq: &[(char, u64)],
+    peq: &PeqMasks,
     m: usize,
     high_bit: u64,
     max_distance: usize,
@@ -646,11 +684,7 @@ fn fuzzy_visit_myers<T, F>(
 
         for character in child_key.chars() {
             // Myers transition (Hyyrö): advance the DP column by one text char.
-            let eq = peq
-                .iter()
-                .find(|(c, _)| *c == character)
-                .map(|(_, mask)| *mask)
-                .unwrap_or(0);
+            let eq = peq.get(character);
             let xv = eq | cvn;
             let xh = (((eq & cvp).wrapping_add(cvp)) ^ cvp) | eq;
             let mut ph = cvn | !(xh | cvp);
