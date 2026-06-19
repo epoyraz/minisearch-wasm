@@ -1,0 +1,26 @@
+Cargo.toml
+  s_7bd1e3c1cb7ce5::t_ab31d4b1951e59 3
+README.md
+  s_7bd1e3c1cb7ce5::t_6f240c2c9eed0e 39
+  s_7bd1e3c1cb7ce5::t_3212d8b956f193 164
+  s_7bd1e3c1cb7ce5::t_828ea3569d3c2e 139-142,145-147,154-156
+package.json
+  s_7bd1e3c1cb7ce5::t_1ac1368bd89e1d 8
+  s_7bd1e3c1cb7ce5::t_2877764e008437 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "bb86f91a92c008344b7ce00cb4b59262d61f4f1f",
+  "prompts": {},
+  "sessions": {
+    "s_7bd1e3c1cb7ce5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5cf200ad-c548-4ac9-8a24-e2cd5b0265ca",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
