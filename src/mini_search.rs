@@ -1006,6 +1006,11 @@ impl MiniSearch {
                     .count()
             };
             let avg_field_length = self.average_field_length[field_id];
+            // `idf` depends only on the term's document frequency in this field,
+            // so it (and its `ln`) is constant across the whole posting list.
+            // Hoist it out of the per-posting loop instead of recomputing it for
+            // every document. Bit-identical to the inlined form.
+            let idf = bm25_idf(matching_fields as f64, self.document_count as f64);
 
             for (doc_id, term_freq) in field_term_freqs {
                 if !clean && !self.document_ids.contains_key(doc_id) {
@@ -1023,14 +1028,13 @@ impl MiniSearch {
                     continue;
                 }
 
-                let raw_score = calc_bm25_score(
-                    *term_freq as f64,
-                    matching_fields as f64,
-                    self.document_count as f64,
-                    field_length as f64,
-                    avg_field_length,
-                    bm25_params,
-                );
+                let raw_score = idf
+                    * bm25_tf_component(
+                        *term_freq as f64,
+                        field_length as f64,
+                        avg_field_length,
+                        bm25_params,
+                    );
                 let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
                 let result = results.entry(*doc_id).or_insert_with(|| RawResultValue {
                     score: 0.0,
@@ -1080,6 +1084,11 @@ impl MiniSearch {
                     .count()
             };
             let avg_field_length = self.average_field_length[field_id];
+            // `idf` depends only on the term's document frequency in this field,
+            // so it (and its `ln`) is constant across the whole posting list.
+            // Hoist it out of the per-posting loop instead of recomputing it for
+            // every document. Bit-identical to the inlined form.
+            let idf = bm25_idf(matching_fields as f64, self.document_count as f64);
 
             for (doc_id, term_freq) in field_term_freqs {
                 if !clean && !self.document_ids.contains_key(doc_id) {
@@ -1097,14 +1106,13 @@ impl MiniSearch {
                     continue;
                 }
 
-                let raw_score = calc_bm25_score(
-                    *term_freq as f64,
-                    matching_fields as f64,
-                    self.document_count as f64,
-                    field_length as f64,
-                    avg_field_length,
-                    bm25_params,
-                );
+                let raw_score = idf
+                    * bm25_tf_component(
+                        *term_freq as f64,
+                        field_length as f64,
+                        avg_field_length,
+                        bm25_params,
+                    );
                 let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
                 let result = results
                     .entry(*doc_id)
@@ -1499,20 +1507,27 @@ fn merge_matches(
     }
 }
 
-fn calc_bm25_score(
+/// Inverse document frequency for a term, given its document frequency in the
+/// field (`matching_count`) and the corpus size (`total_count`). Constant for a
+/// whole posting list, so callers hoist it out of the per-posting loop.
+#[inline]
+fn bm25_idf(matching_count: f64, total_count: f64) -> f64 {
+    (1.0 + (total_count - matching_count + 0.5) / (matching_count + 0.5)).ln()
+}
+
+/// The term-frequency / field-length-normalization half of the BM25 score (the
+/// part that varies per document). Multiply by [`bm25_idf`] for the full score.
+/// Split out so the `idf` (and its `ln`) can be computed once per posting list.
+#[inline]
+fn bm25_tf_component(
     term_freq: f64,
-    matching_count: f64,
-    total_count: f64,
     field_length: f64,
     avg_field_length: f64,
     bm25: Bm25Params,
 ) -> f64 {
-    let inverse_doc_freq =
-        (1.0 + (total_count - matching_count + 0.5) / (matching_count + 0.5)).ln();
-    inverse_doc_freq
-        * (bm25.d
-            + term_freq * (bm25.k + 1.0)
-                / (term_freq + bm25.k * (1.0 - bm25.b + bm25.b * field_length / avg_field_length)))
+    bm25.d
+        + term_freq * (bm25.k + 1.0)
+            / (term_freq + bm25.k * (1.0 - bm25.b + bm25.b * field_length / avg_field_length))
 }
 
 fn assign_unique(target: &mut Vec<String>, term: &str) {
