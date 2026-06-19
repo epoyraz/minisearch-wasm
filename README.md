@@ -36,7 +36,7 @@ nested objects across the boundary is inherently expensive, and real consumers
 ## API
 
 ```js
-import init, { MiniSearchWasm } from "minisearch-rust";
+import init, { MiniSearchWasm } from "minisearch-wasm";
 await init();
 
 // Build (or load a prebuilt index — far cheaper, see below).
@@ -136,16 +136,24 @@ order, this port by document id).
 npm install minisearch-wasm
 ```
 
-The package is built with `wasm-pack --target bundler`, so it works out of the
-box with Vite, webpack, and Rollup — no manual init step:
+The package is a `wasm-pack --target web` build: it loads with a static import
+in every environment — Vite, webpack, Turbopack (dev and build), plain ESM,
+Node, and Web Workers — with one explicit `await init()` to load the
+WebAssembly module up front:
 
 ```js
-import { MiniSearchWasm } from "minisearch-wasm";
+import init, { MiniSearchWasm } from "minisearch-wasm";
+
+await init();                              // load the .wasm once, before first use
 
 const ms = new MiniSearchWasm({ fields: ["title", "text"] });
 ms.addAll(documents);
 const results = ms.search("query");
 ```
+
+In a **Web Worker** the same static import works — just `await init()` before
+the first call. (The `--target web` build is what makes worker and Turbopack use
+friction-free; a bundler-target build would require a dynamic `import()` there.)
 
 ## Build
 
@@ -153,7 +161,7 @@ const results = ms.search("query");
 cargo fmt -- --check
 cargo test
 rustup target add wasm32-unknown-unknown
-npm run build   # wasm-pack build --target bundler --release + metadata patch
+npm run build   # wasm-pack build --target web --release + metadata patch
 ```
 
 Install `wasm-pack` with `cargo install wasm-pack` if needed.
