@@ -1,4 +1,4 @@
-use minisearch_rust::{
+use minisearch_wasm::{
     CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions, SearchOptions, TokenizerMode,
 };
 use serde_json::json;

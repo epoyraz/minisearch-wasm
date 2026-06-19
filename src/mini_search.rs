@@ -666,7 +666,7 @@ impl MiniSearch {
         let version = read_uvarint(bytes, &mut pos)?;
         if version != SNAPSHOT_VERSION {
             return Err(format!(
-                "unsupported minisearch-rust binary snapshot version {version}"
+                "unsupported minisearch-wasm binary snapshot version {version}"
             ));
         }
 

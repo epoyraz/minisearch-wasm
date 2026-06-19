@@ -1,10 +1,14 @@
-# minisearch-rust
+# minisearch-wasm
 
 A Rust + WebAssembly full-text search engine built against the
 [MiniSearch](https://github.com/lucaong/minisearch) behavior contract. It
 computes **identical rankings** to MiniSearch (same ids, same BM25 scores) and
 is **faster than the JavaScript original** on the real workload — verified
 continuously by the benchmark in the sibling `keyword-search` project.
+
+> This is an independent WebAssembly reimplementation that is API-compatible
+> with MiniSearch. It is **not** affiliated with or endorsed by the original
+> [MiniSearch](https://github.com/lucaong/minisearch) project.
 
 The original JavaScript conformance tests are copied under `reference-tests/`,
 and Rust integration tests in `tests/` translate them feature by feature. There
@@ -126,15 +130,42 @@ results — `set-identical 30/30`, `max score delta ≈ 1e-14` (float epsilon),
 exactly equal scores (a tie-break nuance: JS breaks ties by scoring-encounter
 order, this port by document id).
 
+## Install
+
+```sh
+npm install minisearch-wasm
+```
+
+The package is built with `wasm-pack --target bundler`, so it works out of the
+box with Vite, webpack, and Rollup — no manual init step:
+
+```js
+import { MiniSearchWasm } from "minisearch-wasm";
+
+const ms = new MiniSearchWasm({ fields: ["title", "text"] });
+ms.addAll(documents);
+const results = ms.search("query");
+```
+
 ## Build
 
 ```powershell
 cargo fmt -- --check
 cargo test
 rustup target add wasm32-unknown-unknown
-wasm-pack build --target web
+npm run build   # wasm-pack build --target bundler --release + metadata patch
 ```
 
 Install `wasm-pack` with `cargo install wasm-pack` if needed.
+
+### Publishing
+
+```powershell
+npm run publish:pkg   # rebuilds, then `npm publish ./pkg`
+```
+
+You must `npm login` first. The publishable artifact is the generated `pkg/`
+directory; its `package.json` metadata is injected by `scripts/finalize-pkg.mjs`
+on every build.
 
 See `PORTING.md` for conformance status and the next test slices.

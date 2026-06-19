@@ -1,4 +1,4 @@
-use minisearch_rust::SearchableMap;
+use minisearch_wasm::SearchableMap;
 
 #[test]
 fn fuzzy_bit_parallel_matches_dp_reference() {
