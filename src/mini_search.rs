@@ -1,6 +1,8 @@
 use crate::SearchableMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use unicode_general_category::{get_general_category, GeneralCategory};
@@ -8,8 +10,68 @@ use unicode_general_category::{get_general_category, GeneralCategory};
 type FieldId = usize;
 type ShortId = u32;
 type FieldTermData = HashMap<FieldId, HashMap<ShortId, u32>>;
-type RawResult = HashMap<ShortId, RawResultValue>;
-type RawCompactResult = HashMap<ShortId, RawCompactResultValue>;
+// Transient per-query accumulators keyed by doc id. They are rebuilt every
+// search and re-sorted before returning, so a fast non-cryptographic hasher is
+// safe (output is unchanged) and much cheaper than std's SipHash on u32 keys.
+type RawResult = FxHashMap<ShortId, RawResultValue>;
+type RawCompactResult = FxHashMap<ShortId, RawCompactResultValue>;
+
+thread_local! {
+    // Reused across queries (single-threaded Wasm) so the compact search path
+    // accumulates into dense, doc-id-indexed arrays instead of hashing every
+    // posting into a map. See `Scratch`.
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+/// Dense per-query accumulator for the compact (searchJoined) path.
+///
+/// The hot loop adds one BM25 contribution per posting. Hashing each `doc_id`
+/// into a map for every posting is the bulk of the non-fuzzy-traversal cost, yet
+/// a doc is hit many times (once per matched/expanded term × field). Indexing a
+/// flat `Vec` by `doc_id` removes that hashing entirely: O(1) array writes per
+/// posting, and we collect the map once per *unique* doc at the end.
+///
+/// Slots are reset lazily via a monotonic `generation` stamp, so there is no
+/// O(N) clear between queries — only the `touched` docs are revisited.
+#[derive(Default)]
+struct Scratch {
+    score: Vec<f64>,
+    /// Derived (matched) index terms accumulated per doc for the current spec.
+    terms: Vec<Vec<String>>,
+    generation: Vec<u32>,
+    current_generation: u32,
+    touched: Vec<ShortId>,
+}
+
+impl Scratch {
+    /// Grow to hold `len` docs and start a fresh accumulation pass.
+    fn begin(&mut self, len: usize) {
+        if self.score.len() < len {
+            self.score.resize(len, 0.0);
+            self.terms.resize_with(len, Vec::new);
+            self.generation.resize(len, 0);
+        }
+        self.current_generation = self.current_generation.wrapping_add(1);
+        if self.current_generation == 0 {
+            // Wrapped after ~4B passes: clear stamps so none collide with gen 0.
+            self.generation.iter_mut().for_each(|g| *g = 0);
+            self.current_generation = 1;
+        }
+        self.touched.clear();
+    }
+
+    /// Reset `doc`'s slot the first time it is seen this pass and record it.
+    #[inline]
+    fn touch(&mut self, doc: ShortId) {
+        let i = doc as usize;
+        if self.generation[i] != self.current_generation {
+            self.generation[i] = self.current_generation;
+            self.score[i] = 0.0;
+            self.terms[i].clear();
+            self.touched.push(doc);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Bm25Params {
@@ -826,7 +888,7 @@ impl MiniSearch {
 
     fn execute_query_spec(&self, query: &QuerySpec, options: &SearchOptions) -> RawResult {
         let field_boosts = self.field_boosts(options);
-        let mut results = RawResult::new();
+        let mut results = RawResult::default();
 
         if let Some(data) = self.index.get(&query.term) {
             self.term_results(
@@ -841,8 +903,6 @@ impl MiniSearch {
             );
         }
 
-        let mut fuzzy_terms = HashSet::new();
-
         if query.prefix {
             self.index.for_each_prefix(&query.term, |term, data| {
                 // Term length is measured in characters (code points), matching
@@ -854,7 +914,6 @@ impl MiniSearch {
                     return;
                 }
 
-                fuzzy_terms.insert(term.to_owned());
                 let weight = options.weights.prefix * term_len as f64
                     / (term_len as f64 + 0.3 * distance as f64);
                 self.term_results(
@@ -883,7 +942,14 @@ impl MiniSearch {
             if max_distance > 0 {
                 self.index
                     .for_each_fuzzy(&query.term, max_distance, |term, data, distance| {
-                        if distance == 0 || fuzzy_terms.contains(term) {
+                        // A term already surfaced by the prefix pass (it starts
+                        // with the query term) was added there; skip it here so
+                        // it isn't double-counted. Equivalent to the old
+                        // per-query HashSet<String> dedup, without the
+                        // allocations or hashing.
+                        if distance == 0
+                            || (query.prefix && term.starts_with(query.term.as_str()))
+                        {
                             return;
                         }
 
@@ -913,82 +979,108 @@ impl MiniSearch {
         options: &SearchOptions,
     ) -> RawCompactResult {
         let field_boosts = self.field_boosts(options);
-        let mut results = RawCompactResult::new();
 
-        if let Some(data) = self.index.get(&query.term) {
-            self.term_results_compact(
-                &query.term,
-                &query.term,
-                1.0,
-                query.term_boost,
-                data,
-                &field_boosts,
-                options.bm25,
-                &mut results,
-            );
-        }
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.begin(self.next_id as usize);
 
-        let mut fuzzy_terms = HashSet::new();
-
-        if query.prefix {
-            self.index.for_each_prefix(&query.term, |term, data| {
-                let term_len = term.chars().count();
-                let distance = term_len.saturating_sub(query.term.chars().count());
-                if distance == 0 {
-                    return;
-                }
-
-                fuzzy_terms.insert(term.to_owned());
-                let weight = options.weights.prefix * term_len as f64
-                    / (term_len as f64 + 0.3 * distance as f64);
-                self.term_results_compact(
+            if let Some(data) = self.index.get(&query.term) {
+                self.accumulate_dense(
+                    &mut scratch,
                     &query.term,
-                    term,
-                    weight,
+                    1.0,
                     query.term_boost,
                     data,
                     &field_boosts,
                     options.bm25,
-                    &mut results,
                 );
-            });
-        }
-
-        if let Some(fuzzy) = query.fuzzy {
-            let term_len = query.term.chars().count();
-            let max_distance = if fuzzy < 1.0 {
-                options
-                    .max_fuzzy
-                    .min((term_len as f64 * fuzzy).round() as usize)
-            } else {
-                fuzzy as usize
-            };
-
-            if max_distance > 0 {
-                self.index
-                    .for_each_fuzzy(&query.term, max_distance, |term, data, distance| {
-                        if distance == 0 || fuzzy_terms.contains(term) {
-                            return;
-                        }
-
-                        let term_len = term.chars().count();
-                        let weight = options.weights.fuzzy * term_len as f64
-                            / (term_len as f64 + distance as f64);
-                        self.term_results_compact(
-                            &query.term,
-                            term,
-                            weight,
-                            query.term_boost,
-                            data,
-                            &field_boosts,
-                            options.bm25,
-                            &mut results,
-                        );
-                    });
             }
-        }
 
-        results
+            if query.prefix {
+                self.index.for_each_prefix(&query.term, |term, data| {
+                    let term_len = term.chars().count();
+                    let distance = term_len.saturating_sub(query.term.chars().count());
+                    if distance == 0 {
+                        return;
+                    }
+
+                    let weight = options.weights.prefix * term_len as f64
+                        / (term_len as f64 + 0.3 * distance as f64);
+                    self.accumulate_dense(
+                        &mut scratch,
+                        term,
+                        weight,
+                        query.term_boost,
+                        data,
+                        &field_boosts,
+                        options.bm25,
+                    );
+                });
+            }
+
+            if let Some(fuzzy) = query.fuzzy {
+                let term_len = query.term.chars().count();
+                let max_distance = if fuzzy < 1.0 {
+                    options
+                        .max_fuzzy
+                        .min((term_len as f64 * fuzzy).round() as usize)
+                } else {
+                    fuzzy as usize
+                };
+
+                if max_distance > 0 {
+                    self.index
+                        .for_each_fuzzy(&query.term, max_distance, |term, data, distance| {
+                            // A term already surfaced by the prefix pass (it
+                            // starts with the query term) was added there; skip
+                            // it here so it isn't double-counted. Equivalent to
+                            // the old per-query HashSet<String> dedup, without
+                            // the allocations or hashing.
+                            if distance == 0
+                                || (query.prefix && term.starts_with(query.term.as_str()))
+                            {
+                                return;
+                            }
+
+                            let term_len = term.chars().count();
+                            let weight = options.weights.fuzzy * term_len as f64
+                                / (term_len as f64 + distance as f64);
+                            self.accumulate_dense(
+                                &mut scratch,
+                                term,
+                                weight,
+                                query.term_boost,
+                                data,
+                                &field_boosts,
+                                options.bm25,
+                            );
+                        });
+                }
+            }
+
+            // Materialize the per-spec result from the touched docs. Within a
+            // spec every contribution shares the same source term, so
+            // `query_terms` is always just `[query.term]` — set here instead of
+            // accumulating it per posting. `mem::take` hands the collected term
+            // strings to the result without cloning.
+            let mut results = RawCompactResult::default();
+            results.reserve(scratch.touched.len());
+            let touched = std::mem::take(&mut scratch.touched);
+            for &doc_id in &touched {
+                let i = doc_id as usize;
+                let terms = std::mem::take(&mut scratch.terms[i]);
+                results.insert(
+                    doc_id,
+                    RawCompactResultValue {
+                        score: scratch.score[i],
+                        query_terms: vec![query.term.clone()],
+                        terms,
+                    },
+                );
+            }
+            scratch.touched = touched;
+            results
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1069,17 +1161,22 @@ impl MiniSearch {
         }
     }
 
+    // Dense accumulation for the compact path: add each posting's BM25
+    // contribution into the doc-id-indexed `Scratch` arrays instead of hashing
+    // into a map. Mirrors `term_results` exactly (same loop order, so the
+    // floating-point score sums are bit-identical), minus the `match` map and
+    // the per-spec-constant `query_terms` (handled by the caller). `source_term`
+    // is implicit — it is always the spec's own term.
     #[allow(clippy::too_many_arguments)]
-    fn term_results_compact(
+    fn accumulate_dense(
         &self,
-        source_term: &str,
+        scratch: &mut Scratch,
         derived_term: &str,
         term_weight: f64,
         term_boost: f64,
         field_term_data: &FieldTermData,
         field_boosts: &[FieldBoost],
         bm25_params: Bm25Params,
-        results: &mut RawCompactResult,
     ) {
         // A clean index (no discarded docs) has no dead postings, so the
         // per-posting liveness check is pure overhead we can skip.
@@ -1130,17 +1227,11 @@ impl MiniSearch {
                         bm25_params,
                     );
                 let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
-                let result = results
-                    .entry(*doc_id)
-                    .or_insert_with(|| RawCompactResultValue {
-                        score: 0.0,
-                        query_terms: Vec::new(),
-                        terms: Vec::new(),
-                    });
 
-                result.score += weighted_score;
-                assign_unique(&mut result.query_terms, source_term);
-                assign_unique(&mut result.terms, derived_term);
+                scratch.touch(*doc_id);
+                let i = *doc_id as usize;
+                scratch.score[i] += weighted_score;
+                assign_unique(&mut scratch.terms[i], derived_term);
             }
         }
     }
@@ -1455,7 +1546,7 @@ fn merge_search_options(base: &SearchOptions, override_options: &SearchOptions) 
 fn combine_results(results: Vec<RawResult>, combine_with: CombineWith) -> RawResult {
     let mut iter = results.into_iter();
     let Some(first) = iter.next() else {
-        return RawResult::new();
+        return RawResult::default();
     };
 
     iter.fold(first, |mut left, right| match combine_with {
@@ -1473,7 +1564,7 @@ fn combine_results(results: Vec<RawResult>, combine_with: CombineWith) -> RawRes
             left
         }
         CombineWith::And => {
-            let mut combined = RawResult::new();
+            let mut combined = RawResult::default();
 
             for (doc_id, value) in right {
                 if let Some(mut existing) = left.remove(&doc_id) {
@@ -1502,7 +1593,7 @@ fn combine_compact_results(
 ) -> RawCompactResult {
     let mut iter = results.into_iter();
     let Some(first) = iter.next() else {
-        return RawCompactResult::new();
+        return RawCompactResult::default();
     };
 
     iter.fold(first, |mut left, right| match combine_with {
@@ -1520,7 +1611,7 @@ fn combine_compact_results(
             left
         }
         CombineWith::And => {
-            let mut combined = RawCompactResult::new();
+            let mut combined = RawCompactResult::default();
 
             for (doc_id, value) in right {
                 if let Some(mut existing) = left.remove(&doc_id) {

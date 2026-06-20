@@ -1,0 +1,7 @@
+# Enable WebAssembly SIMD (128-bit) for release builds. Lets LLVM autovectorize
+# the BM25 arithmetic loops; ~5% on searchJoined with bit-identical results.
+# Only applies to the wasm target (native `cargo test` is unaffected). Requires
+# a browser with Wasm SIMD — universal in modern browsers (Chrome/Firefox/Safari
+# 2021+); drop this flag if you must support very old engines.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
