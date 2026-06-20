@@ -1,0 +1,44 @@
+.cargo/config.toml
+  s_4535e2d701c42f::t_8828c71c9384a6 1-7
+Cargo.toml
+  s_4535e2d701c42f::t_e98563a70bf3c2 3
+  s_4535e2d701c42f::t_0f5a39730acff1 13-15
+src/mini_search.rs
+  s_4535e2d701c42f::t_718d6ea85683bb 5
+  s_4535e2d701c42f::t_3ce1f4bbda62ba 13-17
+  s_4535e2d701c42f::t_c865441cb282b5 945-952
+  s_4535e2d701c42f::t_e72b650723ede7 983-985,987-989,991,997,999-1019,1021-1058,1061-1083
+  s_4535e2d701c42f::t_3c8da5c03b14f5 19-74
+  s_4535e2d701c42f::t_37f35ebf716837 2
+  s_4535e2d701c42f::t_74d4456f02197d 1567
+  s_4535e2d701c42f::t_51d17c070a5a11 1614
+  s_4535e2d701c42f::t_3e03b1d935a4ac 891
+  s_4535e2d701c42f::t_1ed8e92286e4e8 1549
+  s_4535e2d701c42f::t_2c35de424044b8 1164-1169,1171,1173,1231-1234
+  s_4535e2d701c42f::t_e3ff6e8f1ec1dc 1596
+package.json
+  s_4535e2d701c42f::t_e3b2f105f808f0 3
+src/lib.rs
+  s_4535e2d701c42f::t_7b0847b5074de8 221-235,243-245,251-256,288-296,299-300,303
+  s_4535e2d701c42f::t_a528de2aef418f 10
+  s_4535e2d701c42f::t_9dd3684f0a7c2d 236,258-264,275-287
+  s_4535e2d701c42f::t_ab9bbf69d9de2d 13
+  s_4535e2d701c42f::t_3b3211a7d3c101 85-92,99
+  s_4535e2d701c42f::t_167ed0517813b0 220,237-242,246-250,257,265-274,297-298,301-302,304-331
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "18ff3173a0cf27d51459ddd321ff758957c75626",
+  "prompts": {},
+  "sessions": {
+    "s_4535e2d701c42f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b116e18-9ab1-4b45-9285-e7eed782ecde",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
