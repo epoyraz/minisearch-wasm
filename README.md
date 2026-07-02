@@ -60,6 +60,18 @@ for (let i = 0; i < r.count; i++) {
 // Compatibility path — MiniSearch-shaped result objects (slower, see above):
 const full = mini.search("software engineer", { combineWith: "AND" });
 
+// Auto-suggest (search-as-you-type), MiniSearch-compatible: AND + prefix on
+// the last term by default; defaults configurable via the constructor's
+// `autoSuggestOptions`, overridable per call.
+const suggestions = mini.autoSuggest("softw eng", { fuzzy: 0.2 });
+// => [{ suggestion: "software engineer", terms: ["software", "engineer"], score: … }, …]
+
+// Fast path: one string + one Float64Array across the boundary; a suggestion
+// row IS its space-joined terms.
+const s = mini.autoSuggestJoined("softw eng");
+const phrases = s.count ? s.suggestions.split("\n") : [];
+for (let i = 0; i < s.count; i++) use(phrases[i], s.scores[i], phrases[i].split(" "));
+
 // Persistence: compact binary snapshot — smaller on the wire than JSON and
 // faster to load.
 const bytes = mini.toBytes();            // Uint8Array
@@ -69,8 +81,12 @@ const loaded = MiniSearchWasm.loadBytes(bytes);
 ## Differences from MiniSearch
 
 This is a from-scratch reimplementation. It matches MiniSearch's **ranking** —
-identical BM25 scores, verified to float epsilon (`max delta ≈ 1e-14`) on a
-21k-document corpus — but deliberately diverges from its API and internals:
+identical BM25 scores, verified to float epsilon on a 21k-document corpus
+(`max delta ≈ 1e-14`) and on a 3k-document differential suite covering
+search + autoSuggest before and after removes/discards (`max delta ≈ 5e-16`,
+i.e. last-ulp `Math.log` vs `ln` rounding; per-document matched-term order
+identical, since the radix tree replicates JS MiniSearch's key order and
+traversal exactly) — but deliberately diverges from its API and internals:
 
 - **No JavaScript callbacks.** MiniSearch takes user functions for
   `extractField`, `tokenize`, `processTerm`, and search-time `filter` /
@@ -93,15 +109,16 @@ identical BM25 scores, verified to float epsilon (`max delta ≈ 1e-14`) on a
 - **Search never mutates the index.** MiniSearch lazily removes stale postings
   mid-query when it meets a discarded document; this port just skips them (and
   skips the liveness check entirely on a clean index).
-- **Not implemented (yet).** `autoSuggest`, wildcard queries
-  (`MiniSearch.wildcard`) and nested query-expression trees, async indexing
-  (`addAllAsync`), `vacuum`, and batch `removeAll`/`discardAll`. The query is a
-  plain string plus options, not a query tree. See `PORTING.md`.
-- **Added beyond MiniSearch.** `searchJoined` (compact columnar results for a
-  thin Wasm boundary), `addAllJSON` (index straight from a raw JSON string),
-  `toBytes`/`loadBytes` (compact binary snapshot), the `"jobboard"` tokenizer,
-  and — internally, with identical results — a bit-parallel (Myers) fuzzy
-  traversal and `HashMap`-backed postings.
+- **Not implemented (yet).** Wildcard queries (`MiniSearch.wildcard`) and
+  nested query-expression trees, async indexing (`addAllAsync`), `vacuum`, and
+  batch `removeAll`/`discardAll`. The query is a plain string plus options, not
+  a query tree. `autoSuggest` is implemented (minus the JS `filter` callback,
+  per the no-callbacks rule). See `PORTING.md`.
+- **Added beyond MiniSearch.** `searchJoined` / `autoSuggestJoined` (compact
+  columnar results for a thin Wasm boundary), `addAllJSON` (index straight from
+  a raw JSON string), `toBytes`/`loadBytes` (compact binary snapshot), the
+  `"jobboard"` tokenizer, and — internally, with identical results — a
+  bit-parallel (Myers) fuzzy traversal and `HashMap`-backed postings.
 
 ## Benchmark results
 

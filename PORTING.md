@@ -57,6 +57,36 @@ Benchmark snapshot (median, vs JS MiniSearch): search app-workload ~1.5×,
 `loadBytes` ~8×, `toBytes` ~12×, `addAllJSON` ~1.3×. Full MiniSearch-compatible
 `search()` stays ~0.5× and is kept only for compatibility — see README "Design".
 
+## autoSuggest + exact tree-order parity
+
+`autoSuggest(query, options?)` is ported (issue #2): terms combine with `AND`
+and only the last term is prefix-expanded by default; ranked results are
+grouped by matched-terms phrase with scores averaged per phrase. Defaults are
+configurable via the constructor's `autoSuggestOptions` (persisted in
+snapshots) and overridable per call. `autoSuggestJoined(query)` is the
+boundary-frugal variant (`{ count, suggestions, scores }`, one string + one
+`Float64Array`). The JS `filter` callback option is intentionally not ported
+(no JS callbacks in the engine). Rust conformance tests cover the whole
+reference `autoSuggest` describe block except the `filter` case.
+
+Because a suggestion's phrase is the document's matched terms **in match
+order**, this work also made the radix tree replicate JS MiniSearch's key
+order and traversal exactly:
+
+- node key order = insertion order; an edge split re-inserts the shared prefix
+  at the END (JS `Map.set` + `Map.delete`), delete-side merges likewise; the
+  leaf occupies a real position in the key order (`leaf_pos`).
+- prefix/entries traversal consumes keys from the END (JS `TreeIterator`);
+  fuzzy traversal walks keys FORWARD (JS `fuzzySearch`).
+
+This makes per-document matched-term order identical to JS and tightens score
+parity from ~1e-14 to last-ulp `Math.log`-vs-`ln` differences (~5e-16
+relative). Verified by a 3k-doc differential suite (fresh + after
+remove/discard; search × 6 option combos + autoSuggest × 3): 684 labels,
+~350k result rows, all matching. On dirty indexes JS is compared at its
+post-lazy-cleanup fixpoint (2nd run of each query), since this port
+deliberately never mutates the index during search.
+
 ## Intentional API Direction
 
 This port is all Rust at the engine level. It does not preserve JavaScript
@@ -72,10 +102,9 @@ superseded them.
 ## Next Test Slices
 
 1. Serialization parity for `toJSON` / `loadJSON` behavior.
-2. Auto-suggestion ranking.
-3. Wildcard query behavior.
-4. Async/vacuum-equivalent cleanup behavior, likely as synchronous Rust cleanup
+2. Wildcard query behavior.
+3. Async/vacuum-equivalent cleanup behavior, likely as synchronous Rust cleanup
    plus optional Wasm-friendly chunking.
-5. Unicode tokenizer edge cases from the original tests.
-6. Larger ranking fixtures near the end of `MiniSearch.test.js`.
-7. Browser or Node smoke test against the generated `pkg/` package.
+4. Unicode tokenizer edge cases from the original tests.
+5. Larger ranking fixtures near the end of `MiniSearch.test.js`.
+6. Browser or Node smoke test against the generated `pkg/` package.

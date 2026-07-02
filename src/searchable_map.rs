@@ -10,6 +10,16 @@ pub struct FuzzyMatch<T> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RadixNode<T> {
     leaf: Option<T>,
+    /// Position of the leaf entry within this node's key order. JS MiniSearch
+    /// stores the leaf under an ordinary map key (`LEAF`), so it has an
+    /// insertion position among the children; iteration order — and therefore
+    /// which derived term reaches a document first, the per-document term
+    /// order, and the last-ulp rounding of summed scores — depends on it.
+    /// Maintained so traversal replicates JS exactly. Meaningless while `leaf`
+    /// is `None`; absent in data serialized by older versions (defaults to 0,
+    /// matching their leaf-first behavior).
+    #[serde(default)]
+    leaf_pos: u32,
     children: Vec<(String, RadixNode<T>)>,
 }
 
@@ -17,6 +27,7 @@ impl<T> Default for RadixNode<T> {
     fn default() -> Self {
         Self {
             leaf: None,
+            leaf_pos: 0,
             children: Vec::new(),
         }
     }
@@ -25,6 +36,12 @@ impl<T> Default for RadixNode<T> {
 impl<T> RadixNode<T> {
     fn is_empty(&self) -> bool {
         self.leaf.is_none() && self.children.is_empty()
+    }
+
+    /// The leaf's slot in the key order, clamped into range (data from older
+    /// versions has no recorded position).
+    fn leaf_slot(&self) -> usize {
+        (self.leaf_pos as usize).min(self.children.len())
     }
 }
 
@@ -52,6 +69,11 @@ impl<T> SearchableMap<T> {
 
     pub fn set(&mut self, key: &str, value: T) {
         let node = create_path(&mut self.root, key);
+        if node.leaf.is_none() {
+            // A new leaf appends at the end of the node's key order, like JS
+            // `node.set(LEAF, value)`; an existing leaf keeps its position.
+            node.leaf_pos = node.children.len() as u32;
+        }
         node.leaf = Some(value);
     }
 
@@ -62,6 +84,7 @@ impl<T> SearchableMap<T> {
         let node = create_path(&mut self.root, key);
 
         if node.leaf.is_none() {
+            node.leaf_pos = node.children.len() as u32;
             node.leaf = Some(initial());
         }
 
@@ -73,6 +96,9 @@ impl<T> SearchableMap<T> {
         F: FnOnce(Option<T>) -> T,
     {
         let node = create_path(&mut self.root, key);
+        if node.leaf.is_none() {
+            node.leaf_pos = node.children.len() as u32;
+        }
         let current = node.leaf.take();
         node.leaf = Some(updater(current));
     }
@@ -265,8 +291,8 @@ fn create_path<'a, T>(node: &'a mut RadixNode<T>, key: &str) -> &'a mut RadixNod
     }
 
     for index in 0..node.children.len() {
-        let child_key = node.children[index].0.clone();
-        let offset = common_prefix_len(key, &child_key);
+        let child_key = &node.children[index].0;
+        let offset = common_prefix_len(key, child_key);
 
         if offset == 0 {
             continue;
@@ -276,16 +302,25 @@ fn create_path<'a, T>(node: &'a mut RadixNode<T>, key: &str) -> &'a mut RadixNod
             return create_path(&mut node.children[index].1, &key[offset..]);
         }
 
-        let child = std::mem::take(&mut node.children[index].1);
-        let shared = child_key[..offset].to_owned();
-        let existing_suffix = child_key[offset..].to_owned();
+        // Partial overlap: split the edge. JS re-inserts the shared prefix with
+        // `Map.set` and deletes the old key, which moves the entry to the END
+        // of the node's key order — replicate that, adjusting the leaf slot for
+        // the removal.
+        let (old_key, child) = node.children.remove(index);
+        if (index as u32) < node.leaf_pos {
+            node.leaf_pos -= 1;
+        }
+        let shared = old_key[..offset].to_owned();
+        let existing_suffix = old_key[offset..].to_owned();
         let intermediate = RadixNode {
             leaf: None,
+            leaf_pos: 0,
             children: vec![(existing_suffix, child)],
         };
 
-        node.children[index] = (shared, intermediate);
-        return create_path(&mut node.children[index].1, &key[offset..]);
+        node.children.push((shared, intermediate));
+        let last = node.children.len() - 1;
+        return create_path(&mut node.children[last].1, &key[offset..]);
     }
 
     node.children.push((key.to_owned(), RadixNode::default()));
@@ -347,22 +382,40 @@ fn delete_from<T>(node: &mut RadixNode<T>, key: &str) -> bool {
 fn compact_child<T>(node: &mut RadixNode<T>, index: usize) {
     if node.children[index].1.is_empty() {
         node.children.remove(index);
+        if (index as u32) < node.leaf_pos {
+            node.leaf_pos -= 1;
+        }
         return;
     }
 
     if node.children[index].1.leaf.is_none() && node.children[index].1.children.len() == 1 {
-        let (suffix, grandchild) = node.children[index].1.children.remove(0);
-        node.children[index].0.push_str(&suffix);
-        node.children[index].1 = grandchild;
+        // Collapse the chain link. JS `merge` re-inserts the concatenated key
+        // with `Map.set` + `Map.delete`, moving it to the END of the key order.
+        let (mut merged_key, mut middle) = node.children.remove(index);
+        if (index as u32) < node.leaf_pos {
+            node.leaf_pos -= 1;
+        }
+        let (suffix, grandchild) = middle.children.remove(0);
+        merged_key.push_str(&suffix);
+        node.children.push((merged_key, grandchild));
     }
 }
 
 fn collect_entries<T: Clone>(node: &RadixNode<T>, prefix: String, entries: &mut Vec<(String, T)>) {
+    // Match JS MiniSearch's TreeIterator: keys are consumed from the END of
+    // each node's key order, with the leaf at its recorded slot.
+    let slot = node.leaf_slot();
+    for (child_key, child) in node.children[slot..].iter().rev() {
+        let mut key = prefix.clone();
+        key.push_str(child_key);
+        collect_entries(child, key, entries);
+    }
+
     if let Some(value) = &node.leaf {
         entries.push((prefix.clone(), value.clone()));
     }
 
-    for (child_key, child) in &node.children {
+    for (child_key, child) in node.children[..slot].iter().rev() {
         let mut key = prefix.clone();
         key.push_str(child_key);
         collect_entries(child, key, entries);
@@ -382,11 +435,24 @@ fn visit_entries<T, F>(node: &RadixNode<T>, prefix: &mut String, visitor: &mut F
 where
     F: FnMut(&str, &T),
 {
+    // Match JS MiniSearch's TreeIterator: keys are consumed from the END of
+    // each node's key order, with the leaf at its recorded slot. The order in
+    // which derived terms reach a document decides that document's term list
+    // order and the last-ulp rounding of its summed score, so prefix search
+    // must walk exactly like the original.
+    let slot = node.leaf_slot();
+    for (child_key, child) in node.children[slot..].iter().rev() {
+        let prefix_len = prefix.len();
+        prefix.push_str(child_key);
+        visit_entries(child, prefix, visitor);
+        prefix.truncate(prefix_len);
+    }
+
     if let Some(value) = &node.leaf {
         visitor(prefix, value);
     }
 
-    for (child_key, child) in &node.children {
+    for (child_key, child) in node.children[..slot].iter().rev() {
         let prefix_len = prefix.len();
         prefix.push_str(child_key);
         visit_entries(child, prefix, visitor);
@@ -463,18 +529,26 @@ fn fuzzy_recurse<T: Clone>(
 ) {
     let offset = row * columns;
 
-    if let Some(value) = &node.leaf {
-        let distance = matrix[offset - 1];
-        if distance <= max_distance as u16 {
-            results.push(FuzzyMatch {
-                key: prefix.clone(),
-                value: value.clone(),
-                distance: distance as usize,
-            });
+    // JS `fuzzySearch` iterates node keys in FORWARD order (unlike the entries
+    // iterator), with the leaf at its recorded slot — mirror that exactly.
+    let slot = node.leaf_slot();
+    for index in 0..=node.children.len() {
+        if index == slot {
+            if let Some(value) = &node.leaf {
+                let distance = matrix[offset - 1];
+                if distance <= max_distance as u16 {
+                    results.push(FuzzyMatch {
+                        key: prefix.clone(),
+                        value: value.clone(),
+                        distance: distance as usize,
+                    });
+                }
+            }
         }
-    }
-
-    for (child_key, child) in &node.children {
+        if index == node.children.len() {
+            break;
+        }
+        let (child_key, child) = &node.children[index];
         let mut i = row;
         let mut skipped = false;
 
@@ -541,14 +615,22 @@ fn fuzzy_visit<T, F>(
 {
     let offset = row * columns;
 
-    if let Some(value) = &node.leaf {
-        let distance = matrix[offset - 1];
-        if distance <= max_distance as u16 {
-            visitor(prefix, value, distance as usize);
+    // JS `fuzzySearch` iterates node keys in FORWARD order (unlike the entries
+    // iterator), with the leaf at its recorded slot — mirror that exactly.
+    let slot = node.leaf_slot();
+    for index in 0..=node.children.len() {
+        if index == slot {
+            if let Some(value) = &node.leaf {
+                let distance = matrix[offset - 1];
+                if distance <= max_distance as u16 {
+                    visitor(prefix, value, distance as usize);
+                }
+            }
         }
-    }
-
-    for (child_key, child) in &node.children {
+        if index == node.children.len() {
+            break;
+        }
+        let (child_key, child) = &node.children[index];
         let mut i = row;
         let mut skipped = false;
 
@@ -667,15 +749,23 @@ fn fuzzy_visit_myers<T, F>(
 ) where
     F: FnMut(&str, &T, usize),
 {
-    if let Some(value) = &node.leaf {
-        if score <= max_distance {
-            visitor(prefix, value, score);
-        }
-    }
-
     let k = max_distance as i64;
 
-    for (child_key, child) in &node.children {
+    // JS `fuzzySearch` iterates node keys in FORWARD order (unlike the entries
+    // iterator), with the leaf at its recorded slot — mirror that exactly.
+    let slot = node.leaf_slot();
+    for index in 0..=node.children.len() {
+        if index == slot {
+            if let Some(value) = &node.leaf {
+                if score <= max_distance {
+                    visitor(prefix, value, score);
+                }
+            }
+        }
+        if index == node.children.len() {
+            break;
+        }
+        let (child_key, child) = &node.children[index];
         let mut cvp = vp;
         let mut cvn = vn;
         let mut cscore = score;

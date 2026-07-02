@@ -1,0 +1,9 @@
+{
+  "name": "minisearch-wasm-differential",
+  "private": true,
+  "type": "module",
+  "description": "Differential test harness: runs identical corpora and queries through JS MiniSearch and this port, and compares results (ids, scores, per-document term order, suggestions).",
+  "dependencies": {
+    "minisearch": "7.2.0"
+  }
+}

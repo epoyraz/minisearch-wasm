@@ -2,8 +2,9 @@ mod mini_search;
 mod searchable_map;
 
 pub use mini_search::{
-    Bm25Params, CombineWith, CompactSearchResult, FuzzySetting, MiniSearch, MiniSearchOptions,
-    PackedSearchResults, SearchOptions, SearchResult, TokenizerMode, Weights,
+    AutoSuggestOptions, Bm25Params, CombineWith, CompactSearchResult, FuzzySetting, MiniSearch,
+    MiniSearchOptions, PackedSearchResults, SearchOptions, SearchResult, Suggestion, TokenizerMode,
+    Weights,
 };
 pub use searchable_map::{FuzzyMatch, SearchableMap};
 
@@ -96,7 +97,10 @@ impl MiniSearchWasm {
                 .map_err(|err| JsValue::from_str(&err.to_string()))?
         };
 
-        Ok(results_to_js(&self.inner.search(query, search_options), include_match))
+        Ok(results_to_js(
+            &self.inner.search(query, search_options),
+            include_match,
+        ))
     }
 
     /// App-facing fast search and the recommended path for embedding apps. Only
@@ -113,6 +117,84 @@ impl MiniSearchWasm {
     #[wasm_bindgen(js_name = searchJoined)]
     pub fn search_joined_js(&self, query: &str, or_mode: bool) -> JsValue {
         packed_to_joined_js(&self.inner.search_packed_default(query, or_mode))
+    }
+
+    /// MiniSearch-compatible `autoSuggest(query, options?)`: suggestions for
+    /// search-as-you-type, each as `{ suggestion, terms, score }`, sorted by
+    /// descending score. By default query terms are combined with `AND` and
+    /// only the last term is prefix-expanded; defaults can be changed with the
+    /// constructor's `autoSuggestOptions` or overridden per call (supported
+    /// option keys: `fields`, `boost`, `weights`, `prefix`, `fuzzy`,
+    /// `maxFuzzy`, `combineWith`, `bm25`).
+    #[wasm_bindgen(js_name = autoSuggest)]
+    pub fn auto_suggest_js(&self, query: &str, options: JsValue) -> Result<JsValue, JsValue> {
+        let per_call: Option<AutoSuggestOptions> = if options.is_null() || options.is_undefined() {
+            None
+        } else {
+            Some(
+                serde_wasm_bindgen::from_value(options)
+                    .map_err(|err| JsValue::from_str(&err.to_string()))?,
+            )
+        };
+
+        let suggestions = self.inner.auto_suggest(query, per_call.as_ref());
+
+        let suggestion_key = JsValue::from_str("suggestion");
+        let terms_key = JsValue::from_str("terms");
+        let score_key = JsValue::from_str("score");
+        let array = Array::new_with_length(suggestions.len() as u32);
+        for (index, entry) in suggestions.iter().enumerate() {
+            let object = Object::new();
+            let _ = Reflect::set(
+                &object,
+                &suggestion_key,
+                &JsValue::from_str(&entry.suggestion),
+            );
+            let terms = Array::new_with_length(entry.terms.len() as u32);
+            for (term_index, term) in entry.terms.iter().enumerate() {
+                terms.set(term_index as u32, JsValue::from_str(term));
+            }
+            let _ = Reflect::set(&object, &terms_key, &terms);
+            let _ = Reflect::set(&object, &score_key, &JsValue::from_f64(entry.score));
+            array.set(index as u32, object.into());
+        }
+        Ok(array.into())
+    }
+
+    /// Boundary-frugal auto-suggest, in the spirit of `searchJoined`: runs with
+    /// the index's configured auto-suggest options and returns
+    /// `{ count, suggestions: "vita nova\nvita nostra\n…", scores: Float64Array }`.
+    /// Each row of `suggestions` is one suggestion phrase; its terms are the
+    /// row split on single spaces (a suggestion string *is* its space-joined
+    /// terms), so no per-suggestion JS objects or term arrays cross the
+    /// boundary.
+    #[wasm_bindgen(js_name = autoSuggestJoined)]
+    pub fn auto_suggest_joined_js(&self, query: &str) -> JsValue {
+        let entries = self.inner.auto_suggest(query, None);
+
+        let scores = Float64Array::new_with_length(entries.len() as u32);
+        let mut suggestions = String::new();
+        for (index, entry) in entries.iter().enumerate() {
+            scores.set_index(index as u32, entry.score);
+            if index > 0 {
+                suggestions.push('\n');
+            }
+            suggestions.push_str(&entry.suggestion);
+        }
+
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("count"),
+            &JsValue::from_f64(entries.len() as f64),
+        );
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("suggestions"),
+            &JsValue::from_str(&suggestions),
+        );
+        let _ = Reflect::set(&object, &JsValue::from_str("scores"), &scores);
+        object.into()
     }
 
     /// Profiling probe: runs the search but returns only the hit count, so
@@ -248,7 +330,11 @@ fn results_to_js(results: &[SearchResult], include_match: bool) -> JsValue {
         let object = Object::new();
         let _ = Reflect::set(&object, &id_key, &json_to_js(&result.id));
         let _ = Reflect::set(&object, &score_key, &JsValue::from_f64(result.score));
-        let _ = Reflect::set(&object, &terms_key, &interned_str_array(&result.terms, &mut interns));
+        let _ = Reflect::set(
+            &object,
+            &terms_key,
+            &interned_str_array(&result.terms, &mut interns),
+        );
         let _ = Reflect::set(
             &object,
             &query_terms_key,

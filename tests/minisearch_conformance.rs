@@ -1,5 +1,6 @@
 use minisearch_wasm::{
-    CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions, SearchOptions, TokenizerMode,
+    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions, SearchOptions,
+    TokenizerMode,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -40,6 +41,7 @@ fn mini_search() -> MiniSearch {
         store_fields: vec!["title".to_owned(), "category".to_owned()],
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions::default(),
+        auto_suggest_options: None,
     });
 
     search.add_all(documents()).unwrap();
@@ -106,6 +108,7 @@ fn supports_field_boosting_and_field_filtering() {
         store_fields: vec![],
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions::default(),
+        auto_suggest_options: None,
     });
     search
         .add_all(vec![
@@ -286,6 +289,7 @@ fn jobboard_tokenizer_preserves_symbol_terms() {
         store_fields: vec![],
         tokenizer: TokenizerMode::Jobboard,
         search_options: SearchOptions::default(),
+        auto_suggest_options: None,
     });
     search
         .add_all(vec![json!({
@@ -299,6 +303,184 @@ fn jobboard_tokenizer_preserves_symbol_terms() {
         assert_eq!(
             search.search(query, SearchOptions::default())[0].id,
             json!("job/1")
+        );
+    }
+}
+
+// ---- autoSuggest (ported from reference-tests "autoSuggest" describe block;
+// the "applies the given custom filter" case is not portable, since this port
+// has no JS filter callbacks) --------------------------------------------
+
+fn italian_documents() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "id": 1,
+            "title": "Divina Commedia",
+            "text": "Nel mezzo del cammin di nostra vita",
+            "category": "poetry"
+        }),
+        json!({
+            "id": 2,
+            "title": "I Promessi Sposi",
+            "text": "Quel ramo del lago di Como",
+            "category": "fiction"
+        }),
+        json!({
+            "id": 3,
+            "title": "Vita Nova",
+            "text": "In quella parte del libro della mia memoria",
+            "category": "poetry"
+        }),
+    ]
+}
+
+fn auto_suggest_index(
+    search_options: SearchOptions,
+    auto_suggest_options: Option<AutoSuggestOptions>,
+) -> MiniSearch {
+    let mut search = MiniSearch::new(MiniSearchOptions {
+        fields: vec!["title".to_owned(), "text".to_owned()],
+        id_field: "id".to_owned(),
+        store_fields: vec!["category".to_owned()],
+        tokenizer: TokenizerMode::Default,
+        search_options,
+        auto_suggest_options,
+    });
+    search.add_all(italian_documents()).unwrap();
+    search
+}
+
+fn suggestions_of(search: &MiniSearch, query: &str) -> Vec<String> {
+    search
+        .auto_suggest(query, None)
+        .into_iter()
+        .map(|entry| entry.suggestion)
+        .collect()
+}
+
+#[test]
+fn auto_suggest_returns_scored_suggestions() {
+    let search = auto_suggest_index(SearchOptions::default(), None);
+    let results = search.auto_suggest("com", None);
+
+    assert!(!results.is_empty());
+    assert_eq!(
+        results
+            .iter()
+            .map(|entry| entry.suggestion.clone())
+            .collect::<Vec<_>>(),
+        vec!["como".to_owned(), "commedia".to_owned()]
+    );
+    assert!(results[0].score > results[1].score);
+}
+
+#[test]
+fn auto_suggest_returns_empty_array_when_nothing_matches() {
+    let search = auto_suggest_index(SearchOptions::default(), None);
+
+    assert!(search.auto_suggest("paguro", None).is_empty());
+    assert!(search.auto_suggest("", None).is_empty());
+    assert!(search
+        .auto_suggest("sottomarino aeroplano", None)
+        .is_empty());
+}
+
+#[test]
+fn auto_suggest_returns_scored_suggestions_for_multi_word_queries() {
+    let search = auto_suggest_index(SearchOptions::default(), None);
+    let results = search.auto_suggest("vita no", None);
+
+    assert!(!results.is_empty());
+    assert_eq!(
+        results
+            .iter()
+            .map(|entry| entry.suggestion.clone())
+            .collect::<Vec<_>>(),
+        vec!["vita nova".to_owned(), "vita nostra".to_owned()]
+    );
+    assert!(results[0].score > results[1].score);
+    assert_eq!(results[0].terms, vec!["vita".to_owned(), "nova".to_owned()]);
+}
+
+#[test]
+fn auto_suggest_respects_the_order_of_query_terms() {
+    let search = auto_suggest_index(SearchOptions::default(), None);
+
+    assert_eq!(
+        suggestions_of(&search, "nostra vi"),
+        vec!["nostra vita".to_owned()]
+    );
+}
+
+#[test]
+fn auto_suggest_does_not_duplicate_suggested_terms() {
+    let search = auto_suggest_index(SearchOptions::default(), None);
+    let results = search.auto_suggest(
+        "vita",
+        Some(&AutoSuggestOptions {
+            fuzzy: Some(FuzzySetting::Enabled(true)),
+            prefix: Some(true),
+            ..AutoSuggestOptions::default()
+        }),
+    );
+
+    assert_eq!(results[0].suggestion, "vita");
+    assert_eq!(results[0].terms, vec!["vita".to_owned()]);
+}
+
+#[test]
+fn auto_suggest_respects_custom_defaults_set_in_the_constructor() {
+    let search = auto_suggest_index(
+        SearchOptions::default(),
+        Some(AutoSuggestOptions {
+            combine_with: Some(CombineWith::Or),
+            fuzzy: Some(FuzzySetting::Enabled(true)),
+            ..AutoSuggestOptions::default()
+        }),
+    );
+
+    assert_eq!(
+        suggestions_of(&search, "nosta vi"),
+        vec!["nostra vita".to_owned(), "vita".to_owned()]
+    );
+}
+
+#[test]
+fn auto_suggest_applies_search_options_not_overridden_by_suggest_defaults() {
+    // combineWith OR in searchOptions must NOT leak into autoSuggest (which
+    // defaults to AND), while fuzzy does apply.
+    let search = auto_suggest_index(
+        SearchOptions {
+            combine_with: CombineWith::Or,
+            fuzzy: Some(FuzzySetting::Enabled(true)),
+            ..SearchOptions::default()
+        },
+        None,
+    );
+
+    assert_eq!(
+        suggestions_of(&search, "nosta vi"),
+        vec!["nostra vita".to_owned()]
+    );
+}
+
+#[test]
+fn auto_suggest_options_survive_binary_snapshots() {
+    let search = auto_suggest_index(
+        SearchOptions::default(),
+        Some(AutoSuggestOptions {
+            combine_with: Some(CombineWith::Or),
+            fuzzy: Some(FuzzySetting::Enabled(true)),
+            ..AutoSuggestOptions::default()
+        }),
+    );
+    let reloaded = MiniSearch::from_bytes(&search.to_bytes().unwrap()).unwrap();
+
+    for query in ["nosta vi", "com", "vita no"] {
+        assert_eq!(
+            reloaded.auto_suggest(query, None),
+            search.auto_suggest(query, None),
+            "query={query}"
         );
     }
 }

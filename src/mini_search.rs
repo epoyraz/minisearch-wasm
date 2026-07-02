@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use unicode_general_category::{get_general_category, GeneralCategory};
 
@@ -205,6 +206,35 @@ impl Default for SearchOptions {
     }
 }
 
+/// Options for [`MiniSearch::auto_suggest`]. Unlike [`SearchOptions`], every
+/// field is optional so that unset fields fall back through the same chain as
+/// JS MiniSearch: per-call options → constructor `autoSuggestOptions` →
+/// constructor `searchOptions` → auto-suggest defaults (`combineWith: AND`,
+/// prefix search on the last query term only).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSuggestOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub boost: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Weights>,
+    /// `Some(true)`: prefix-expand every query term. `Some(false)`: none.
+    /// `None` (default): prefix-expand only the last term, matching the JS
+    /// default of `(term, i, terms) => i === terms.length - 1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy: Option<FuzzySetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fuzzy: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine_with: Option<CombineWith>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25: Option<Bm25Params>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniSearchOptions {
@@ -217,6 +247,11 @@ pub struct MiniSearchOptions {
     pub tokenizer: TokenizerMode,
     #[serde(default)]
     pub search_options: SearchOptions,
+    /// Default options for `auto_suggest`, like the JS `autoSuggestOptions`
+    /// constructor option. `None` keeps snapshots byte-identical to engines
+    /// built before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_suggest_options: Option<AutoSuggestOptions>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -246,6 +281,16 @@ pub struct CompactSearchResult {
     pub id: Value,
     pub score: f64,
     pub terms: Vec<String>,
+}
+
+/// One auto-suggest entry: a completed/corrected version of the query, as in JS
+/// MiniSearch's `Suggestion` type. `suggestion` is always `terms` joined with a
+/// single space.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Suggestion {
+    pub suggestion: String,
+    pub terms: Vec<String>,
+    pub score: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -575,6 +620,151 @@ impl MiniSearch {
             options.combine_with = CombineWith::Or;
         }
         self.run_search_packed(query, &options)
+    }
+
+    /// Suggest completed/corrected versions of `query`, like JS MiniSearch's
+    /// `autoSuggest`: run the query (by default combining terms with `AND` and
+    /// prefix-expanding only the last term), then group the ranked results by
+    /// their matched-terms phrase, averaging the scores of the documents that
+    /// share a phrase.
+    ///
+    /// Option fallback follows JS MiniSearch: `per_call` options override the
+    /// constructor's `autoSuggestOptions`, which override the constructor's
+    /// `searchOptions`; `combineWith` and `prefix` skip the `searchOptions`
+    /// layer and default to `AND` / last-term-only instead.
+    pub fn auto_suggest(
+        &self,
+        query: &str,
+        per_call: Option<&AutoSuggestOptions>,
+    ) -> Vec<Suggestion> {
+        let (options, prefix) = self.resolve_auto_suggest_options(per_call);
+
+        // Like `query_specs`, but with per-term prefix expansion: `None`
+        // prefix-expands only the last term (the JS auto-suggest default).
+        let terms: Vec<String> = tokenize(self.options.tokenizer, query)
+            .into_iter()
+            .map(|term| process_term(self.options.tokenizer, &term))
+            .filter(|term| !term.is_empty())
+            .collect();
+        let last_index = terms.len().saturating_sub(1);
+        let specs: Vec<QuerySpec> = terms
+            .into_iter()
+            .enumerate()
+            .map(|(index, term)| QuerySpec {
+                term,
+                fuzzy: options.fuzzy.and_then(FuzzySetting::value),
+                prefix: prefix.unwrap_or(index == last_index),
+                term_boost: 1.0,
+            })
+            .collect();
+
+        let results = specs
+            .iter()
+            .map(|spec| self.execute_query_spec_compact(spec, &options))
+            .collect::<Vec<_>>();
+        let raw_results = combine_compact_results(results, options.combine_with);
+
+        // Rank documents exactly like `run_search_packed`, so suggestions are
+        // grouped in result-ranking order.
+        let mut ranked: Vec<(ShortId, f64, Vec<String>)> = raw_results
+            .into_iter()
+            .map(|(doc_id, raw)| {
+                let quality = raw.query_terms.len().max(1) as f64;
+                (doc_id, raw.score * quality, raw.terms)
+            })
+            .collect();
+        ranked.sort_by(|(left_id, left_score, _), (right_id, right_score, _)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        // Group by phrase. A doc's matched terms are accumulated in
+        // first-match order (query-spec order, tree-traversal order within a
+        // spec), matching JS `Object.keys(match)`, so the joined phrase is
+        // identical to the JS one. First-appearance grouping order plus the
+        // stable sort below reproduce JS's tie order.
+        let mut phrase_slots: FxHashMap<String, usize> = FxHashMap::default();
+        let mut grouped: Vec<(Vec<String>, f64, u32)> = Vec::new();
+        for (_, score, terms) in ranked {
+            let phrase = terms.join(" ");
+            match phrase_slots.entry(phrase) {
+                Entry::Occupied(slot) => {
+                    let (_, total, count) = &mut grouped[*slot.get()];
+                    *total += score;
+                    *count += 1;
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(grouped.len());
+                    grouped.push((terms, score, 1));
+                }
+            }
+        }
+
+        let mut suggestions: Vec<Suggestion> = grouped
+            .into_iter()
+            .map(|(terms, total, count)| Suggestion {
+                suggestion: terms.join(" "),
+                terms,
+                score: total / count as f64,
+            })
+            .collect();
+        suggestions.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(Ordering::Equal)
+        });
+        suggestions
+    }
+
+    /// Resolve the effective search options for `auto_suggest`, returning the
+    /// merged options plus the tri-state prefix setting (`None` = expand only
+    /// the last term).
+    fn resolve_auto_suggest_options(
+        &self,
+        per_call: Option<&AutoSuggestOptions>,
+    ) -> (SearchOptions, Option<bool>) {
+        let mut options = self.options.search_options.clone();
+        let mut combine_with: Option<CombineWith> = None;
+        let mut prefix: Option<bool> = None;
+
+        let layers = [self.options.auto_suggest_options.as_ref(), per_call];
+        for layer in layers.into_iter().flatten() {
+            if layer.fields.is_some() {
+                options.fields = layer.fields.clone();
+            }
+            if !layer.boost.is_empty() {
+                options.boost = layer.boost.clone();
+            }
+            if let Some(weights) = layer.weights {
+                options.weights = weights;
+            }
+            if let Some(fuzzy) = layer.fuzzy {
+                options.fuzzy = Some(fuzzy);
+            }
+            if let Some(max_fuzzy) = layer.max_fuzzy {
+                options.max_fuzzy = max_fuzzy;
+            }
+            if let Some(bm25) = layer.bm25 {
+                options.bm25 = bm25;
+            }
+            if layer.combine_with.is_some() {
+                combine_with = layer.combine_with;
+            }
+            if layer.prefix.is_some() {
+                prefix = layer.prefix;
+            }
+        }
+
+        // The auto-suggest default is AND; the constructor's searchOptions
+        // combineWith intentionally does not apply here (in JS the auto-suggest
+        // defaults always shadow it).
+        options.combine_with = combine_with.unwrap_or(CombineWith::And);
+        options.prefix = false;
+
+        (options, prefix)
     }
 
     /// Diagnostic: run the compact query with prefix/fuzzy overridden and return
@@ -947,8 +1137,7 @@ impl MiniSearch {
                         // it isn't double-counted. Equivalent to the old
                         // per-query HashSet<String> dedup, without the
                         // allocations or hashing.
-                        if distance == 0
-                            || (query.prefix && term.starts_with(query.term.as_str()))
+                        if distance == 0 || (query.prefix && term.starts_with(query.term.as_str()))
                         {
                             return;
                         }
