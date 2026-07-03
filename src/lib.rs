@@ -3,8 +3,8 @@ mod searchable_map;
 
 pub use mini_search::{
     AutoSuggestOptions, Bm25Params, CombineWith, CompactSearchResult, FuzzySetting,
-    JoinedSearchResults, MiniSearch, MiniSearchOptions, PackedSearchResults, SearchOptions,
-    SearchResult, Suggestion, TokenizerMode, Weights,
+    JoinedSearchResults, MiniSearch, MiniSearchOptions, PackedSearchResults, PartialSearchOptions,
+    Query, QueryCombination, SearchOptions, SearchResult, Suggestion, TokenizerMode, Weights,
 };
 pub use searchable_map::{FuzzyMatch, SearchableMap};
 
@@ -13,6 +13,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
+
+/// Registry key of the wildcard query symbol (`Symbol.for(WILDCARD_KEY)`), so
+/// `MiniSearchWasm.wildcard` returns the same symbol on every access.
+const WILDCARD_KEY: &str = "minisearch-wasm.wildcard";
 
 #[wasm_bindgen]
 pub struct MiniSearchWasm {
@@ -81,8 +85,21 @@ impl MiniSearchWasm {
             .map_err(|err| JsValue::from_str(&err))
     }
 
+    /// The special wildcard query value, like `MiniSearch.wildcard`: pass it
+    /// to `search` (alone or inside a query tree) to match every document.
+    /// A registered symbol, so it is identity-stable across calls.
+    #[wasm_bindgen(getter, js_name = wildcard)]
+    pub fn wildcard_js() -> JsValue {
+        js_sys::Symbol::for_(WILDCARD_KEY).into()
+    }
+
+    /// MiniSearch-compatible `search(query, options?)`. `query` is a string,
+    /// the `MiniSearchWasm.wildcard` symbol, or a query-expression tree:
+    /// `{ combineWith?, queries: [subquery, …], …optionOverrides }` with
+    /// subqueries nesting arbitrarily. Present option keys cascade down the
+    /// tree, exactly like JS MiniSearch.
     #[wasm_bindgen(js_name = search)]
-    pub fn search_js(&self, query: &str, options: JsValue) -> Result<JsValue, JsValue> {
+    pub fn search_js(&self, query: JsValue, options: JsValue) -> Result<JsValue, JsValue> {
         // Optional `includeMatch` (default true, for MiniSearch compatibility):
         // callers that never read the per-hit `match` map can set it false to
         // skip building it — the single biggest remaining boundary cost. Read it
@@ -90,15 +107,17 @@ impl MiniSearchWasm {
         // the binary snapshot format is affected.
         let include_match = read_bool_option(&options, "includeMatch", true);
 
-        let search_options: SearchOptions = if options.is_null() || options.is_undefined() {
-            SearchOptions::default()
+        let per_call: PartialSearchOptions = if options.is_null() || options.is_undefined() {
+            PartialSearchOptions::default()
         } else {
             serde_wasm_bindgen::from_value(options)
                 .map_err(|err| JsValue::from_str(&err.to_string()))?
         };
 
+        let query = parse_query(&query)?;
+
         Ok(results_to_js(
-            &self.inner.search(query, search_options),
+            &self.inner.search_query(&query, &per_call),
             include_match,
         ))
     }
@@ -341,6 +360,48 @@ fn results_to_js(results: &[SearchResult], include_match: bool) -> JsValue {
 
 /// Read an optional boolean flag off a JS options object without disturbing the
 /// engine's typed option deserialization (unknown keys to serde are ignored).
+/// Parse a JS query value — string, the wildcard symbol, or a query-tree
+/// object — into the engine's [`Query`]. Tree nodes are `{ queries: [...] }`
+/// plus option-override keys; subqueries parse recursively.
+fn parse_query(value: &JsValue) -> Result<Query, JsValue> {
+    if let Some(text) = value.as_string() {
+        return Ok(Query::Text(text));
+    }
+
+    if *value == MiniSearchWasm::wildcard_js() {
+        return Ok(Query::Wildcard);
+    }
+
+    if value.is_object() {
+        let queries_value = Reflect::get(value, &JsValue::from_str("queries"))?;
+        if !Array::is_array(&queries_value) {
+            return Err(JsValue::from_str(
+                "MiniSearch: invalid query: a query object must have a 'queries' array",
+            ));
+        }
+
+        let queries_array = Array::from(&queries_value);
+        let mut queries = Vec::with_capacity(queries_array.length() as usize);
+        for subquery in queries_array.iter() {
+            queries.push(parse_query(&subquery)?);
+        }
+
+        // Node options are the object's remaining keys. Deserialize a shallow
+        // copy with `queries` removed: its entries may be nested objects or
+        // the wildcard symbol, which serde cannot (and must not) consume.
+        let copy = Object::assign(&Object::new(), Object::unchecked_from_js_ref(value));
+        Reflect::delete_property(&copy, &JsValue::from_str("queries"))?;
+        let options: PartialSearchOptions = serde_wasm_bindgen::from_value(copy.into())
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+
+        return Ok(Query::Combination(QueryCombination { queries, options }));
+    }
+
+    Err(JsValue::from_str(
+        "MiniSearch: invalid query: expected a string, a query object, or MiniSearchWasm.wildcard",
+    ))
+}
+
 fn read_bool_option(options: &JsValue, key: &str, default: bool) -> bool {
     if !options.is_object() {
         return default;

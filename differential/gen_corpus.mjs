@@ -53,5 +53,49 @@ for (const q of queryTerms) queries.push(q)
 // wide query (>64 terms, with duplicates) exercising the non-bitmask fallback
 queries.push(Array.from({ length: 70 }, (_, i) => vocab[(i * 37) % 40]).join(' '))
 
-writeFileSync(process.argv[2] || 'corpus.json', JSON.stringify({ docs, queries }))
-console.log(`corpus: ${docs.length} docs, ${queries.length} queries, vocab ${vocab.length}`)
+// Query-expression trees (advanced `search(query)` form). `{wildcard: true}`
+// is this harness's JSON stand-in for the wildcard symbol; each runner maps it
+// to its engine's real wildcard value.
+const treeQueries = [
+  { name: 'and2', tree: { combineWith: 'AND', queries: ['engine', 'data'] } },
+  { name: 'or_of_ands', tree: {
+    combineWith: 'OR',
+    queries: [
+      { combineWith: 'AND', queries: ['search', 'index'] },
+      'cloud data',
+      { combineWith: 'AND', queries: ['zürich', 'café'] }
+    ]
+  } },
+  { name: 'wildcard', tree: { wildcard: true } },
+  { name: 'andnot_wildcard', tree: { combineWith: 'AND_NOT', queries: [{ wildcard: true }, 'engine'] } },
+  { name: 'andnot_plain', tree: { combineWith: 'AND_NOT', queries: ['engine develop', 'test'] } },
+  { name: 'single', tree: { queries: ['engine'] } },
+  { name: 'empty', tree: { queries: [] } },
+  { name: 'cascade_options', tree: {
+    fuzzy: 0.2,
+    weights: { fuzzy: 0.2, prefix: 0.75 },
+    queries: [
+      { prefix: true, fields: ['title'], queries: ['eng'] },
+      { combineWith: 'AND', queries: ['serch', 'pythn'] }
+    ]
+  } },
+  { name: 'boost_node', tree: { boost: { title: 3 }, queries: ['engine', 'mark'] } },
+  { name: 'bm25_node', tree: { bm25: { k: 1.5, b: 0.9, d: 0.6 }, queries: ['engine', 'develop'] } },
+  { name: 'deep_nesting', tree: {
+    combineWith: 'AND',
+    queries: [
+      { combineWith: 'OR', queries: [
+        { combineWith: 'AND', queries: ['engine', { combineWith: 'OR', queries: ['data', 'cloud'] }] },
+        'radix trie'
+      ] },
+      { combineWith: 'AND_NOT', queries: [{ wildcard: true }, 'pappagallo'] }
+    ]
+  } },
+  { name: 'dup_terms_across_subqueries', tree: {
+    combineWith: 'OR',
+    queries: [{ combineWith: 'AND', queries: ['engine', 'data'] }, 'engine cloud']
+  } }
+]
+
+writeFileSync(process.argv[2] || 'corpus.json', JSON.stringify({ docs, queries, treeQueries }))
+console.log(`corpus: ${docs.length} docs, ${queries.length} queries, ${treeQueries.length} tree queries, vocab ${vocab.length}`)

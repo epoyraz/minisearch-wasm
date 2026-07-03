@@ -326,6 +326,53 @@ pub struct AutoSuggestOptions {
     pub bm25: Option<Bm25Params>,
 }
 
+/// Search options where every field is optional, mirroring how JS MiniSearch
+/// treats per-call options and query-tree node options: a plain object whose
+/// *present* keys override the inherited options (`{...inherited, ...node}`),
+/// while absent keys fall through — ultimately to the constructor's
+/// `searchOptions` at the leaves. [`SearchOptions`] cannot express "absent"
+/// (its fields carry defaults), so merging it would clobber inherited values.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialSearchOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boost: Option<BTreeMap<String, f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Weights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuzzy: Option<FuzzySetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fuzzy: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combine_with: Option<CombineWith>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25: Option<Bm25Params>,
+}
+
+/// A search query, like JS MiniSearch's `Query` type: either a plain query
+/// string, the special wildcard (matching every document), or a combination
+/// of subqueries — each itself a full `Query` — merged with an `AND` / `OR` /
+/// `AND_NOT` operator and optional per-node option overrides.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Query {
+    Text(String),
+    Wildcard,
+    Combination(QueryCombination),
+}
+
+/// A query-tree node: subqueries plus the node's option overrides. Present
+/// option keys cascade down to the node's subtree, exactly like the JS
+/// `{...searchOptions, ...query}` spread in `executeQuery`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QueryCombination {
+    pub queries: Vec<Query>,
+    pub options: PartialSearchOptions,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MiniSearchOptions {
@@ -633,7 +680,35 @@ impl MiniSearch {
     pub fn search(&self, query: &str, search_options: SearchOptions) -> Vec<SearchResult> {
         let options = merge_search_options(&self.options.search_options, &search_options);
         let raw_results = self.execute_query(query, &options);
-        let mut results = Vec::new();
+        self.materialize_raw_results(raw_results, true)
+    }
+
+    /// Search with a full query expression — a plain string, the wildcard, or
+    /// an `AND`/`OR`/`AND_NOT` tree of subqueries — like passing a `Query` to
+    /// JS MiniSearch's `search`. `per_call` carries the second-argument
+    /// options; only its present keys override the constructor's
+    /// `searchOptions`, and tree nodes overlay their own present keys on top,
+    /// cascading down to the leaves (the JS `{...searchOptions, ...query}`
+    /// spread).
+    pub fn search_query(
+        &self,
+        query: &Query,
+        per_call: &PartialSearchOptions,
+    ) -> Vec<SearchResult> {
+        let raw_results = self.execute_query_tree(query, per_call);
+        // JS skips sorting a top-level wildcard (every score is 1) and returns
+        // document-insertion order, which is ascending short id: ids are
+        // assigned monotonically, and snapshots reload them in that order.
+        let sort_by_score = !matches!(query, Query::Wildcard);
+        self.materialize_raw_results(raw_results, sort_by_score)
+    }
+
+    fn materialize_raw_results(
+        &self,
+        raw_results: RawResult,
+        sort_by_score: bool,
+    ) -> Vec<SearchResult> {
+        let mut results = Vec::with_capacity(raw_results.len());
 
         for (doc_id, raw) in raw_results {
             let quality = raw.terms.len().max(1) as f64;
@@ -656,13 +731,17 @@ impl MiniSearch {
             ));
         }
 
-        results.sort_by(|(left_id, left), (right_id, right)| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left_id.cmp(right_id))
-        });
+        if sort_by_score {
+            results.sort_by(|(left_id, left), (right_id, right)| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left_id.cmp(right_id))
+            });
+        } else {
+            results.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
+        }
         results.into_iter().map(|(_, result)| result).collect()
     }
 
@@ -1230,6 +1309,53 @@ impl MiniSearch {
             .collect::<Vec<_>>();
 
         combine_results(results, options.combine_with)
+    }
+
+    /// Recursive query-tree executor, mirroring JS `executeQuery`. `inherited`
+    /// is the accumulated partial options from the per-call argument and any
+    /// ancestor nodes; the constructor's `searchOptions` are merged in only at
+    /// the string leaves, exactly like JS. Note the asymmetry this implies, as
+    /// in JS: a combination node without its own `combineWith` combines its
+    /// subqueries with `OR` (the `combineResults` default) even when the
+    /// constructor's `searchOptions` say `AND` — the constructor default
+    /// reaches only the term combination inside string leaves.
+    fn execute_query_tree(&self, query: &Query, inherited: &PartialSearchOptions) -> RawResult {
+        match query {
+            Query::Wildcard => self.execute_wildcard_query(),
+            Query::Text(text) => {
+                let options = apply_partial_options(&self.options.search_options, inherited);
+                self.execute_query(text, &options)
+            }
+            Query::Combination(combination) => {
+                let options = overlay_partial_options(inherited, &combination.options);
+                let results = combination
+                    .queries
+                    .iter()
+                    .map(|subquery| self.execute_query_tree(subquery, &options))
+                    .collect::<Vec<_>>();
+
+                combine_results(results, options.combine_with.unwrap_or_default())
+            }
+        }
+    }
+
+    /// Match every live document with score 1, no matched terms — JS
+    /// `executeWildcardQuery` minus the `boostDocument` callback (not ported,
+    /// per the no-callbacks rule).
+    fn execute_wildcard_query(&self) -> RawResult {
+        self.document_ids
+            .keys()
+            .map(|&doc_id| {
+                (
+                    doc_id,
+                    RawResultValue {
+                        score: 1.0,
+                        terms: Vec::new(),
+                        matches: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect()
     }
 
     fn query_specs(&self, query: &str, options: &SearchOptions) -> Vec<QuerySpec> {
@@ -1891,6 +2017,58 @@ fn merge_search_options(base: &SearchOptions, override_options: &SearchOptions) 
     merged.bm25 = override_options.bm25;
 
     merged
+}
+
+/// Apply a partial's present keys over concrete options — the leaf-level
+/// `{...globalSearchOptions, ...accumulated}` merge in JS `executeQuery`.
+fn apply_partial_options(base: &SearchOptions, partial: &PartialSearchOptions) -> SearchOptions {
+    let mut merged = base.clone();
+
+    if let Some(fields) = &partial.fields {
+        merged.fields = Some(fields.clone());
+    }
+    if let Some(boost) = &partial.boost {
+        merged.boost = boost.clone();
+    }
+    if let Some(weights) = partial.weights {
+        merged.weights = weights;
+    }
+    if let Some(prefix) = partial.prefix {
+        merged.prefix = prefix;
+    }
+    if let Some(fuzzy) = partial.fuzzy {
+        merged.fuzzy = Some(fuzzy);
+    }
+    if let Some(max_fuzzy) = partial.max_fuzzy {
+        merged.max_fuzzy = max_fuzzy;
+    }
+    if let Some(combine_with) = partial.combine_with {
+        merged.combine_with = combine_with;
+    }
+    if let Some(bm25) = partial.bm25 {
+        merged.bm25 = bm25;
+    }
+
+    merged
+}
+
+/// Overlay one partial on another — the per-node `{...inherited, ...node}`
+/// spread in JS `executeQuery`: `over`'s present keys win, absent keys fall
+/// through to `base`.
+fn overlay_partial_options(
+    base: &PartialSearchOptions,
+    over: &PartialSearchOptions,
+) -> PartialSearchOptions {
+    PartialSearchOptions {
+        fields: over.fields.clone().or_else(|| base.fields.clone()),
+        boost: over.boost.clone().or_else(|| base.boost.clone()),
+        weights: over.weights.or(base.weights),
+        prefix: over.prefix.or(base.prefix),
+        fuzzy: over.fuzzy.or(base.fuzzy),
+        max_fuzzy: over.max_fuzzy.or(base.max_fuzzy),
+        combine_with: over.combine_with.or(base.combine_with),
+        bm25: over.bm25.or(base.bm25),
+    }
 }
 
 fn combine_results(results: Vec<RawResult>, combine_with: CombineWith) -> RawResult {

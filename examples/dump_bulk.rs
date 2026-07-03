@@ -6,10 +6,36 @@
 //! JS `Object.keys(match)` order.
 
 use minisearch_wasm::{
-    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions, SearchOptions,
-    TokenizerMode,
+    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions,
+    PartialSearchOptions, Query, QueryCombination, SearchOptions, TokenizerMode,
 };
 use serde_json::{json, Map, Value};
+
+/// Parse the harness's JSON tree representation: strings are text queries,
+/// `{"wildcard": true}` is the wildcard, everything else is a combination
+/// node whose non-`queries` keys are option overrides.
+fn value_to_query(value: &Value) -> Query {
+    match value {
+        Value::String(text) => Query::Text(text.clone()),
+        Value::Object(map) => {
+            if map.get("wildcard") == Some(&Value::Bool(true)) {
+                return Query::Wildcard;
+            }
+            let queries = map["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(value_to_query)
+                .collect();
+            let mut options_map = map.clone();
+            options_map.remove("queries");
+            let options: PartialSearchOptions =
+                serde_json::from_value(Value::Object(options_map)).unwrap();
+            Query::Combination(QueryCombination { queries, options })
+        }
+        other => panic!("invalid tree query node: {other}"),
+    }
+}
 
 fn make_index(docs: &[Value]) -> MiniSearch {
     let mut search = MiniSearch::new(MiniSearchOptions {
@@ -69,7 +95,11 @@ fn option_combos() -> Vec<(&'static str, SearchOptions)> {
     ]
 }
 
-fn dump(search: &MiniSearch, queries: &[String]) -> Map<String, Value> {
+fn dump(
+    search: &MiniSearch,
+    queries: &[String],
+    tree_queries: &[(String, Query)],
+) -> Map<String, Value> {
     let mut out = Map::new();
 
     for query in queries {
@@ -110,6 +140,36 @@ fn dump(search: &MiniSearch, queries: &[String]) -> Map<String, Value> {
         }
     }
 
+    // Query trees: terms dumped SORTED, mirroring js_bulk.mjs (JS match keys
+    // are insertion-ordered, this port's full-path match map is sorted — a
+    // documented divergence; ids and scores are compared exactly).
+    let tree_rows = |results: Vec<minisearch_wasm::SearchResult>| -> Value {
+        Value::Array(
+            results
+                .into_iter()
+                .map(|result| {
+                    let mut terms = result.terms;
+                    terms.sort();
+                    json!({ "id": result.id, "score": result.score, "terms": terms })
+                })
+                .collect(),
+        )
+    };
+    let and_per_call = PartialSearchOptions {
+        combine_with: Some(CombineWith::And),
+        ..PartialSearchOptions::default()
+    };
+    for (name, tree) in tree_queries {
+        out.insert(
+            format!("t:{name}"),
+            tree_rows(search.search_query(tree, &PartialSearchOptions::default())),
+        );
+        out.insert(
+            format!("tand:{name}"),
+            tree_rows(search.search_query(tree, &and_per_call)),
+        );
+    }
+
     out
 }
 
@@ -124,7 +184,22 @@ fn main() {
         .map(|q| q.as_str().unwrap().to_owned())
         .collect();
 
-    let fresh = dump(&make_index(&docs), &queries);
+    let tree_queries: Vec<(String, Query)> = corpus["treeQueries"]
+        .as_array()
+        .map(|trees| {
+            trees
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["name"].as_str().unwrap().to_owned(),
+                        value_to_query(&entry["tree"]),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let fresh = dump(&make_index(&docs), &queries, &tree_queries);
 
     let mut mutated = make_index(&docs);
     let mut index = 0usize;
@@ -139,7 +214,7 @@ fn main() {
         }
         index += 11;
     }
-    let after_mutation = dump(&mutated, &queries);
+    let after_mutation = dump(&mutated, &queries, &tree_queries);
 
     let out = json!({ "fresh": fresh, "afterMutation": after_mutation });
     std::fs::write(&args[2], serde_json::to_string(&out).unwrap()).unwrap();

@@ -3,7 +3,14 @@
 import MiniSearch from 'minisearch'
 import { readFileSync, writeFileSync } from 'fs'
 
-const { docs, queries } = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+const { docs, queries, treeQueries = [] } = JSON.parse(readFileSync(process.argv[2], 'utf8'))
+
+// Map the harness's `{wildcard: true}` JSON sentinel to the real symbol.
+const toQuery = (node) => {
+  if (typeof node === 'string') return node
+  if (node.wildcard === true) return MiniSearch.wildcard
+  return { ...node, queries: node.queries.map(toQuery) }
+}
 
 const makeIndex = () => {
   const ms = new MiniSearch({
@@ -37,6 +44,15 @@ const dump = (ms) => {
     out[`a:default:${query}`] = dumpSuggest(ms, query)
     out[`a:fuzzy:${query}`] = dumpSuggest(ms, query, { fuzzy: 0.2 })
     out[`a:or:${query}`] = dumpSuggest(ms, query, { combineWith: 'OR' })
+  }
+  // Query trees: terms are dumped SORTED — JS match keys are insertion-ordered
+  // while the port's full-path match map is sorted, a documented divergence;
+  // the comparison checks set equality plus exact ids/scores.
+  for (const { name, tree } of treeQueries) {
+    out[`t:${name}`] = ms.search(toQuery(tree)).map(r =>
+      ({ id: r.id, score: r.score, terms: [...r.terms].sort() }))
+    out[`tand:${name}`] = ms.search(toQuery(tree), { combineWith: 'AND' }).map(r =>
+      ({ id: r.id, score: r.score, terms: [...r.terms].sort() }))
   }
   return out
 }

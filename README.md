@@ -60,6 +60,19 @@ for (let i = 0; i < r.count; i++) {
 // Compatibility path — MiniSearch-shaped result objects (slower, see above):
 const full = mini.search("software engineer", { combineWith: "AND" });
 
+// Query-expression trees and wildcard, like JS MiniSearch: subqueries combine
+// with AND / OR / AND_NOT and nest arbitrarily; a node's other keys override
+// the search options for its subtree. `MiniSearchWasm.wildcard` matches every
+// document (e.g. "everything except…" via AND_NOT).
+const advanced = mini.search({
+  combineWith: "AND_NOT",
+  queries: [
+    { combineWith: "OR", queries: ["designer", { prefix: true, queries: ["develop"] }] },
+    "senior",
+  ],
+});
+const everything = mini.search(MiniSearchWasm.wildcard);
+
 // Auto-suggest (search-as-you-type), MiniSearch-compatible: AND + prefix on
 // the last term by default; defaults configurable via the constructor's
 // `autoSuggestOptions`, overridable per call.
@@ -109,11 +122,10 @@ traversal exactly) — but deliberately diverges from its API and internals:
 - **Search never mutates the index.** MiniSearch lazily removes stale postings
   mid-query when it meets a discarded document; this port just skips them (and
   skips the liveness check entirely on a clean index).
-- **Not implemented (yet).** Wildcard queries (`MiniSearch.wildcard`) and
-  nested query-expression trees, async indexing (`addAllAsync`), `vacuum`, and
-  batch `removeAll`/`discardAll`. The query is a plain string plus options, not
-  a query tree. `autoSuggest` is implemented (minus the JS `filter` callback,
-  per the no-callbacks rule). See `PORTING.md`.
+- **Not implemented (yet).** Async indexing (`addAllAsync`), `vacuum`, and
+  batch `removeAll`/`discardAll`. `autoSuggest`, query-expression trees, and
+  wildcard queries are implemented (minus the JS callback options, per the
+  no-callbacks rule). See `PORTING.md`.
 - **Added beyond MiniSearch.** `searchJoined` / `autoSuggestJoined` (compact
   columnar results for a thin Wasm boundary), `addAllJSON` (index straight from
   a raw JSON string), `toBytes`/`loadBytes` (compact binary snapshot), the

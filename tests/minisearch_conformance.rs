@@ -1,6 +1,6 @@
 use minisearch_wasm::{
-    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions, SearchOptions,
-    TokenizerMode,
+    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions,
+    PartialSearchOptions, Query, QueryCombination, SearchOptions, TokenizerMode, Weights,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -483,4 +483,220 @@ fn auto_suggest_options_survive_binary_snapshots() {
             "query={query}"
         );
     }
+}
+
+// --- Query-expression trees and wildcard, ported from the JS suite's
+// --- "when passing a query tree" / wildcard cases.
+
+fn divina_commedia_index() -> MiniSearch {
+    let mut search = MiniSearch::new(MiniSearchOptions {
+        fields: vec!["title".to_owned(), "text".to_owned()],
+        id_field: "id".to_owned(),
+        store_fields: vec![],
+        tokenizer: TokenizerMode::Default,
+        search_options: SearchOptions::default(),
+        auto_suggest_options: None,
+    });
+    search
+        .add_all(vec![
+            json!({ "id": 1, "title": "Divina Commedia", "text": "Nel mezzo del cammin di nostra vita" }),
+            json!({ "id": 2, "title": "I Promessi Sposi", "text": "Quel ramo del lago di Como" }),
+            json!({ "id": 3, "title": "Vita Nova", "text": "In quella parte del libro della mia memoria" }),
+        ])
+        .unwrap();
+    search
+}
+
+fn text(query: &str) -> Query {
+    Query::Text(query.to_owned())
+}
+
+fn combination(combine_with: Option<CombineWith>, queries: Vec<Query>) -> Query {
+    Query::Combination(QueryCombination {
+        queries,
+        options: PartialSearchOptions {
+            combine_with,
+            ..PartialSearchOptions::default()
+        },
+    })
+}
+
+fn result_ids(results: &[minisearch_wasm::SearchResult]) -> Vec<serde_json::Value> {
+    results.iter().map(|result| result.id.clone()).collect()
+}
+
+#[test]
+fn searches_according_to_query_tree_combination() {
+    let search = divina_commedia_index();
+
+    let results = search.search_query(
+        &combination(
+            Some(CombineWith::Or),
+            vec![
+                combination(Some(CombineWith::And), vec![text("vita"), text("cammin")]),
+                text("como sottomarino"),
+                combination(
+                    Some(CombineWith::And),
+                    vec![text("nova"), text("pappagallo")],
+                ),
+            ],
+        ),
+        &PartialSearchOptions::default(),
+    );
+
+    assert_eq!(result_ids(&results), vec![json!(1), json!(2)]);
+}
+
+#[test]
+fn combines_wildcard_queries() {
+    let search = divina_commedia_index();
+
+    let results = search.search_query(
+        &combination(
+            Some(CombineWith::AndNot),
+            vec![Query::Wildcard, text("vita")],
+        ),
+        &PartialSearchOptions::default(),
+    );
+
+    assert_eq!(result_ids(&results), vec![json!(2)]);
+}
+
+#[test]
+fn cascades_subquery_options() {
+    let search = divina_commedia_index();
+
+    let results = search.search_query(
+        &Query::Combination(QueryCombination {
+            queries: vec![
+                Query::Combination(QueryCombination {
+                    queries: vec![text("vit")],
+                    options: PartialSearchOptions {
+                        prefix: Some(true),
+                        fields: Some(vec!["title".to_owned()]),
+                        ..PartialSearchOptions::default()
+                    },
+                }),
+                combination(Some(CombineWith::And), vec![text("bago"), text("coomo")]),
+            ],
+            options: PartialSearchOptions {
+                combine_with: Some(CombineWith::Or),
+                fuzzy: Some(FuzzySetting::Enabled(true)),
+                weights: Some(Weights {
+                    fuzzy: 0.2,
+                    prefix: 0.75,
+                }),
+                ..PartialSearchOptions::default()
+            },
+        }),
+        &PartialSearchOptions::default(),
+    );
+
+    assert_eq!(result_ids(&results), vec![json!(3), json!(2)]);
+}
+
+#[test]
+fn per_call_options_are_defaults_for_query_trees() {
+    let search = divina_commedia_index();
+
+    let tree = || {
+        Query::Combination(QueryCombination {
+            queries: vec![
+                Query::Combination(QueryCombination {
+                    queries: vec![text("vita")],
+                    options: PartialSearchOptions {
+                        fields: Some(vec!["text".to_owned()]),
+                        ..PartialSearchOptions::default()
+                    },
+                }),
+                Query::Combination(QueryCombination {
+                    queries: vec![text("promessi")],
+                    options: PartialSearchOptions {
+                        fields: Some(vec!["title".to_owned()]),
+                        ..PartialSearchOptions::default()
+                    },
+                }),
+            ],
+            options: PartialSearchOptions::default(),
+        })
+    };
+
+    let reference = search.search_query(&tree(), &PartialSearchOptions::default());
+    assert_eq!(reference.len(), 2);
+
+    // Boosting a field via the per-call options raises that subquery's score.
+    let mut boost = BTreeMap::new();
+    boost.insert("title".to_owned(), 2.0);
+    let boosted = search.search_query(
+        &tree(),
+        &PartialSearchOptions {
+            boost: Some(boost),
+            ..PartialSearchOptions::default()
+        },
+    );
+    assert_eq!(boosted.len(), reference.len());
+    let score_of = |results: &[minisearch_wasm::SearchResult]| {
+        results
+            .iter()
+            .find(|result| result.id == json!(2))
+            .unwrap()
+            .score
+    };
+    assert!(score_of(&boosted) > score_of(&reference));
+
+    // Per-call combineWith applies to the top-level combination…
+    let and_results = search.search_query(
+        &tree(),
+        &PartialSearchOptions {
+            combine_with: Some(CombineWith::And),
+            ..PartialSearchOptions::default()
+        },
+    );
+    assert_eq!(and_results.len(), 0);
+
+    // …unless the node overrides it back to OR.
+    let mut or_tree = tree();
+    if let Query::Combination(node) = &mut or_tree {
+        node.options.combine_with = Some(CombineWith::Or);
+    }
+    let or_results = search.search_query(
+        &or_tree,
+        &PartialSearchOptions {
+            combine_with: Some(CombineWith::And),
+            ..PartialSearchOptions::default()
+        },
+    );
+    assert_eq!(or_results.len(), reference.len());
+}
+
+#[test]
+fn wildcard_matches_all_documents() {
+    let mut search = mini_search();
+
+    // The string "*" and the empty string are just normal (non-matching) queries.
+    assert!(search.search("*", SearchOptions::default()).is_empty());
+    assert!(search.search("", SearchOptions::default()).is_empty());
+    assert!(search
+        .search_query(&text("*"), &PartialSearchOptions::default())
+        .is_empty());
+
+    // The wildcard matches every document, score 1, in insertion order
+    // (unsorted, like JS skipping the sort for top-level wildcards).
+    let results = search.search_query(&Query::Wildcard, &PartialSearchOptions::default());
+    assert_eq!(
+        result_ids(&results),
+        vec![json!(1), json!(2), json!(3), json!(4)]
+    );
+    assert!(results.iter().all(|result| result.score == 1.0));
+    assert!(results.iter().all(|result| result.terms.is_empty()));
+    assert_eq!(
+        results[0].stored_fields["title"],
+        json!("Moby Dick"),
+        "stored fields are still attached"
+    );
+
+    // Discarded documents no longer match.
+    search.discard(&json!(2)).unwrap();
+    let results = search.search_query(&Query::Wildcard, &PartialSearchOptions::default());
+    assert_eq!(result_ids(&results), vec![json!(1), json!(3), json!(4)]);
 }

@@ -59,5 +59,42 @@ check('autoSuggestJoined terms-from-rows', objPath.map(s => s.terms), rows.map(r
 const reloaded = MiniSearchWasm.loadBytes(wasmCtor.toBytes())
 check('loadBytes autoSuggest', wasmCtor.autoSuggest('nosta vi'), reloaded.autoSuggest('nosta vi'))
 
+// --- query trees + wildcard through the wasm boundary -----------------------
+// Full-path term/match ordering differs (sorted vs insertion, documented), so
+// compare ids and scores; per-row terms as sorted sets.
+const rowsOf = (results) => results.map(r => ({ id: r.id, score: r.score, terms: [...r.terms].sort() }))
+const checkSearch = (name, jsQuery, wasmQuery, options) =>
+  check(name, rowsOf(js.search(jsQuery, options)), rowsOf(wasm.search(wasmQuery, options)))
+
+checkSearch('search plain string parity', 'vita del', 'vita del')
+checkSearch('search partial per-call options', 'vit', 'vit', { prefix: true })
+
+const tree = {
+  combineWith: 'OR',
+  queries: [
+    { combineWith: 'AND', queries: ['vita', 'cammin'] },
+    'como sottomarino',
+    { combineWith: 'AND', queries: ['nova', 'pappagallo'] }
+  ]
+}
+checkSearch('search query tree', tree, tree)
+
+const cascade = {
+  fuzzy: true,
+  weights: { fuzzy: 0.2, prefix: 0.75 },
+  queries: [
+    { prefix: true, fields: ['title'], queries: ['vit'] },
+    { combineWith: 'AND', queries: ['bago', 'coomo'] }
+  ]
+}
+checkSearch('search tree option cascade', cascade, cascade)
+
+check('wildcard is a stable symbol', true,
+  typeof MiniSearchWasm.wildcard === 'symbol' && MiniSearchWasm.wildcard === MiniSearchWasm.wildcard)
+checkSearch('search wildcard', MiniSearch.wildcard, MiniSearchWasm.wildcard)
+const andNotTree = (wildcard) => ({ combineWith: 'AND_NOT', queries: [wildcard, 'vita'] })
+checkSearch('search AND_NOT wildcard tree', andNotTree(MiniSearch.wildcard), andNotTree(MiniSearchWasm.wildcard))
+check("search('*') is a plain term", js.search('*'), wasm.search('*'))
+
 console.log(failures === 0 ? 'WASM SMOKE: ALL PASS' : `${failures} FAILURES`)
 process.exit(failures === 0 ? 0 : 1)

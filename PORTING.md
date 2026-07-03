@@ -82,9 +82,9 @@ order and traversal exactly:
 This makes per-document matched-term order identical to JS and tightens score
 parity from ~1e-14 to last-ulp `Math.log`-vs-`ln` differences (~5e-16
 relative). Verified by a 3k-doc differential suite (fresh + after
-remove/discard; search × 6 option combos + autoSuggest × 3): 684 labels,
-~350k result rows, all matching. On dirty indexes JS is compared at its
-post-lazy-cleanup fixpoint (2nd run of each query), since this port
+remove/discard; search × 6 option combos + autoSuggest × 3 + query trees × 2):
+750 labels, ~400k result rows, all matching. On dirty indexes JS is compared
+at its post-lazy-cleanup fixpoint (2nd run of each query), since this port
 deliberately never mutates the index during search.
 
 ## Intentional API Direction
@@ -99,12 +99,35 @@ recommended) and `search` (MiniSearch-compatible objects). The earlier
 `searchCompact` / `searchPacked` variants were removed once `searchJoined`
 superseded them.
 
+## Query-Expression Trees and Wildcard
+
+`search` accepts the full JS `Query` type: a string, the wildcard, or a
+combination node `{ combineWith?, queries: [...], ...optionOverrides }` with
+arbitrary nesting. The Rust side mirrors `executeQuery` exactly: node options
+are *partial* (`PartialSearchOptions`) and cascade via the JS
+`{...inherited, ...node}` spread; the constructor's `searchOptions` merge in
+only at string leaves — so, as in JS, a combination node without its own
+`combineWith` combines subqueries with `OR` even when the constructor default
+is `AND`. The wildcard is `MiniSearchWasm.wildcard`, a registered symbol
+(`Symbol.for`), matching every live document with score 1; a top-level
+wildcard returns document-insertion order unsorted, like JS. The `filter` /
+`boostDocument` / `boostTerm` callbacks are not ported (no-callbacks rule).
+
+Per-call `search` options are now also truly partial: only keys present on the
+options object override the constructor's `searchOptions`, matching JS (an
+options object like `{ fuzzy: 0.2 }` no longer resets `combineWith`/`prefix`
+to library defaults).
+
+One documented divergence on this path: per-result `terms` / `match` keys come
+from a sorted map, while JS preserves insertion order — same set, different
+order. The bulk differential compares tree-query terms as sets and everything
+else (ids, scores, both fresh and mutated indexes) exactly.
+
 ## Next Test Slices
 
 1. Serialization parity for `toJSON` / `loadJSON` behavior.
-2. Wildcard query behavior.
-3. Async/vacuum-equivalent cleanup behavior, likely as synchronous Rust cleanup
+2. Async/vacuum-equivalent cleanup behavior, likely as synchronous Rust cleanup
    plus optional Wasm-friendly chunking.
-4. Unicode tokenizer edge cases from the original tests.
-5. Larger ranking fixtures near the end of `MiniSearch.test.js`.
-6. Browser or Node smoke test against the generated `pkg/` package.
+3. Unicode tokenizer edge cases from the original tests.
+4. Larger ranking fixtures near the end of `MiniSearch.test.js`.
+5. Browser or Node smoke test against the generated `pkg/` package.

@@ -9,6 +9,10 @@ this port, then compares outputs:
   match except inside near-tie score bands, where members are compared as sets
   (the documented tie-order difference).
 - **autoSuggest**: suggestion phrases and terms exactly, scores as above.
+- **query trees + wildcard** (full `search(query)` path): ids and scores as
+  above; per-row terms as sorted sets (`{wildcard: true}` in the corpus JSON
+  stands in for the wildcard symbol). JS match keys are insertion-ordered
+  while this port's full-path match map is sorted — a documented divergence.
 
 Both a fresh index and one mutated by `remove`/`discard` are checked. On the
 mutated index the JS side is dumped at its post-lazy-cleanup fixpoint (each
