@@ -1,0 +1,33 @@
+README.md
+  s_55291276258039::t_7b06adf5417588 125-126,132,134,136-137,141
+Cargo.toml
+  s_4535e2d701c42f::t_481b44d658a20a 1-30
+package.json
+  s_4535e2d701c42f::t_912b79d13cbe15 1-11
+Cargo.lock
+  s_4535e2d701c42f::t_dad3323fc5871b 66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "a5f59a8f78fcf8b158f829c2e7b37d7cf16f248f",
+  "prompts": {},
+  "sessions": {
+    "s_4535e2d701c42f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b116e18-9ab1-4b45-9285-e7eed782ecde",
+        "model": "unknown"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    },
+    "s_55291276258039": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdab0e1b-609f-4a05-a2a7-a5bc369bf28c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
