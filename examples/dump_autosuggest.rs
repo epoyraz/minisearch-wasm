@@ -38,6 +38,7 @@ fn index(
         tokenizer: TokenizerMode::Default,
         search_options,
         auto_suggest_options,
+        auto_vacuum: None,
     });
     search.add_all(docs).unwrap();
     search

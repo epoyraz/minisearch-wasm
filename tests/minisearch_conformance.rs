@@ -1,6 +1,7 @@
 use minisearch_wasm::{
-    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions,
-    PartialSearchOptions, Query, QueryCombination, SearchOptions, TokenizerMode, Weights,
+    AutoSuggestOptions, AutoVacuumOptions, AutoVacuumSetting, CombineWith, FuzzySetting,
+    MiniSearch, MiniSearchOptions, PartialSearchOptions, Query, QueryCombination, SearchOptions,
+    TokenizerMode, Weights,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -34,15 +35,20 @@ fn documents() -> Vec<serde_json::Value> {
     ]
 }
 
-fn mini_search() -> MiniSearch {
-    let mut search = MiniSearch::new(MiniSearchOptions {
+fn mini_search_options() -> MiniSearchOptions {
+    MiniSearchOptions {
         fields: vec!["title".to_owned(), "text".to_owned()],
         id_field: "id".to_owned(),
         store_fields: vec!["title".to_owned(), "category".to_owned()],
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions::default(),
         auto_suggest_options: None,
-    });
+        auto_vacuum: None,
+    }
+}
+
+fn mini_search() -> MiniSearch {
+    let mut search = MiniSearch::new(mini_search_options());
 
     search.add_all(documents()).unwrap();
     search
@@ -109,6 +115,7 @@ fn supports_field_boosting_and_field_filtering() {
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions::default(),
         auto_suggest_options: None,
+        auto_vacuum: None,
     });
     search
         .add_all(vec![
@@ -282,6 +289,203 @@ fn remove_discard_and_replace_update_visible_results() {
 }
 
 #[test]
+fn remove_all_matches_sequential_removes() {
+    let docs = documents();
+    let removed = vec![docs[0].clone(), docs[3].clone()];
+    let mut sequential = mini_search();
+    let mut batch = mini_search();
+
+    for document in &removed {
+        sequential.remove(document).unwrap();
+    }
+    batch.remove_all(removed).unwrap();
+
+    assert_eq!(batch.to_bytes().unwrap(), sequential.to_bytes().unwrap());
+    for query in ["ishmael", "motorcycle", "archery", "neuromancer"] {
+        assert_eq!(
+            batch.search(query, SearchOptions::default()),
+            sequential.search(query, SearchOptions::default()),
+            "query={query}"
+        );
+    }
+}
+
+#[test]
+fn remove_all_documents_resets_to_a_fresh_index_and_allows_readding() {
+    let mut search = mini_search();
+    search.discard(&json!(2)).unwrap();
+    search.remove_all_documents();
+
+    let fresh = MiniSearch::new(mini_search_options());
+    assert_eq!(search.to_bytes().unwrap(), fresh.to_bytes().unwrap());
+    assert!(search.search("zen", SearchOptions::default()).is_empty());
+
+    let document = documents()[1].clone();
+    search.add(document.clone()).unwrap();
+    let mut fresh_with_document = MiniSearch::new(mini_search_options());
+    fresh_with_document.add(document).unwrap();
+
+    assert_eq!(
+        search.to_bytes().unwrap(),
+        fresh_with_document.to_bytes().unwrap()
+    );
+    assert_eq!(
+        search.search("motorcycle", SearchOptions::default())[0].id,
+        json!(2)
+    );
+}
+
+#[test]
+fn discard_all_matches_sequential_discards_on_a_dirty_index() {
+    let ids = vec![json!(1), json!(3)];
+    let mut sequential = mini_search();
+    let mut batch = mini_search();
+
+    for id in &ids {
+        sequential.discard(id).unwrap();
+    }
+    batch.discard_all(&ids).unwrap();
+
+    assert_eq!(batch.to_bytes().unwrap(), sequential.to_bytes().unwrap());
+    for query in ["ishmael sky", "zen art", "neuromancer"] {
+        assert_eq!(
+            batch.search(query, SearchOptions::default()),
+            sequential.search(query, SearchOptions::default()),
+            "query={query}"
+        );
+    }
+}
+
+#[test]
+fn discard_all_stops_at_an_unknown_id_without_rolling_back() {
+    let mut search = mini_search();
+    let error = search
+        .discard_all(&[json!(1), json!("missing"), json!(2)])
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        "MiniSearch: cannot discard document with ID missing: it is not in the index"
+    );
+    assert!(!search.has(&json!(1)));
+    assert!(search.has(&json!(2)));
+    assert!(search
+        .search("ishmael", SearchOptions::default())
+        .is_empty());
+    assert_eq!(
+        search.search("motorcycle", SearchOptions::default())[0].id,
+        json!(2)
+    );
+}
+
+#[test]
+fn vacuum_removes_stale_postings_and_resets_dirt() {
+    let docs = documents();
+    let mut dirty = mini_search();
+    let mut clean = mini_search();
+
+    dirty.discard(&json!(1)).unwrap();
+    dirty.discard(&json!(2)).unwrap();
+    clean.remove(&docs[0]).unwrap();
+    clean.remove(&docs[1]).unwrap();
+
+    assert_eq!(dirty.dirt_count(), 2);
+    assert_ne!(dirty.to_bytes().unwrap(), clean.to_bytes().unwrap());
+
+    dirty.vacuum();
+
+    assert_eq!(dirty.dirt_count(), 0);
+    assert!(!dirty.is_vacuuming());
+    assert_eq!(dirty.to_bytes().unwrap(), clean.to_bytes().unwrap());
+}
+
+#[test]
+fn vacuum_step_cleans_incrementally() {
+    let mut search = mini_search();
+    search.discard(&json!(1)).unwrap();
+    search.begin_vacuum();
+
+    assert!(search.is_vacuuming());
+    assert!(!search.vacuum_step(1));
+    assert_eq!(search.dirt_count(), 1);
+
+    let mut steps = 1;
+    while !search.vacuum_step(1) {
+        steps += 1;
+    }
+
+    assert!(steps > 1);
+    assert!(!search.is_vacuuming());
+    assert_eq!(search.dirt_count(), 0);
+}
+
+#[test]
+fn vacuum_preserves_dirt_added_during_an_active_run() {
+    let mut options = mini_search_options();
+    options.auto_vacuum = Some(AutoVacuumSetting::Enabled(false));
+    let mut search = MiniSearch::new(options);
+    search.add_all(documents()).unwrap();
+
+    search.discard(&json!(1)).unwrap();
+    search.begin_vacuum();
+    assert!(!search.vacuum_step(1));
+    search.discard(&json!(2)).unwrap();
+
+    while !search.vacuum_step(1) {}
+
+    assert_eq!(search.dirt_count(), 1);
+    search.vacuum();
+    assert_eq!(search.dirt_count(), 0);
+}
+
+#[test]
+fn auto_vacuum_respects_thresholds_and_can_be_disabled() {
+    let mut enabled_options = mini_search_options();
+    enabled_options.auto_vacuum = Some(AutoVacuumSetting::Options(AutoVacuumOptions {
+        min_dirt_count: Some(2),
+        min_dirt_factor: Some(0.01),
+        batch_size: Some(1),
+        batch_wait: Some(1),
+    }));
+    let mut enabled = MiniSearch::new(enabled_options);
+    enabled.add_all(documents()).unwrap();
+
+    enabled.discard(&json!(1)).unwrap();
+    assert_eq!(enabled.dirt_count(), 1);
+    enabled.discard(&json!(2)).unwrap();
+    assert_eq!(enabled.dirt_count(), 0);
+
+    let mut disabled_options = mini_search_options();
+    disabled_options.auto_vacuum = Some(AutoVacuumSetting::Enabled(false));
+    let mut disabled = MiniSearch::new(disabled_options);
+    disabled.add_all(documents()).unwrap();
+    disabled.discard_all(&[json!(1), json!(2)]).unwrap();
+
+    assert_eq!(disabled.dirt_count(), 2);
+}
+
+#[test]
+fn auto_vacuum_settings_survive_snapshots_and_apply_after_discard_all() {
+    let mut options = mini_search_options();
+    options.auto_vacuum = Some(AutoVacuumSetting::Options(AutoVacuumOptions {
+        min_dirt_count: Some(2),
+        min_dirt_factor: Some(0.01),
+        batch_size: Some(1),
+        batch_wait: Some(1),
+    }));
+    let mut search = MiniSearch::new(options);
+    search.add_all(documents()).unwrap();
+
+    let mut reloaded = MiniSearch::from_bytes(&search.to_bytes().unwrap()).unwrap();
+    reloaded.discard_all(&[json!(1), json!(2)]).unwrap();
+
+    assert_eq!(reloaded.dirt_count(), 0);
+    assert!(reloaded
+        .search("ishmael motorcycle", SearchOptions::default())
+        .is_empty());
+}
+
+#[test]
 fn jobboard_tokenizer_preserves_symbol_terms() {
     let mut search = MiniSearch::new(MiniSearchOptions {
         fields: vec!["title".to_owned(), "description".to_owned()],
@@ -290,6 +494,7 @@ fn jobboard_tokenizer_preserves_symbol_terms() {
         tokenizer: TokenizerMode::Jobboard,
         search_options: SearchOptions::default(),
         auto_suggest_options: None,
+        auto_vacuum: None,
     });
     search
         .add_all(vec![json!({
@@ -345,6 +550,7 @@ fn auto_suggest_index(
         tokenizer: TokenizerMode::Default,
         search_options,
         auto_suggest_options,
+        auto_vacuum: None,
     });
     search.add_all(italian_documents()).unwrap();
     search
@@ -496,6 +702,7 @@ fn divina_commedia_index() -> MiniSearch {
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions::default(),
         auto_suggest_options: None,
+        auto_vacuum: None,
     });
     search
         .add_all(vec![

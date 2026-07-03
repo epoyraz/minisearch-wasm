@@ -1,11 +1,12 @@
 {
   "name": "minisearch-wasm-build",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "description": "Build orchestration for the minisearch-wasm npm package (not published; the publishable artifact is pkg/).",
   "type": "module",
   "scripts": {
     "build": "wasm-pack build --target web --release && node scripts/finalize-pkg.mjs",
+    "bench:maintenance": "npm run build && node differential/bench_maintenance.mjs",
     "publish:pkg": "npm run build && npm publish ./pkg"
   }
 }

@@ -326,6 +326,83 @@ pub struct AutoSuggestOptions {
     pub bm25: Option<Bm25Params>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VacuumOptions {
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub batch_wait: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoVacuumOptions {
+    #[serde(default)]
+    pub min_dirt_count: Option<usize>,
+    #[serde(default)]
+    pub min_dirt_factor: Option<f64>,
+    #[serde(default)]
+    pub batch_size: Option<usize>,
+    #[serde(default)]
+    pub batch_wait: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AutoVacuumSetting {
+    Enabled(bool),
+    Options(AutoVacuumOptions),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedVacuumOptions {
+    pub batch_size: usize,
+    pub batch_wait: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedAutoVacuumOptions {
+    min_dirt_count: usize,
+    min_dirt_factor: f64,
+    vacuum: ResolvedVacuumOptions,
+}
+
+impl VacuumOptions {
+    pub(crate) fn resolved(self) -> ResolvedVacuumOptions {
+        ResolvedVacuumOptions {
+            batch_size: self
+                .batch_size
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_VACUUM_BATCH_SIZE),
+            batch_wait: self
+                .batch_wait
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_VACUUM_BATCH_WAIT),
+        }
+    }
+}
+
+impl AutoVacuumOptions {
+    fn resolved(self) -> ResolvedAutoVacuumOptions {
+        ResolvedAutoVacuumOptions {
+            min_dirt_count: self
+                .min_dirt_count
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_AUTO_VACUUM_MIN_DIRT_COUNT),
+            min_dirt_factor: self
+                .min_dirt_factor
+                .filter(|value| *value > 0.0)
+                .unwrap_or(DEFAULT_AUTO_VACUUM_MIN_DIRT_FACTOR),
+            vacuum: VacuumOptions {
+                batch_size: self.batch_size,
+                batch_wait: self.batch_wait,
+            }
+            .resolved(),
+        }
+    }
+}
+
 /// Search options where every field is optional, mirroring how JS MiniSearch
 /// treats per-call options and query-tree node options: a plain object whose
 /// *present* keys override the inherited options (`{...inherited, ...node}`),
@@ -390,6 +467,11 @@ pub struct MiniSearchOptions {
     /// built before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_suggest_options: Option<AutoSuggestOptions>,
+    /// Automatic cleanup of stale postings left by `discard`. Missing, `null`,
+    /// and `true` use MiniSearch's defaults; `false` disables it; an object
+    /// overrides individual thresholds and batching settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_vacuum: Option<AutoVacuumSetting>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -471,6 +553,13 @@ struct FieldBoost {
     boost: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct VacuumState {
+    terms: Vec<String>,
+    next_term: usize,
+    initial_dirt_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MiniSearch {
     options: MiniSearchOptions,
@@ -490,10 +579,16 @@ pub struct MiniSearch {
     average_field_length: Vec<f64>,
     stored_fields: HashMap<ShortId, BTreeMap<String, Value>>,
     dirt_count: usize,
+    #[serde(skip)]
+    vacuum_state: Option<VacuumState>,
 }
 
 /// Binary snapshot format version. Bump when the layout in `to_bytes` changes.
 const SNAPSHOT_VERSION: u64 = 3;
+const DEFAULT_VACUUM_BATCH_SIZE: usize = 1000;
+const DEFAULT_VACUUM_BATCH_WAIT: u32 = 10;
+const DEFAULT_AUTO_VACUUM_MIN_DIRT_COUNT: usize = 20;
+const DEFAULT_AUTO_VACUUM_MIN_DIRT_FACTOR: f64 = 0.1;
 
 impl MiniSearch {
     pub fn new(options: MiniSearchOptions) -> Self {
@@ -518,6 +613,7 @@ impl MiniSearch {
             average_field_length,
             stored_fields: HashMap::new(),
             dirt_count: 0,
+            vacuum_state: None,
         }
     }
 
@@ -626,7 +722,30 @@ impl MiniSearch {
         Ok(())
     }
 
+    pub fn remove_all(&mut self, documents: Vec<Value>) -> Result<(), String> {
+        for document in documents {
+            self.remove(&document)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_all_documents(&mut self) {
+        let options = self.options.clone();
+        *self = Self::new(options);
+    }
+
     pub fn discard(&mut self, id: &Value) -> Result<(), String> {
+        self.discard_without_auto_vacuum(id)?;
+        self.maybe_auto_vacuum();
+        Ok(())
+    }
+
+    pub(crate) fn discard_deferred(&mut self, id: &Value) -> Result<(), String> {
+        self.discard_without_auto_vacuum(id)
+    }
+
+    fn discard_without_auto_vacuum(&mut self, id: &Value) -> Result<(), String> {
         let id_key = id_key(id)?;
         let short_id = *self.id_to_short_id.get(&id_key).ok_or_else(|| {
             format!(
@@ -656,6 +775,23 @@ impl MiniSearch {
         Ok(())
     }
 
+    pub fn discard_all(&mut self, ids: &[Value]) -> Result<(), String> {
+        for id in ids {
+            self.discard_without_auto_vacuum(id)?;
+        }
+
+        self.maybe_auto_vacuum();
+        Ok(())
+    }
+
+    pub(crate) fn discard_all_deferred(&mut self, ids: &[Value]) -> Result<(), String> {
+        for id in ids {
+            self.discard_without_auto_vacuum(id)?;
+        }
+
+        Ok(())
+    }
+
     pub fn replace(&mut self, document: Value) -> Result<(), String> {
         let id = self
             .extract_field(&document, &self.options.id_field)
@@ -669,6 +805,114 @@ impl MiniSearch {
 
         self.discard(&id)?;
         self.add(document)
+    }
+
+    pub fn vacuum(&mut self) {
+        self.begin_vacuum();
+        while !self.vacuum_step(usize::MAX) {}
+    }
+
+    pub fn begin_vacuum(&mut self) {
+        if self.vacuum_state.is_some() {
+            return;
+        }
+
+        let terms = self
+            .index
+            .sorted_entries()
+            .into_iter()
+            .map(|(term, _)| term)
+            .collect();
+        self.vacuum_state = Some(VacuumState {
+            terms,
+            next_term: 0,
+            initial_dirt_count: self.dirt_count,
+        });
+    }
+
+    /// Cleans at most `max_terms` terms from the current vacuum run. Returns
+    /// `true` when the run is complete. A run is started automatically when
+    /// needed, making this suitable for a JS timer-driven chunking loop.
+    pub fn vacuum_step(&mut self, max_terms: usize) -> bool {
+        self.begin_vacuum();
+
+        let (start, end, terms_len) = {
+            let state = self.vacuum_state.as_ref().expect("vacuum was just started");
+            let start = state.next_term;
+            let end = start.saturating_add(max_terms).min(state.terms.len());
+            (start, end, state.terms.len())
+        };
+
+        let terms: Vec<String> = self
+            .vacuum_state
+            .as_ref()
+            .expect("vacuum state exists")
+            .terms[start..end]
+            .to_vec();
+
+        for term in terms {
+            let should_delete_term = {
+                let document_ids = &self.document_ids;
+                let Some(fields_data) = self.index.get_mut(&term) else {
+                    continue;
+                };
+
+                fields_data.retain(|_, field_index| {
+                    field_index.retain(|short_id, _| document_ids.contains_key(short_id));
+                    !field_index.is_empty()
+                });
+                fields_data.is_empty()
+            };
+
+            if should_delete_term {
+                self.index.delete(&term);
+            }
+        }
+
+        let state = self.vacuum_state.as_mut().expect("vacuum state exists");
+        state.next_term = end;
+        if end < terms_len {
+            return false;
+        }
+
+        let initial_dirt_count = state.initial_dirt_count;
+        self.dirt_count = self.dirt_count.saturating_sub(initial_dirt_count);
+        self.vacuum_state = None;
+        true
+    }
+
+    pub fn is_vacuuming(&self) -> bool {
+        self.vacuum_state.is_some()
+    }
+
+    pub fn dirt_count(&self) -> usize {
+        self.dirt_count
+    }
+
+    pub fn dirt_factor(&self) -> f64 {
+        self.dirt_count as f64 / (1 + self.document_count + self.dirt_count) as f64
+    }
+
+    pub(crate) fn auto_vacuum_request(&self) -> Option<ResolvedVacuumOptions> {
+        let options = self.resolved_auto_vacuum_options()?;
+        (self.dirt_count >= options.min_dirt_count && self.dirt_factor() >= options.min_dirt_factor)
+            .then_some(options.vacuum)
+    }
+
+    fn maybe_auto_vacuum(&mut self) {
+        if self.auto_vacuum_request().is_some() {
+            self.vacuum();
+        }
+    }
+
+    fn resolved_auto_vacuum_options(&self) -> Option<ResolvedAutoVacuumOptions> {
+        match self.options.auto_vacuum {
+            Some(AutoVacuumSetting::Enabled(false)) => None,
+            Some(AutoVacuumSetting::Options(options)) => Some(options.resolved()),
+            Some(AutoVacuumSetting::Enabled(true)) | None => {
+                Some(AutoVacuumOptions::default().resolved())
+            }
+        }
     }
 
     pub fn has(&self, id: &Value) -> bool {
@@ -1298,6 +1542,7 @@ impl MiniSearch {
             average_field_length,
             stored_fields,
             dirt_count,
+            vacuum_state: None,
         })
     }
 

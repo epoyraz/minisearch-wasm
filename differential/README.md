@@ -14,11 +14,12 @@ this port, then compares outputs:
   stands in for the wildcard symbol). JS match keys are insertion-ordered
   while this port's full-path match map is sorted — a documented divergence.
 
-Both a fresh index and one mutated by `remove`/`discard` are checked. On the
-mutated index the JS side is dumped at its post-lazy-cleanup fixpoint (each
-query runs twice, the second run is recorded), because JS mutates the index
-during dirty searches while this port never does — the port's dirty-search
-scores equal JS's post-cleanup scores by design.
+A fresh index, one mutated by `remove`/`discard`, one mutated by
+`removeAll`/`discardAll`, and one explicitly vacuumed are checked. On dirty
+indexes the JS side is dumped at its post-lazy-cleanup fixpoint (each query runs
+twice, the second run is recorded), because JS mutates the index during dirty
+searches while this port never does — the port's dirty-search scores equal JS's
+post-cleanup scores by design.
 
 ## Run
 
@@ -55,4 +56,12 @@ latter needs `npm run build` first):
 node gen_corpus.mjs bench_corpus.json 20000
 cargo run --release --example bench_search differential/bench_corpus.json   # from repo root
 node bench_wasm.mjs bench_corpus.json
+```
+
+Maintenance-path benchmark for `addAllAsync` overhead and vacuum
+latency/snapshot reclamation (uses 5,000 documents by default):
+
+```powershell
+npm run bench:maintenance
+# Optional: BENCH_DOCS=10000 BENCH_CHUNK=500 BENCH_VACUUM_BATCH=1000 npm run bench:maintenance
 ```

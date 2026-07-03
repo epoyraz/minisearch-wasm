@@ -57,6 +57,7 @@ fn main() {
             ..SearchOptions::default()
         },
         auto_suggest_options: None,
+        auto_vacuum: None,
     };
 
     println!(

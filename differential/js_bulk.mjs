@@ -72,5 +72,31 @@ for (let i = 3; i < docs.length; i += 11) {
 dump(mutated)
 const afterMutation = dump(mutated)
 
-writeFileSync(process.argv[3], JSON.stringify({ fresh, afterMutation }))
+// Same mutations through the batch APIs.
+const batchMutated = makeIndex()
+const documentsToRemove = docs.filter((_, index) => index % 7 === 0)
+const idsToDiscard = docs
+  .filter((_, index) => index % 11 === 3 && index % 7 !== 0)
+  .map(document => document.id)
+batchMutated.removeAll(documentsToRemove)
+batchMutated.discardAll(idsToDiscard)
+// As above, record the post-lazy-cleanup fixpoint.
+dump(batchMutated)
+const afterBatchMutation = dump(batchMutated)
+
+// Explicitly vacuum a dirty index and compare the fully clean state.
+const vacuumed = makeIndex()
+for (let i = 0; i < docs.length; i += 7) vacuumed.remove(docs[i])
+for (let i = 3; i < docs.length; i += 11) {
+  if (i % 7 !== 0) vacuumed.discard(docs[i].id)
+}
+await vacuumed.vacuum({ batchSize: vacuumed.termCount + 1 })
+const afterVacuum = dump(vacuumed)
+
+writeFileSync(process.argv[3], JSON.stringify({
+  fresh,
+  afterMutation,
+  afterBatchMutation,
+  afterVacuum
+}))
 console.log('js dump written:', Object.keys(fresh).length, 'labels per phase')

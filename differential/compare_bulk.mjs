@@ -68,7 +68,7 @@ const compareLabel = (label, a, b) => {
   return true
 }
 
-for (const phase of ['fresh', 'afterMutation']) {
+for (const phase of ['fresh', 'afterMutation', 'afterBatchMutation', 'afterVacuum']) {
   const pa = js[phase], pb = rust[phase]
   const keys = new Set([...Object.keys(pa), ...Object.keys(pb)])
   for (const key of keys) {

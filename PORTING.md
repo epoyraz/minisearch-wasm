@@ -123,11 +123,44 @@ from a sorted map, while JS preserves insertion order — same set, different
 order. The bulk differential compares tree-query terms as sets and everything
 else (ids, scores, both fresh and mutated indexes) exactly.
 
-## Next Test Slices
+## Batch Removal and Discard
 
-1. Serialization parity for `toJSON` / `loadJSON` behavior.
-2. Async/vacuum-equivalent cleanup behavior, likely as synchronous Rust cleanup
-   plus optional Wasm-friendly chunking.
-3. Unicode tokenizer edge cases from the original tests.
-4. Larger ranking fixtures near the end of `MiniSearch.test.js`.
-5. Browser or Node smoke test against the generated `pkg/` package.
+`removeAll(documents)` and `discardAll(ids)` call the corresponding single-item
+operation in order, matching MiniSearch's partial-mutation behavior when an
+item fails. Calling `removeAll()` through Wasm reconstructs a fresh engine with
+the same options, including resetting short document IDs and dirty-index state.
+As required by the Wasm boundary, an explicit `undefined` is treated like an
+omitted argument; any other non-array value throws MiniSearch's documented
+missing-documents error.
+
+## Vacuuming, Auto-Vacuum, and Async Indexing
+
+`vacuum`, `dirtCount`, `dirtFactor`, and `isVacuuming` are implemented through
+the real Wasm boundary. The Rust engine exposes synchronous `vacuum()` plus
+incremental `vacuum_step(batch_size)`; Wasm drives those steps between
+`setTimeout` waits so large cleanups do not monopolize the browser thread.
+Discards made during a run remain counted as new dirt, matching MiniSearch's
+`initialDirtCount` behavior. Concurrent vacuum requests are coalesced into the
+active promise and cause one follow-up pass.
+
+`autoVacuum` defaults to MiniSearch's settings (`minDirtCount: 20`,
+`minDirtFactor: 0.1`, `batchSize: 1000`, `batchWait: 10`), accepts `false`,
+`true`, or a partial options object, and is triggered once after `discardAll`.
+Native Rust auto-vacuum runs synchronously; Wasm schedules the same cleanup
+incrementally.
+
+`addAllAsync(documents, { chunkSize? })` defaults to chunks of 10, yields to the
+event loop before each full chunk, and preserves earlier chunks if a later
+document errors, like JS MiniSearch.
+
+## Additional Conformance Hardening
+
+The remaining planned coverage slices are now present:
+
+- Rust JSON and compact-binary round trips preserve dirty state, auto-vacuum
+  settings, stored fields, and search results; malformed and incompatible
+  snapshots are rejected.
+- Default tokenization covers diacritics, contiguous punctuation, Cyrillic,
+  Japanese, Greek, Arabic, and numeric terms from the JS reference suite.
+- The reference movie and song ranking fixtures verify exact result ordering
+  across exact, fuzzy, prefix, and multi-term searches.

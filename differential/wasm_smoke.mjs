@@ -1,5 +1,5 @@
-// Smoke test of the built pkg/: autoSuggest + autoSuggestJoined through the
-// real Wasm boundary, compared against JS MiniSearch.
+// Smoke test of the built pkg through the real Wasm boundary, compared against
+// JS MiniSearch: search, suggestions, mutations, vacuuming, and async indexing.
 import { readFileSync } from 'fs'
 import MiniSearch from 'minisearch'
 import init, { MiniSearchWasm } from '../pkg/minisearch_wasm.js'
@@ -96,5 +96,107 @@ const andNotTree = (wildcard) => ({ combineWith: 'AND_NOT', queries: [wildcard, 
 checkSearch('search AND_NOT wildcard tree', andNotTree(MiniSearch.wildcard), andNotTree(MiniSearchWasm.wildcard))
 check("search('*') is a plain term", js.search('*'), wasm.search('*'))
 
+// --- removeAll / discardAll through the wasm boundary ----------------------
+const jsBatch = new MiniSearch({ fields: ['title', 'text'], storeFields: ['category'], autoVacuum: false })
+jsBatch.addAll(documents)
+const wasmBatch = new MiniSearchWasm({ fields: ['title', 'text'], storeFields: ['category'] })
+wasmBatch.addAll(documents)
+
+jsBatch.removeAll([documents[0]])
+wasmBatch.removeAll([documents[0]])
+check('removeAll([...])', rowsOf(jsBatch.search(MiniSearch.wildcard)), rowsOf(wasmBatch.search(MiniSearchWasm.wildcard)))
+
+let removeAllError
+try {
+  wasmBatch.removeAll(null)
+} catch (error) {
+  removeAllError = String(error)
+}
+check('removeAll(non-array) error',
+  'Expected documents to be present. Omit the argument to remove all documents.',
+  removeAllError)
+
+jsBatch.discardAll([2])
+wasmBatch.discardAll([2])
+const jsDirtyRows = rowsOf(jsBatch.search('lago vita'))
+const wasmDirtyRows = rowsOf(wasmBatch.search('lago vita'))
+const withoutScores = (rows) => rows.map(({ score, ...row }) => row)
+const scoresMatch = jsDirtyRows.length === wasmDirtyRows.length &&
+  jsDirtyRows.every((row, index) => {
+    const other = wasmDirtyRows[index]
+    return Math.abs(row.score - other.score) /
+      Math.max(Math.abs(row.score), Math.abs(other.score), 1e-12) <= 1e-12
+  })
+check('discardAll([...]) dirty search rows', withoutScores(jsDirtyRows), withoutScores(wasmDirtyRows))
+check('discardAll([...]) dirty search scores', true, scoresMatch)
+
+jsBatch.removeAll()
+wasmBatch.removeAll()
+check('removeAll() resets index', rowsOf(jsBatch.search(MiniSearch.wildcard)), rowsOf(wasmBatch.search(MiniSearchWasm.wildcard)))
+
+// --- vacuum / autoVacuum ---------------------------------------------------
+const jsVacuum = new MiniSearch({ fields: ['title', 'text'], autoVacuum: false })
+jsVacuum.addAll(documents)
+const wasmVacuum = new MiniSearchWasm({ fields: ['title', 'text'], autoVacuum: false })
+wasmVacuum.addAll(documents)
+jsVacuum.discardAll([1, 2])
+wasmVacuum.discardAll([1, 2])
+check('dirtCount before vacuum', jsVacuum.dirtCount, wasmVacuum.dirtCount)
+check('dirtFactor before vacuum', jsVacuum.dirtFactor, wasmVacuum.dirtFactor)
+
+const jsVacuumPromise = jsVacuum.vacuum({ batchSize: 1, batchWait: 1 })
+const wasmVacuumPromise = wasmVacuum.vacuum({ batchSize: 1, batchWait: 1 })
+check('vacuum returns Promise', true, wasmVacuumPromise instanceof Promise)
+check('isVacuuming while active', jsVacuum.isVacuuming, wasmVacuum.isVacuuming)
+await Promise.all([jsVacuumPromise, wasmVacuumPromise])
+check('vacuum search parity',
+  rowsOf(jsVacuum.search(MiniSearch.wildcard)),
+  rowsOf(wasmVacuum.search(MiniSearchWasm.wildcard)))
+check('dirtCount after vacuum', jsVacuum.dirtCount, wasmVacuum.dirtCount)
+check('isVacuuming after completion', jsVacuum.isVacuuming, wasmVacuum.isVacuuming)
+
+const autoVacuumOptions = {
+  minDirtCount: 1,
+  minDirtFactor: 0.01,
+  batchSize: 1,
+  batchWait: 1
+}
+const jsAutoVacuum = new MiniSearch({ fields: ['title', 'text'], autoVacuum: autoVacuumOptions })
+jsAutoVacuum.addAll(documents)
+const wasmAutoVacuum = new MiniSearchWasm({ fields: ['title', 'text'], autoVacuum: autoVacuumOptions })
+wasmAutoVacuum.addAll(documents)
+jsAutoVacuum.discard(1)
+wasmAutoVacuum.discard(1)
+check('autoVacuum starts at threshold', jsAutoVacuum.isVacuuming, wasmAutoVacuum.isVacuuming)
+while (jsAutoVacuum.isVacuuming || wasmAutoVacuum.isVacuuming) {
+  await new Promise(resolve => setTimeout(resolve, 1))
+}
+check('autoVacuum dirtCount', jsAutoVacuum.dirtCount, wasmAutoVacuum.dirtCount)
+check('autoVacuum search parity',
+  rowsOf(jsAutoVacuum.search(MiniSearch.wildcard)),
+  rowsOf(wasmAutoVacuum.search(MiniSearchWasm.wildcard)))
+
+// --- addAllAsync -----------------------------------------------------------
+const jsAsync = new MiniSearch({ fields: ['title', 'text'] })
+const wasmAsync = new MiniSearchWasm({ fields: ['title', 'text'] })
+const jsAddPromise = jsAsync.addAllAsync(documents, { chunkSize: 2 })
+const wasmAddPromise = wasmAsync.addAllAsync(documents, { chunkSize: 2 })
+check('addAllAsync returns Promise', true, wasmAddPromise instanceof Promise)
+check('addAllAsync yields before first full chunk', 0, wasmAsync.documentCount)
+await Promise.all([jsAddPromise, wasmAddPromise])
+check('addAllAsync custom chunk parity',
+  rowsOf(jsAsync.search(MiniSearch.wildcard)),
+  rowsOf(wasmAsync.search(MiniSearchWasm.wildcard)))
+
+const jsAsyncDefault = new MiniSearch({ fields: ['title', 'text'] })
+const wasmAsyncDefault = new MiniSearchWasm({ fields: ['title', 'text'] })
+await Promise.all([
+  jsAsyncDefault.addAllAsync(documents),
+  wasmAsyncDefault.addAllAsync(documents)
+])
+check('addAllAsync default chunk parity',
+  rowsOf(jsAsyncDefault.search(MiniSearch.wildcard)),
+  rowsOf(wasmAsyncDefault.search(MiniSearchWasm.wildcard)))
+
 console.log(failures === 0 ? 'WASM SMOKE: ALL PASS' : `${failures} FAILURES`)
-process.exit(failures === 0 ? 0 : 1)
+process.exitCode = failures === 0 ? 0 : 1

@@ -2,25 +2,44 @@ mod mini_search;
 mod searchable_map;
 
 pub use mini_search::{
-    AutoSuggestOptions, Bm25Params, CombineWith, CompactSearchResult, FuzzySetting,
-    JoinedSearchResults, MiniSearch, MiniSearchOptions, PackedSearchResults, PartialSearchOptions,
-    Query, QueryCombination, SearchOptions, SearchResult, Suggestion, TokenizerMode, Weights,
+    AutoSuggestOptions, AutoVacuumOptions, AutoVacuumSetting, Bm25Params, CombineWith,
+    CompactSearchResult, FuzzySetting, JoinedSearchResults, MiniSearch, MiniSearchOptions,
+    PackedSearchResults, PartialSearchOptions, Query, QueryCombination, SearchOptions,
+    SearchResult, Suggestion, TokenizerMode, VacuumOptions, Weights,
 };
 pub use searchable_map::{FuzzyMatch, SearchableMap};
 
-use js_sys::{Array, Float64Array, Object, Reflect};
-use serde::Serialize;
+use js_sys::{Array, Float64Array, Function, Object, Promise, Reflect};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use wasm_bindgen::prelude::*;
+use std::rc::Rc;
+use wasm_bindgen::{prelude::*, JsCast};
+use wasm_bindgen_futures::{future_to_promise, JsFuture};
 
 /// Registry key of the wildcard query symbol (`Symbol.for(WILDCARD_KEY)`), so
 /// `MiniSearchWasm.wildcard` returns the same symbol on every access.
 const WILDCARD_KEY: &str = "minisearch-wasm.wildcard";
 
+#[derive(Default)]
+struct VacuumRuntime {
+    active: bool,
+    rerun: bool,
+    current: Option<Promise>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddAllAsyncOptions {
+    #[serde(default = "default_async_chunk_size")]
+    chunk_size: usize,
+}
+
 #[wasm_bindgen]
 pub struct MiniSearchWasm {
-    inner: MiniSearch,
+    inner: Rc<RefCell<MiniSearch>>,
+    vacuum_runtime: Rc<RefCell<VacuumRuntime>>,
 }
 
 #[wasm_bindgen]
@@ -30,59 +49,186 @@ impl MiniSearchWasm {
         let options: MiniSearchOptions = serde_wasm_bindgen::from_value(options)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
 
-        Ok(MiniSearchWasm {
-            inner: MiniSearch::new(options),
-        })
+        Ok(MiniSearchWasm::from_inner(MiniSearch::new(options)))
     }
 
     #[wasm_bindgen(js_name = add)]
-    pub fn add_js(&mut self, document: JsValue) -> Result<(), JsValue> {
+    pub fn add_js(&self, document: JsValue) -> Result<(), JsValue> {
         let document: Value = serde_wasm_bindgen::from_value(document)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
 
         self.inner
+            .borrow_mut()
             .add(document)
             .map_err(|err| JsValue::from_str(&err))
     }
 
     #[wasm_bindgen(js_name = addAll)]
-    pub fn add_all_js(&mut self, documents: JsValue) -> Result<(), JsValue> {
+    pub fn add_all_js(&self, documents: JsValue) -> Result<(), JsValue> {
         let documents: Vec<Value> = serde_wasm_bindgen::from_value(documents)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
 
         self.inner
+            .borrow_mut()
             .add_all(documents)
             .map_err(|err| JsValue::from_str(&err))
     }
 
+    #[wasm_bindgen(js_name = addAllAsync)]
+    pub fn add_all_async_js(
+        &self,
+        documents: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<Promise, JsValue> {
+        let documents: Vec<Value> = serde_wasm_bindgen::from_value(documents)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+        let options: AddAllAsyncOptions = match options {
+            None => AddAllAsyncOptions {
+                chunk_size: default_async_chunk_size(),
+            },
+            Some(options) => serde_wasm_bindgen::from_value(options)
+                .map_err(|err| JsValue::from_str(&err.to_string()))?,
+        };
+        let inner = Rc::clone(&self.inner);
+
+        Ok(future_to_promise(async move {
+            if options.chunk_size == 0 {
+                inner
+                    .borrow_mut()
+                    .add_all(documents)
+                    .map_err(|err| JsValue::from_str(&err))?;
+                return Ok(JsValue::UNDEFINED);
+            }
+
+            let mut chunk = Vec::with_capacity(options.chunk_size);
+            for document in documents {
+                chunk.push(document);
+                if chunk.len() == options.chunk_size {
+                    yield_to_timer(0).await?;
+                    inner
+                        .borrow_mut()
+                        .add_all(std::mem::take(&mut chunk))
+                        .map_err(|err| JsValue::from_str(&err))?;
+                    chunk = Vec::with_capacity(options.chunk_size);
+                }
+            }
+
+            inner
+                .borrow_mut()
+                .add_all(chunk)
+                .map_err(|err| JsValue::from_str(&err))?;
+            Ok(JsValue::UNDEFINED)
+        }))
+    }
+
     #[wasm_bindgen(js_name = addAllJSON)]
-    pub fn add_all_json_js(&mut self, documents: &str) -> Result<(), JsValue> {
+    pub fn add_all_json_js(&self, documents: &str) -> Result<(), JsValue> {
         let documents: Vec<Value> =
             serde_json::from_str(documents).map_err(|err| JsValue::from_str(&err.to_string()))?;
 
         self.inner
+            .borrow_mut()
             .add_all(documents)
             .map_err(|err| JsValue::from_str(&err))
     }
 
     #[wasm_bindgen(js_name = remove)]
-    pub fn remove_js(&mut self, document: JsValue) -> Result<(), JsValue> {
+    pub fn remove_js(&self, document: JsValue) -> Result<(), JsValue> {
         let document: Value = serde_wasm_bindgen::from_value(document)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
 
         self.inner
+            .borrow_mut()
             .remove(&document)
             .map_err(|err| JsValue::from_str(&err))
     }
 
+    #[wasm_bindgen(js_name = removeAll)]
+    pub fn remove_all_js(&self, documents: JsValue) -> Result<(), JsValue> {
+        if documents.is_undefined() {
+            self.inner.borrow_mut().remove_all_documents();
+            return Ok(());
+        }
+
+        if !Array::is_array(&documents) {
+            return Err(JsValue::from_str(
+                "Expected documents to be present. Omit the argument to remove all documents.",
+            ));
+        }
+
+        let documents: Vec<Value> = serde_wasm_bindgen::from_value(documents)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+
+        self.inner
+            .borrow_mut()
+            .remove_all(documents)
+            .map_err(|err| JsValue::from_str(&err))
+    }
+
     #[wasm_bindgen(js_name = discard)]
-    pub fn discard_js(&mut self, id: JsValue) -> Result<(), JsValue> {
+    pub fn discard_js(&self, id: JsValue) -> Result<(), JsValue> {
         let id: Value = serde_wasm_bindgen::from_value(id)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
 
         self.inner
-            .discard(&id)
-            .map_err(|err| JsValue::from_str(&err))
+            .borrow_mut()
+            .discard_deferred(&id)
+            .map_err(|err| JsValue::from_str(&err))?;
+        self.maybe_schedule_auto_vacuum();
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = discardAll)]
+    pub fn discard_all_js(&self, ids: JsValue) -> Result<(), JsValue> {
+        let ids: Vec<Value> = serde_wasm_bindgen::from_value(ids)
+            .map_err(|err| JsValue::from_str(&err.to_string()))?;
+
+        self.inner
+            .borrow_mut()
+            .discard_all_deferred(&ids)
+            .map_err(|err| JsValue::from_str(&err))?;
+        self.maybe_schedule_auto_vacuum();
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = vacuum)]
+    pub fn vacuum_js(&self, options: Option<JsValue>) -> Result<Promise, JsValue> {
+        let options: VacuumOptions = match options {
+            None => VacuumOptions::default(),
+            Some(options) => serde_wasm_bindgen::from_value(options)
+                .map_err(|err| JsValue::from_str(&err.to_string()))?,
+        };
+
+        Ok(schedule_vacuum(
+            Rc::clone(&self.inner),
+            Rc::clone(&self.vacuum_runtime),
+            options.resolved(),
+        ))
+    }
+
+    #[wasm_bindgen(getter, js_name = isVacuuming)]
+    pub fn is_vacuuming_js(&self) -> bool {
+        self.vacuum_runtime.borrow().active || self.inner.borrow().is_vacuuming()
+    }
+
+    #[wasm_bindgen(getter, js_name = dirtCount)]
+    pub fn dirt_count_js(&self) -> f64 {
+        self.inner.borrow().dirt_count() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = dirtFactor)]
+    pub fn dirt_factor_js(&self) -> f64 {
+        self.inner.borrow().dirt_factor()
+    }
+
+    #[wasm_bindgen(getter, js_name = documentCount)]
+    pub fn document_count_js(&self) -> f64 {
+        self.inner.borrow().document_count() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = termCount)]
+    pub fn term_count_js(&self) -> f64 {
+        self.inner.borrow().term_count() as f64
     }
 
     /// The special wildcard query value, like `MiniSearch.wildcard`: pass it
@@ -115,11 +261,9 @@ impl MiniSearchWasm {
         };
 
         let query = parse_query(&query)?;
+        let results = self.inner.borrow().search_query(&query, &per_call);
 
-        Ok(results_to_js(
-            &self.inner.search_query(&query, &per_call),
-            include_match,
-        ))
+        Ok(results_to_js(&results, include_match))
     }
 
     /// App-facing fast search and the recommended path for embedding apps. Only
@@ -135,7 +279,7 @@ impl MiniSearchWasm {
     /// `search()` (same ids, same BM25 scores).
     #[wasm_bindgen(js_name = searchJoined)]
     pub fn search_joined_js(&self, query: &str, or_mode: bool) -> JsValue {
-        joined_to_js(&self.inner.search_joined_default(query, or_mode))
+        joined_to_js(&self.inner.borrow().search_joined_default(query, or_mode))
     }
 
     /// MiniSearch-compatible `autoSuggest(query, options?)`: suggestions for
@@ -156,7 +300,7 @@ impl MiniSearchWasm {
             )
         };
 
-        let suggestions = self.inner.auto_suggest(query, per_call.as_ref());
+        let suggestions = self.inner.borrow().auto_suggest(query, per_call.as_ref());
 
         let suggestion_key = JsValue::from_str("suggestion");
         let terms_key = JsValue::from_str("terms");
@@ -189,7 +333,7 @@ impl MiniSearchWasm {
     /// boundary.
     #[wasm_bindgen(js_name = autoSuggestJoined)]
     pub fn auto_suggest_joined_js(&self, query: &str) -> JsValue {
-        let entries = self.inner.auto_suggest(query, None);
+        let entries = self.inner.borrow().auto_suggest(query, None);
 
         let scores = Float64Array::new_with_length(entries.len() as u32);
         let mut suggestions = String::new();
@@ -221,29 +365,37 @@ impl MiniSearchWasm {
     /// pure engine compute cost separately from the boundary cost.
     #[wasm_bindgen(js_name = searchCountDefault)]
     pub fn search_count_default_js(&self, query: &str, or_mode: bool) -> f64 {
-        self.inner.search_packed_default(query, or_mode).ids.len() as f64
+        self.inner
+            .borrow()
+            .search_packed_default(query, or_mode)
+            .ids
+            .len() as f64
     }
 
     /// Diagnostic probe: hit count for a query with prefix/fuzzy toggled, to
     /// profile where search time goes.
     #[wasm_bindgen(js_name = searchCountOpts)]
     pub fn search_count_opts_js(&self, query: &str, prefix: bool, fuzzy: bool) -> f64 {
-        self.inner.search_count_opts(query, prefix, fuzzy) as f64
+        self.inner.borrow().search_count_opts(query, prefix, fuzzy) as f64
     }
 
     #[wasm_bindgen(js_name = toJSON)]
     pub fn to_json_js(&self) -> Result<JsValue, JsValue> {
-        to_json_compatible_value(&self.inner).map_err(|err| JsValue::from_str(&err))
+        to_json_compatible_value(&*self.inner.borrow()).map_err(|err| JsValue::from_str(&err))
     }
 
     #[wasm_bindgen(js_name = toJSONString)]
     pub fn to_json_string_js(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&self.inner).map_err(|err| JsValue::from_str(&err.to_string()))
+        serde_json::to_string(&*self.inner.borrow())
+            .map_err(|err| JsValue::from_str(&err.to_string()))
     }
 
     #[wasm_bindgen(js_name = toBytes)]
     pub fn to_bytes_js(&self) -> Result<Vec<u8>, JsValue> {
-        self.inner.to_bytes().map_err(|err| JsValue::from_str(&err))
+        self.inner
+            .borrow()
+            .to_bytes()
+            .map_err(|err| JsValue::from_str(&err))
     }
 
     #[wasm_bindgen(js_name = loadJSON)]
@@ -251,15 +403,109 @@ impl MiniSearchWasm {
         let inner: MiniSearch =
             serde_json::from_str(serialized).map_err(|err| JsValue::from_str(&err.to_string()))?;
 
-        Ok(MiniSearchWasm { inner })
+        Ok(MiniSearchWasm::from_inner(inner))
     }
 
     #[wasm_bindgen(js_name = loadBytes)]
     pub fn load_bytes_js(bytes: &[u8]) -> Result<MiniSearchWasm, JsValue> {
         let inner = MiniSearch::from_bytes(bytes).map_err(|err| JsValue::from_str(&err))?;
 
-        Ok(MiniSearchWasm { inner })
+        Ok(MiniSearchWasm::from_inner(inner))
     }
+}
+
+impl MiniSearchWasm {
+    fn from_inner(inner: MiniSearch) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(inner)),
+            vacuum_runtime: Rc::new(RefCell::new(VacuumRuntime::default())),
+        }
+    }
+
+    fn maybe_schedule_auto_vacuum(&self) {
+        let options = self.inner.borrow().auto_vacuum_request();
+        if let Some(options) = options {
+            let _ = schedule_vacuum(
+                Rc::clone(&self.inner),
+                Rc::clone(&self.vacuum_runtime),
+                options,
+            );
+        }
+    }
+}
+
+fn schedule_vacuum(
+    inner: Rc<RefCell<MiniSearch>>,
+    runtime: Rc<RefCell<VacuumRuntime>>,
+    options: mini_search::ResolvedVacuumOptions,
+) -> Promise {
+    {
+        let mut state = runtime.borrow_mut();
+        if state.active {
+            state.rerun = true;
+            return state
+                .current
+                .as_ref()
+                .expect("active vacuum has a promise")
+                .clone();
+        }
+        state.active = true;
+    }
+
+    let future_inner = Rc::clone(&inner);
+    let future_runtime = Rc::clone(&runtime);
+    let promise = future_to_promise(async move {
+        let result = async {
+            loop {
+                future_inner.borrow_mut().begin_vacuum();
+                loop {
+                    let done = future_inner.borrow_mut().vacuum_step(options.batch_size);
+                    if done {
+                        break;
+                    }
+                    yield_to_timer(options.batch_wait).await?;
+                }
+
+                let rerun = {
+                    let mut state = future_runtime.borrow_mut();
+                    let rerun = state.rerun;
+                    state.rerun = false;
+                    rerun
+                };
+                if !rerun {
+                    break;
+                }
+            }
+            Ok(JsValue::UNDEFINED)
+        }
+        .await;
+
+        let mut state = future_runtime.borrow_mut();
+        state.active = false;
+        state.rerun = false;
+        state.current = None;
+        result
+    });
+    runtime.borrow_mut().current = Some(promise.clone());
+    promise
+}
+
+async fn yield_to_timer(milliseconds: u32) -> Result<(), JsValue> {
+    let global = js_sys::global();
+    let timer: Function = Reflect::get(&global, &JsValue::from_str("setTimeout"))?
+        .dyn_into()
+        .map_err(|_| JsValue::from_str("global setTimeout is not available"))?;
+    let promise = Promise::new(&mut |resolve, reject| {
+        if let Err(error) = timer.call2(&global, &resolve, &JsValue::from_f64(milliseconds as f64))
+        {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    JsFuture::from(promise).await.map(|_| ())
+}
+
+fn default_async_chunk_size() -> usize {
+    10
 }
 
 /// Most boundary-frugal shape: `scores` as a `Float64Array`, plus `ids` and

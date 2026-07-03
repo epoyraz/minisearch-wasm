@@ -6,8 +6,8 @@
 //! JS `Object.keys(match)` order.
 
 use minisearch_wasm::{
-    AutoSuggestOptions, CombineWith, FuzzySetting, MiniSearch, MiniSearchOptions,
-    PartialSearchOptions, Query, QueryCombination, SearchOptions, TokenizerMode,
+    AutoSuggestOptions, AutoVacuumSetting, CombineWith, FuzzySetting, MiniSearch,
+    MiniSearchOptions, PartialSearchOptions, Query, QueryCombination, SearchOptions, TokenizerMode,
 };
 use serde_json::{json, Map, Value};
 
@@ -45,6 +45,7 @@ fn make_index(docs: &[Value]) -> MiniSearch {
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions::default(),
         auto_suggest_options: None,
+        auto_vacuum: Some(AutoVacuumSetting::Enabled(false)),
     });
     search.add_all(docs.to_vec()).unwrap();
     search
@@ -216,7 +217,40 @@ fn main() {
     }
     let after_mutation = dump(&mutated, &queries, &tree_queries);
 
-    let out = json!({ "fresh": fresh, "afterMutation": after_mutation });
+    let mut batch_mutated = make_index(&docs);
+    let documents_to_remove: Vec<Value> = docs.iter().step_by(7).cloned().collect();
+    let ids_to_discard: Vec<Value> = docs
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % 11 == 3 && index % 7 != 0)
+        .map(|(_, document)| document["id"].clone())
+        .collect();
+    batch_mutated.remove_all(documents_to_remove).unwrap();
+    batch_mutated.discard_all(&ids_to_discard).unwrap();
+    let after_batch_mutation = dump(&batch_mutated, &queries, &tree_queries);
+
+    let mut vacuumed = make_index(&docs);
+    let mut index = 0usize;
+    while index < docs.len() {
+        vacuumed.remove(&docs[index]).unwrap();
+        index += 7;
+    }
+    index = 3;
+    while index < docs.len() {
+        if index % 7 != 0 {
+            vacuumed.discard(&docs[index]["id"]).unwrap();
+        }
+        index += 11;
+    }
+    vacuumed.vacuum();
+    let after_vacuum = dump(&vacuumed, &queries, &tree_queries);
+
+    let out = json!({
+        "fresh": fresh,
+        "afterMutation": after_mutation,
+        "afterBatchMutation": after_batch_mutation,
+        "afterVacuum": after_vacuum
+    });
     std::fs::write(&args[2], serde_json::to_string(&out).unwrap()).unwrap();
     eprintln!("rust dump written: {} labels per phase", fresh.len());
 }

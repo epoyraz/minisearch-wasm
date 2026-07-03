@@ -79,6 +79,15 @@ const everything = mini.search(MiniSearchWasm.wildcard);
 const suggestions = mini.autoSuggest("softw eng", { fuzzy: 0.2 });
 // => [{ suggestion: "software engineer", terms: ["software", "engineer"], score: … }, …]
 
+// Non-blocking batch indexing, yielding between chunks:
+await mini.addAllAsync(documents, { chunkSize: 100 });
+
+// Discard leaves stale postings. Auto-vacuum is enabled by default and can be
+// tuned or disabled in the constructor; manual vacuuming is also asynchronous.
+mini.discard(oldDocumentId);
+await mini.vacuum({ batchSize: 1000, batchWait: 10 });
+console.log(mini.dirtCount, mini.dirtFactor, mini.isVacuuming);
+
 // Fast path: one string + one Float64Array across the boundary; a suggestion
 // row IS its space-joined terms.
 const s = mini.autoSuggestJoined("softw eng");
@@ -121,11 +130,8 @@ traversal exactly) — but deliberately diverges from its API and internals:
   code units.
 - **Search never mutates the index.** MiniSearch lazily removes stale postings
   mid-query when it meets a discarded document; this port just skips them (and
-  skips the liveness check entirely on a clean index).
-- **Not implemented (yet).** Async indexing (`addAllAsync`), `vacuum`, and
-  batch `removeAll`/`discardAll`. `autoSuggest`, query-expression trees, and
-  wildcard queries are implemented (minus the JS callback options, per the
-  no-callbacks rule). See `PORTING.md`.
+  skips the liveness check entirely on a clean index). Explicit and automatic
+  vacuuming remove those stale postings in asynchronous Wasm-side batches.
 - **Added beyond MiniSearch.** `searchJoined` / `autoSuggestJoined` (compact
   columnar results for a thin Wasm boundary), `addAllJSON` (index straight from
   a raw JSON string), `toBytes`/`loadBytes` (compact binary snapshot), the
@@ -147,6 +153,13 @@ expect some run-to-run variance.
 | Serialize index — `toBytes` vs `JSON.stringify` | ~8× faster |
 | Build index — `addAllJSON` vs `addAll` | ~2.7× faster |
 | Full compat `search()` vs JS `search()` | ~0.7× (slower by design — see Design) |
+
+The synthetic maintenance benchmark (`npm run bench:maintenance`, 5,000
+documents, 500-document async chunks) measured `addAllAsync` at 2.89× the
+synchronous Wasm indexing time, reflecting its deliberate event-loop yields.
+Vacuuming 1,250 discarded documents took 122 ms and reduced the binary snapshot
+by 20%. These timings are workload- and machine-dependent; the benchmark always
+verifies post-maintenance search parity and dirt cleanup.
 
 The compact binary snapshot is delta+varint encoded, so it is both smaller than
 the JSON index and low-entropy enough to compress well; `loadBytes` rebuilds the
