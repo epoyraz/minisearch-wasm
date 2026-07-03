@@ -26,12 +26,14 @@ A Wasm search engine lives or dies at the JS↔Wasm boundary. Two rules:
    `ids` / `terms` as single newline-joined strings the host splits natively.
    No per-hit JS object is created on the Rust side.
 
-That is what `searchJoined` does, and it is the recommended path for embedding
-apps. `search()` is also provided for drop-in MiniSearch compatibility (it
-returns the full nested per-hit `{ id, score, terms, queryTerms, match, … }`
-objects) — but it is **slower than JS by design**: rebuilding MiniSearch's
-nested objects across the boundary is inherently expensive, and real consumers
-(e.g. the jobboard worker) only ever read `id`, `score`, and `terms`.
+That is what `searchJoined` does — and `searchRaw` goes further still
+(everything numeric: typed arrays plus one small interned term table). These
+are the recommended paths for embedding apps. `search()` is also provided for
+drop-in MiniSearch compatibility (it returns the full nested per-hit
+`{ id, score, terms, queryTerms, match, … }` objects); rebuilding those nested
+objects across the boundary costs most of the engine's win, leaving it at
+roughly JS parity — real consumers (e.g. the jobboard worker) only ever read
+`id`, `score`, and `terms`.
 
 ## API
 
@@ -164,12 +166,13 @@ expect some run-to-run variance.
 
 | Category | Rust vs JS MiniSearch |
 |---|---|
-| **Search — app workload** (`{id, score, terms}`, end to end) | **~12× faster** (median; mean ~7×) |
+| **Search — app workload** (`{id, score, terms}` via `searchJoined`) | **~11× faster** (median; mean ~7×) |
+| **Search — same workload via `searchRaw`** | **~23× faster** (median; mean ~16×) |
 | **Index download** (prebuilt, brotli) | **~0.73× — smaller on the wire than JS** |
 | Load prebuilt index — `loadBytes` vs `loadJSON` | ~13× faster |
 | Serialize index — `toBytes` vs `JSON.stringify` | ~12× faster |
-| Build index — `addAllJSON` vs `addAll` | ~3.4× faster |
-| Full compat `search()` vs JS `search()` | ~0.7× (slower by design — see Design) |
+| Build index — `addAllJSON` vs `addAll` | ~2.9× faster |
+| Full compat `search()` vs JS `search()` | ~parity (~1.3× faster with `includeMatch: false`) |
 
 Search-as-you-type re-issues the same committed terms every keystroke; the
 engine memoizes prefix/fuzzy tree expansions (bit-identical replay,
