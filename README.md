@@ -57,6 +57,23 @@ for (let i = 0; i < r.count; i++) {
   use(ids[i], r.scores[i], terms[i] ? terms[i].split(" ") : []);
 }
 
+// …with per-call option overrides (partial, like search()):
+const exact = mini.searchJoinedOpts("java", { prefix: false, fuzzy: false });
+
+// Fastest path — everything numeric. Fetch the id table once, then per query
+// only typed arrays + one small interned term table cross the boundary:
+const idTable = mini.docIdTable().split("\n");   // row n = internal doc id n
+const raw = mini.searchRaw("software engineer"); // optional options 2nd arg
+// { count, docIds: Uint32Array, scores: Float64Array, termTable: "a\nb\n…",
+//   termOffsets: Uint32Array, termIds: Uint32Array }
+const termTable = raw.termTable ? raw.termTable.split("\n") : [];
+for (let i = 0; i < raw.count; i++) {
+  const terms = [];
+  for (let k = raw.termOffsets[i]; k < raw.termOffsets[i + 1]; k++)
+    terms.push(termTable[raw.termIds[k]]);
+  use(idTable[raw.docIds[i]], raw.scores[i], terms);
+}
+
 // Compatibility path — MiniSearch-shaped result objects (slower, see above):
 const full = mini.search("software engineer", { combineWith: "AND" });
 
@@ -147,12 +164,17 @@ expect some run-to-run variance.
 
 | Category | Rust vs JS MiniSearch |
 |---|---|
-| **Search — app workload** (`{id, score, terms}`, end to end) | **~2.7× faster** (median; mean ~1.8×) |
+| **Search — app workload** (`{id, score, terms}`, end to end) | **~12× faster** (median; mean ~7×) |
 | **Index download** (prebuilt, brotli) | **~0.73× — smaller on the wire than JS** |
-| Load prebuilt index — `loadBytes` vs `loadJSON` | ~8× faster |
-| Serialize index — `toBytes` vs `JSON.stringify` | ~8× faster |
-| Build index — `addAllJSON` vs `addAll` | ~2.7× faster |
+| Load prebuilt index — `loadBytes` vs `loadJSON` | ~13× faster |
+| Serialize index — `toBytes` vs `JSON.stringify` | ~12× faster |
+| Build index — `addAllJSON` vs `addAll` | ~3.4× faster |
 | Full compat `search()` vs JS `search()` | ~0.7× (slower by design — see Design) |
+
+Search-as-you-type re-issues the same committed terms every keystroke; the
+engine memoizes prefix/fuzzy tree expansions (bit-identical replay,
+invalidated on any mutation), which is where most of the search speedup comes
+from on repeated queries. Cold first-run queries are ~2-3× faster than JS.
 
 The synthetic maintenance benchmark (`npm run bench:maintenance`, 5,000
 documents, 500-document async chunks) measured `addAllAsync` at 2.89× the

@@ -153,6 +153,37 @@ incrementally.
 event loop before each full chunk, and preserves earlier chunks if a later
 document errors, like JS MiniSearch.
 
+## Flat Postings, Expansion Cache, and the Raw Boundary (0.8.0)
+
+Three performance changes, all verified bit-exact by the full differential
+(fresh, mutated, batch-mutated, and vacuumed phases — ALL MATCH, max score
+delta unchanged at ~5.5e-16):
+
+- **Flat sorted posting lists.** Postings are `Vec<(docId, freq)]` sorted by
+  doc id instead of a per-(term, field) `HashMap` — linear scoring loops,
+  snapshots write without re-sorting and read with a push loop (no hash-table
+  builds on load), one allocation per list. Scores are unchanged because each
+  document receives exactly one contribution per posting list, so per-document
+  float sum order is unaffected. JSON round-trip shape is preserved via a
+  custom `{docId: freq}` map (de)serializer.
+- **Prefix/fuzzy expansion cache.** Radix-tree expansions (the dominant query
+  cost — fuzzy traversal was ~86% of engine time on the jobboard corpus) are
+  memoized per term (+ max distance for fuzzy) in traversal order, with
+  weights recomputed from stored lengths, so replayed queries are
+  bit-identical. Any index mutation clears the cache; strictly only added
+  terms could invalidate a stale list (deleted terms fail their `index.get`
+  replay harmlessly), but clearing on every mutation keeps the invariant
+  trivial. Search-as-you-type repeats committed terms each keystroke, so this
+  collapses warm-query engine time (~7× on the jobboard corpus).
+- **`searchRaw` / `searchJoinedOpts` / `docIdTable`.** `searchJoinedOpts`
+  adds partial per-call option overrides to the joined fast path (e.g. exact
+  whole-token lookups with `{prefix: false, fuzzy: false}`). `searchRaw` is
+  the fully numeric boundary: short doc ids + scores + matched-term ids into a
+  per-query interned term table, resolved against the one-time `docIdTable`
+  (newline-joined external ids in short-id order; mutations require
+  re-fetching the table). Each distinct derived term crosses the boundary once
+  per query instead of once per hit.
+
 ## Additional Conformance Hardening
 
 The remaining planned coverage slices are now present:

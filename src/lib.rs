@@ -4,8 +4,8 @@ mod searchable_map;
 pub use mini_search::{
     AutoSuggestOptions, AutoVacuumOptions, AutoVacuumSetting, Bm25Params, CombineWith,
     CompactSearchResult, FuzzySetting, JoinedSearchResults, MiniSearch, MiniSearchOptions,
-    PackedSearchResults, PartialSearchOptions, Query, QueryCombination, SearchOptions,
-    SearchResult, Suggestion, TokenizerMode, VacuumOptions, Weights,
+    PackedSearchResults, PartialSearchOptions, Query, QueryCombination, RawSearchResults,
+    SearchOptions, SearchResult, Suggestion, TokenizerMode, VacuumOptions, Weights,
 };
 pub use searchable_map::{FuzzyMatch, SearchableMap};
 
@@ -280,6 +280,78 @@ impl MiniSearchWasm {
     #[wasm_bindgen(js_name = searchJoined)]
     pub fn search_joined_js(&self, query: &str, or_mode: bool) -> JsValue {
         joined_to_js(&self.inner.borrow().search_joined_default(query, or_mode))
+    }
+
+    /// `searchJoined` with per-call option overrides (partial, like `search`):
+    /// e.g. `searchJoinedOpts(q, { prefix: false, fuzzy: false })` for exact
+    /// whole-token lookups without the rich `search()` result shape.
+    #[wasm_bindgen(js_name = searchJoinedOpts)]
+    pub fn search_joined_opts_js(&self, query: &str, options: JsValue) -> Result<JsValue, JsValue> {
+        let per_call: PartialSearchOptions = if options.is_null() || options.is_undefined() {
+            PartialSearchOptions::default()
+        } else {
+            serde_wasm_bindgen::from_value(options)
+                .map_err(|err| JsValue::from_str(&err.to_string()))?
+        };
+
+        Ok(joined_to_js(
+            &self.inner.borrow().search_joined_opts(query, &per_call),
+        ))
+    }
+
+    /// The most boundary-frugal search: everything numeric. Returns
+    /// `{ count, docIds: Uint32Array, scores: Float64Array, termTable: string,
+    /// termOffsets: Uint32Array, termIds: Uint32Array }` where `docIds` are
+    /// internal short ids resolved against the one-time `docIdTable`, and hit
+    /// `i`'s matched terms are `termIds[termOffsets[i]..termOffsets[i+1]]`
+    /// indexing the newline-split `termTable`. Each distinct derived term
+    /// crosses the boundary once per query, however many hits matched it.
+    /// Optional `options` are partial per-call overrides, like `search`.
+    #[wasm_bindgen(js_name = searchRaw)]
+    pub fn search_raw_js(&self, query: &str, options: JsValue) -> Result<JsValue, JsValue> {
+        let per_call: PartialSearchOptions = if options.is_null() || options.is_undefined() {
+            PartialSearchOptions::default()
+        } else {
+            serde_wasm_bindgen::from_value(options)
+                .map_err(|err| JsValue::from_str(&err.to_string()))?
+        };
+
+        let raw = self.inner.borrow().search_raw(query, &per_call);
+
+        let doc_ids = js_sys::Uint32Array::new_with_length(raw.doc_ids.len() as u32);
+        doc_ids.copy_from(&raw.doc_ids);
+        let scores = Float64Array::new_with_length(raw.scores.len() as u32);
+        scores.copy_from(&raw.scores);
+        let term_offsets = js_sys::Uint32Array::new_with_length(raw.term_offsets.len() as u32);
+        term_offsets.copy_from(&raw.term_offsets);
+        let term_ids = js_sys::Uint32Array::new_with_length(raw.term_ids.len() as u32);
+        term_ids.copy_from(&raw.term_ids);
+
+        let object = Object::new();
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("count"),
+            &JsValue::from_f64(raw.doc_ids.len() as f64),
+        );
+        let _ = Reflect::set(&object, &JsValue::from_str("docIds"), &doc_ids);
+        let _ = Reflect::set(&object, &JsValue::from_str("scores"), &scores);
+        let _ = Reflect::set(
+            &object,
+            &JsValue::from_str("termTable"),
+            &JsValue::from_str(&raw.term_table),
+        );
+        let _ = Reflect::set(&object, &JsValue::from_str("termOffsets"), &term_offsets);
+        let _ = Reflect::set(&object, &JsValue::from_str("termIds"), &term_ids);
+        Ok(object.into())
+    }
+
+    /// External document ids newline-joined in short-id order (row `n` =
+    /// internal id `n`; removed/discarded docs leave empty rows). Fetch once
+    /// after loading — and again after any mutation — to resolve `searchRaw`
+    /// doc ids.
+    #[wasm_bindgen(js_name = docIdTable)]
+    pub fn doc_id_table_js(&self) -> String {
+        self.inner.borrow().doc_id_table()
     }
 
     /// MiniSearch-compatible `autoSuggest(query, options?)`: suggestions for

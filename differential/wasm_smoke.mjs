@@ -198,5 +198,38 @@ check('addAllAsync default chunk parity',
   rowsOf(jsAsyncDefault.search(MiniSearch.wildcard)),
   rowsOf(wasmAsyncDefault.search(MiniSearchWasm.wildcard)))
 
+// --- searchRaw / searchJoinedOpts / docIdTable ------------------------------
+{
+  const decodeRaw = (r, table) => {
+    const terms = r.termTable ? r.termTable.split('\n') : []
+    const out = []
+    for (let i = 0; i < r.count; i++) {
+      const row = []
+      for (let k = r.termOffsets[i]; k < r.termOffsets[i + 1]; k++) row.push(terms[r.termIds[k]])
+      out.push({ id: table[r.docIds[i]], score: r.scores[i], terms: row })
+    }
+    return out
+  }
+  const decodeJoined2 = (r) => {
+    if (!r.count) return []
+    const ids = r.ids.split('\n')
+    const termRows = r.terms.split('\n')
+    return ids.map((id, i) => ({ id, score: r.scores[i], terms: termRows[i] ? termRows[i].split(' ') : [] }))
+  }
+
+  const idTable = wasm.docIdTable().split('\n')
+  for (const q of ['vita', 'del', 'vit', 'nosuchterm']) {
+    check(`searchRaw parity (${q})`,
+      decodeJoined2(wasm.searchJoined(q, false)),
+      decodeRaw(wasm.searchRaw(q), idTable))
+  }
+  check('searchRaw with options',
+    decodeJoined2(wasm.searchJoinedOpts('vit', { prefix: true, fuzzy: 0.2 })),
+    decodeRaw(wasm.searchRaw('vit', { prefix: true, fuzzy: 0.2 }), idTable))
+  check('searchJoinedOpts exact lookup',
+    js.search('vita', { prefix: false, fuzzy: false, combineWith: 'OR' }).map(r => String(r.id)),
+    (() => { const r = wasm.searchJoinedOpts('vita', { prefix: false, fuzzy: false, combineWith: 'OR' }); return r.count ? r.ids.split('\n') : [] })())
+}
+
 console.log(failures === 0 ? 'WASM SMOKE: ALL PASS' : `${failures} FAILURES`)
 process.exitCode = failures === 0 ? 0 : 1
