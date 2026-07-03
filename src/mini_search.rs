@@ -11,11 +11,11 @@ use unicode_general_category::{get_general_category, GeneralCategory};
 type FieldId = usize;
 type ShortId = u32;
 type FieldTermData = HashMap<FieldId, HashMap<ShortId, u32>>;
-// Transient per-query accumulators keyed by doc id. They are rebuilt every
-// search and re-sorted before returning, so a fast non-cryptographic hasher is
-// safe (output is unchanged) and much cheaper than std's SipHash on u32 keys.
+// Transient per-query accumulator keyed by doc id (full `search()` path). It
+// is rebuilt every search and re-sorted before returning, so a fast
+// non-cryptographic hasher is safe (output is unchanged) and much cheaper than
+// std's SipHash on u32 keys.
 type RawResult = FxHashMap<ShortId, RawResultValue>;
-type RawCompactResult = FxHashMap<ShortId, RawCompactResultValue>;
 
 thread_local! {
     // Reused across queries (single-threaded Wasm) so the compact search path
@@ -30,48 +30,139 @@ thread_local! {
 /// into a map for every posting is the bulk of the non-fuzzy-traversal cost, yet
 /// a doc is hit many times (once per matched/expanded term × field). Indexing a
 /// flat `Vec` by `doc_id` removes that hashing entirely: O(1) array writes per
-/// posting, and we collect the map once per *unique* doc at the end.
+/// posting.
 ///
-/// Slots are reset lazily via a monotonic `generation` stamp, so there is no
-/// O(N) clear between queries — only the `touched` docs are revisited.
+/// A whole multi-term query runs in ONE scratch pass — there are no per-spec
+/// intermediate maps and no merge step. Per doc the pass tracks the running
+/// score, the matched derived terms (as ids into a per-query interned `table`,
+/// so no per-(doc, term) `String`s), and three counters that replace the old
+/// combinator: `spec_count` (`AND` keeps a doc iff it equals the spec count),
+/// `first_spec` (`AND_NOT` keeps a doc iff it is 0 and `spec_count` is 1), and
+/// `term_count` (matched distinct query terms — the score's quality factor —
+/// counted only by the first spec of each distinct term; duplicate query terms
+/// touch identical doc sets, so this reproduces the old string dedup exactly).
+///
+/// Scores stay bit-identical to the old per-spec-map + merge design: each
+/// spec accumulates into `spec_score` and is flushed into `score` as one
+/// addition per doc per spec, the same float summation order as the old
+/// `existing.score += value.score` merge.
+///
+/// Slots are reset lazily via monotonic generation stamps, so there is no
+/// O(N) clear between queries — only touched docs are revisited.
 #[derive(Default)]
 struct Scratch {
+    /// Per-doc score across the whole query (spec subtotals flushed in).
     score: Vec<f64>,
-    /// Derived (matched) index terms accumulated per doc for the current spec.
-    terms: Vec<Vec<String>>,
+    /// Per-doc subtotal for the spec currently accumulating.
+    spec_score: Vec<f64>,
+    /// Per-doc matched derived terms, as `table` ids, in first-match order.
+    terms: Vec<Vec<u32>>,
+    /// Per-doc number of specs that matched.
+    spec_count: Vec<u32>,
+    /// Per-doc number of distinct query terms that matched (quality factor).
+    term_count: Vec<u32>,
+    /// Per-doc index of the first spec that touched the doc (for `AND_NOT`).
+    first_spec: Vec<u32>,
     generation: Vec<u32>,
-    current_generation: u32,
+    spec_generation: Vec<u32>,
+    query_counter: u32,
+    spec_counter: u32,
     touched: Vec<ShortId>,
+    spec_touched: Vec<ShortId>,
+    /// Interned derived terms for the current query.
+    table: Vec<String>,
+    lookup: FxHashMap<String, u32>,
 }
 
 impl Scratch {
-    /// Grow to hold `len` docs and start a fresh accumulation pass.
-    fn begin(&mut self, len: usize) {
+    /// Grow to hold `len` docs and start a fresh query pass.
+    fn begin_query(&mut self, len: usize) {
         if self.score.len() < len {
             self.score.resize(len, 0.0);
+            self.spec_score.resize(len, 0.0);
             self.terms.resize_with(len, Vec::new);
+            self.spec_count.resize(len, 0);
+            self.term_count.resize(len, 0);
+            self.first_spec.resize(len, 0);
             self.generation.resize(len, 0);
+            self.spec_generation.resize(len, 0);
         }
-        self.current_generation = self.current_generation.wrapping_add(1);
-        if self.current_generation == 0 {
+        self.query_counter = self.query_counter.wrapping_add(1);
+        if self.query_counter == 0 {
             // Wrapped after ~4B passes: clear stamps so none collide with gen 0.
             self.generation.iter_mut().for_each(|g| *g = 0);
-            self.current_generation = 1;
+            self.query_counter = 1;
         }
         self.touched.clear();
+        self.table.clear();
+        self.lookup.clear();
     }
 
-    /// Reset `doc`'s slot the first time it is seen this pass and record it.
-    #[inline]
-    fn touch(&mut self, doc: ShortId) {
-        let i = doc as usize;
-        if self.generation[i] != self.current_generation {
-            self.generation[i] = self.current_generation;
-            self.score[i] = 0.0;
-            self.terms[i].clear();
-            self.touched.push(doc);
+    /// Start accumulating the next query spec.
+    fn begin_spec(&mut self) {
+        self.spec_counter = self.spec_counter.wrapping_add(1);
+        if self.spec_counter == 0 {
+            self.spec_generation.iter_mut().for_each(|g| *g = 0);
+            self.spec_counter = 1;
+        }
+        self.spec_touched.clear();
+    }
+
+    /// Add each spec-touched doc's subtotal into its query total — one
+    /// addition per doc per spec, preserving the old merge's float order.
+    fn flush_spec(&mut self) {
+        for &doc in &self.spec_touched {
+            let i = doc as usize;
+            self.score[i] += self.spec_score[i];
         }
     }
+
+    /// Id of `term` in the per-query intern table, creating it on first use.
+    fn intern(&mut self, term: &str) -> u32 {
+        if let Some(&id) = self.lookup.get(term) {
+            return id;
+        }
+        let id = self.table.len() as u32;
+        self.table.push(term.to_owned());
+        self.lookup.insert(term.to_owned(), id);
+        id
+    }
+
+    /// Reset `doc`'s slots the first time it is seen this query/spec and
+    /// record the spec-membership counters.
+    #[inline]
+    fn touch(&mut self, doc: ShortId, spec_index: u32, counts_term: bool) -> usize {
+        let i = doc as usize;
+        if self.generation[i] != self.query_counter {
+            self.generation[i] = self.query_counter;
+            self.score[i] = 0.0;
+            self.terms[i].clear();
+            self.spec_count[i] = 0;
+            self.term_count[i] = 0;
+            self.first_spec[i] = spec_index;
+            self.touched.push(doc);
+        }
+        if self.spec_generation[i] != self.spec_counter {
+            self.spec_generation[i] = self.spec_counter;
+            self.spec_score[i] = 0.0;
+            self.spec_count[i] += 1;
+            self.term_count[i] += u32::from(counts_term);
+            self.spec_touched.push(doc);
+        }
+        i
+    }
+}
+
+/// View of a finished fused query, borrowed from the thread-local scratch:
+/// ranked `(doc, score)` hits plus each doc's matched terms as ids into the
+/// interned `table`. Only valid inside `run_fused_query`'s `finish` closure.
+struct FusedHits<'a> {
+    /// (doc id, quality-multiplied score), sorted score desc / doc id asc.
+    hits: Vec<(ShortId, f64)>,
+    /// Per-doc matched derived-term ids, indexed by doc id.
+    terms: &'a [Vec<u32>],
+    /// Interned derived terms.
+    table: &'a [String],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -300,18 +391,22 @@ pub struct PackedSearchResults {
     pub terms: Vec<Vec<String>>,
 }
 
+/// Result set already materialized in the `searchJoined` boundary shape:
+/// `ids` and `terms` as single newline-joined strings (terms space-joined
+/// within a row), scores as one vector. Row `i` of each field describes the
+/// same hit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct JoinedSearchResults {
+    pub ids: String,
+    pub scores: Vec<f64>,
+    pub terms: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct RawResultValue {
     score: f64,
     terms: Vec<String>,
     matches: BTreeMap<String, Vec<String>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct RawCompactResultValue {
-    score: f64,
-    query_terms: Vec<String>,
-    terms: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -577,33 +672,25 @@ impl MiniSearch {
         search_options: SearchOptions,
     ) -> Vec<CompactSearchResult> {
         let options = merge_search_options(&self.options.search_options, &search_options);
-        let raw_results = self.execute_query_compact(query, &options);
-        let mut results = Vec::new();
-
-        for (doc_id, raw) in raw_results {
-            let quality = raw.query_terms.len().max(1) as f64;
-            results.push((
-                doc_id,
-                CompactSearchResult {
+        let specs = self.query_specs(query, &options);
+        self.run_fused_query(&specs, &options, |fused| {
+            fused
+                .hits
+                .iter()
+                .map(|&(doc_id, score)| CompactSearchResult {
                     id: self
                         .document_ids
                         .get(&doc_id)
                         .cloned()
                         .unwrap_or(Value::Null),
-                    score: raw.score * quality,
-                    terms: raw.terms,
-                },
-            ));
-        }
-
-        results.sort_by(|(left_id, left), (right_id, right)| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left_id.cmp(right_id))
-        });
-        results.into_iter().map(|(_, result)| result).collect()
+                    score,
+                    terms: fused.terms[doc_id as usize]
+                        .iter()
+                        .map(|&id| fused.table[id as usize].clone())
+                        .collect(),
+                })
+                .collect()
+        })
     }
 
     pub fn search_packed(&self, query: &str, search_options: SearchOptions) -> PackedSearchResults {
@@ -658,65 +745,53 @@ impl MiniSearch {
             })
             .collect();
 
-        let results = specs
-            .iter()
-            .map(|spec| self.execute_query_spec_compact(spec, &options))
-            .collect::<Vec<_>>();
-        let raw_results = combine_compact_results(results, options.combine_with);
-
-        // Rank documents exactly like `run_search_packed`, so suggestions are
-        // grouped in result-ranking order.
-        let mut ranked: Vec<(ShortId, f64, Vec<String>)> = raw_results
-            .into_iter()
-            .map(|(doc_id, raw)| {
-                let quality = raw.query_terms.len().max(1) as f64;
-                (doc_id, raw.score * quality, raw.terms)
-            })
-            .collect();
-        ranked.sort_by(|(left_id, left_score, _), (right_id, right_score, _)| {
-            right_score
-                .partial_cmp(left_score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left_id.cmp(right_id))
-        });
-
-        // Group by phrase. A doc's matched terms are accumulated in
-        // first-match order (query-spec order, tree-traversal order within a
-        // spec), matching JS `Object.keys(match)`, so the joined phrase is
-        // identical to the JS one. First-appearance grouping order plus the
-        // stable sort below reproduce JS's tie order.
-        let mut phrase_slots: FxHashMap<String, usize> = FxHashMap::default();
-        let mut grouped: Vec<(Vec<String>, f64, u32)> = Vec::new();
-        for (_, score, terms) in ranked {
-            let phrase = terms.join(" ");
-            match phrase_slots.entry(phrase) {
-                Entry::Occupied(slot) => {
-                    let (_, total, count) = &mut grouped[*slot.get()];
-                    *total += score;
-                    *count += 1;
-                }
-                Entry::Vacant(slot) => {
-                    slot.insert(grouped.len());
-                    grouped.push((terms, score, 1));
+        self.run_fused_query(&specs, &options, |fused| {
+            // Group ranked hits by matched-terms phrase — keyed by the term-id
+            // sequence, which is equivalent to the joined phrase (terms cannot
+            // contain spaces) without building a string per document. A doc's
+            // terms are in first-match order (query-spec order, tree-traversal
+            // order within a spec), matching JS `Object.keys(match)`, so the
+            // phrase is identical to the JS one. First-appearance grouping
+            // order plus the stable sort below reproduce JS's tie order.
+            let mut phrase_slots: FxHashMap<&[u32], usize> = FxHashMap::default();
+            let mut grouped: Vec<(&[u32], f64, u32)> = Vec::new();
+            for &(doc_id, score) in &fused.hits {
+                let term_ids: &[u32] = &fused.terms[doc_id as usize];
+                match phrase_slots.entry(term_ids) {
+                    Entry::Occupied(slot) => {
+                        let (_, total, count) = &mut grouped[*slot.get()];
+                        *total += score;
+                        *count += 1;
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(grouped.len());
+                        grouped.push((term_ids, score, 1));
+                    }
                 }
             }
-        }
 
-        let mut suggestions: Vec<Suggestion> = grouped
-            .into_iter()
-            .map(|(terms, total, count)| Suggestion {
-                suggestion: terms.join(" "),
-                terms,
-                score: total / count as f64,
-            })
-            .collect();
-        suggestions.sort_by(|left, right| {
-            right
-                .score
-                .partial_cmp(&left.score)
-                .unwrap_or(Ordering::Equal)
-        });
-        suggestions
+            let mut suggestions: Vec<Suggestion> = grouped
+                .into_iter()
+                .map(|(term_ids, total, count)| {
+                    let terms: Vec<String> = term_ids
+                        .iter()
+                        .map(|&id| fused.table[id as usize].clone())
+                        .collect();
+                    Suggestion {
+                        suggestion: terms.join(" "),
+                        terms,
+                        score: total / count as f64,
+                    }
+                })
+                .collect();
+            suggestions.sort_by(|left, right| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            });
+            suggestions
+        })
     }
 
     /// Resolve the effective search options for `auto_suggest`, returning the
@@ -778,42 +853,147 @@ impl MiniSearch {
         } else {
             None
         };
-        self.execute_query_compact(query, &options).len()
+        let specs = self.query_specs(query, &options);
+        self.run_fused_query(&specs, &options, |fused| fused.hits.len())
+    }
+
+    /// Engine side of the Wasm `searchJoined`: the ranked result set already
+    /// materialized as the boundary shape — `ids` and `terms` as single
+    /// newline-joined strings (terms space-joined within a row) plus a scores
+    /// vector. Building the joined strings here skips the per-hit id `Value`
+    /// clones and per-(doc, term) `String`s a `PackedSearchResults` would
+    /// allocate just to be concatenated and thrown away at the boundary.
+    pub fn search_joined_default(&self, query: &str, or_mode: bool) -> JoinedSearchResults {
+        use std::fmt::Write;
+
+        let mut options = self.options.search_options.clone();
+        if or_mode {
+            options.combine_with = CombineWith::Or;
+        }
+        let specs = self.query_specs(query, &options);
+        self.run_fused_query(&specs, &options, |fused| {
+            let mut ids = String::new();
+            let mut terms = String::new();
+            let mut scores = Vec::with_capacity(fused.hits.len());
+
+            for (index, &(doc_id, score)) in fused.hits.iter().enumerate() {
+                if index > 0 {
+                    ids.push('\n');
+                    terms.push('\n');
+                }
+                match self.document_ids.get(&doc_id) {
+                    Some(Value::String(id)) => ids.push_str(id),
+                    Some(other) => {
+                        let _ = write!(ids, "{other}");
+                    }
+                    None => ids.push_str("null"),
+                }
+                for (term_index, &id) in fused.terms[doc_id as usize].iter().enumerate() {
+                    if term_index > 0 {
+                        terms.push(' ');
+                    }
+                    terms.push_str(&fused.table[id as usize]);
+                }
+                scores.push(score);
+            }
+
+            JoinedSearchResults { ids, scores, terms }
+        })
     }
 
     fn run_search_packed(&self, query: &str, options: &SearchOptions) -> PackedSearchResults {
-        let raw_results = self.execute_query_compact(query, options);
-        let mut results: Vec<(ShortId, f64, Vec<String>)> = raw_results
-            .into_iter()
-            .map(|(doc_id, raw)| {
-                let quality = raw.query_terms.len().max(1) as f64;
-                (doc_id, raw.score * quality, raw.terms)
+        let specs = self.query_specs(query, options);
+        self.run_fused_query(&specs, options, |fused| {
+            let mut ids = Vec::with_capacity(fused.hits.len());
+            let mut scores = Vec::with_capacity(fused.hits.len());
+            let mut terms = Vec::with_capacity(fused.hits.len());
+
+            for &(doc_id, score) in &fused.hits {
+                ids.push(
+                    self.document_ids
+                        .get(&doc_id)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                scores.push(score);
+                terms.push(
+                    fused.terms[doc_id as usize]
+                        .iter()
+                        .map(|&id| fused.table[id as usize].clone())
+                        .collect(),
+                );
+            }
+
+            PackedSearchResults { ids, scores, terms }
+        })
+    }
+
+    /// Run every query spec through one shared dense scratch pass, filter by
+    /// the combine mode, rank, and hand the borrowed result view to `finish`.
+    ///
+    /// One scratch pass replaces the old per-spec map materialization and
+    /// pairwise merge: `AND` keeps a doc iff its matched-spec count equals the
+    /// spec count, `AND_NOT` iff only spec 0 touched it, and the quality
+    /// factor is the matched distinct-term count (counted by the first spec of
+    /// each distinct term — duplicate query terms touch identical doc sets, so
+    /// this equals the old merge's string dedup). Scores are bit-identical to
+    /// the old design; see `Scratch`.
+    fn run_fused_query<R>(
+        &self,
+        specs: &[QuerySpec],
+        options: &SearchOptions,
+        finish: impl FnOnce(FusedHits<'_>) -> R,
+    ) -> R {
+        let field_boosts = self.field_boosts(options);
+
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let scratch = &mut *scratch;
+            scratch.begin_query(self.next_id as usize);
+
+            let mut seen_terms: FxHashMap<&str, ()> = FxHashMap::default();
+            for (spec_index, spec) in specs.iter().enumerate() {
+                let counts_term = seen_terms.insert(spec.term.as_str(), ()).is_none();
+                scratch.begin_spec();
+                self.execute_spec_fused(
+                    scratch,
+                    spec,
+                    spec_index as u32,
+                    counts_term,
+                    options,
+                    &field_boosts,
+                );
+                scratch.flush_spec();
+            }
+
+            let spec_count = specs.len() as u32;
+            let mut hits: Vec<(ShortId, f64)> = Vec::with_capacity(scratch.touched.len());
+            for &doc_id in &scratch.touched {
+                let i = doc_id as usize;
+                let keep = match options.combine_with {
+                    CombineWith::Or => true,
+                    CombineWith::And => scratch.spec_count[i] == spec_count,
+                    CombineWith::AndNot => scratch.first_spec[i] == 0 && scratch.spec_count[i] == 1,
+                };
+                if keep {
+                    let quality = scratch.term_count[i].max(1) as f64;
+                    hits.push((doc_id, scratch.score[i] * quality));
+                }
+            }
+
+            hits.sort_unstable_by(|(left_id, left_score), (right_id, right_score)| {
+                right_score
+                    .partial_cmp(left_score)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| left_id.cmp(right_id))
+            });
+
+            finish(FusedHits {
+                hits,
+                terms: &scratch.terms,
+                table: &scratch.table,
             })
-            .collect();
-
-        results.sort_by(|(left_id, left_score, _), (right_id, right_score, _)| {
-            right_score
-                .partial_cmp(left_score)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left_id.cmp(right_id))
-        });
-
-        let mut ids = Vec::with_capacity(results.len());
-        let mut scores = Vec::with_capacity(results.len());
-        let mut terms = Vec::with_capacity(results.len());
-
-        for (doc_id, score, result_terms) in results {
-            ids.push(
-                self.document_ids
-                    .get(&doc_id)
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
-            scores.push(score);
-            terms.push(result_terms);
-        }
-
-        PackedSearchResults { ids, scores, terms }
+        })
     }
 
     pub fn document_count(&self) -> usize {
@@ -1052,16 +1232,6 @@ impl MiniSearch {
         combine_results(results, options.combine_with)
     }
 
-    fn execute_query_compact(&self, query: &str, options: &SearchOptions) -> RawCompactResult {
-        let queries = self.query_specs(query, options);
-        let results = queries
-            .iter()
-            .map(|query| self.execute_query_spec_compact(query, options))
-            .collect::<Vec<_>>();
-
-        combine_compact_results(results, options.combine_with)
-    }
-
     fn query_specs(&self, query: &str, options: &SearchOptions) -> Vec<QuerySpec> {
         tokenize(self.options.tokenizer, query)
             .into_iter()
@@ -1162,114 +1332,102 @@ impl MiniSearch {
         results
     }
 
-    fn execute_query_spec_compact(
+    /// Accumulate one query spec (exact + optional prefix/fuzzy expansions)
+    /// into the shared per-query scratch. Caller brackets this with
+    /// `begin_spec`/`flush_spec`.
+    fn execute_spec_fused(
         &self,
+        scratch: &mut Scratch,
         query: &QuerySpec,
+        spec_index: u32,
+        counts_term: bool,
         options: &SearchOptions,
-    ) -> RawCompactResult {
-        let field_boosts = self.field_boosts(options);
+        field_boosts: &[FieldBoost],
+    ) {
+        if let Some(data) = self.index.get(&query.term) {
+            let term_id = scratch.intern(&query.term);
+            self.accumulate_dense(
+                scratch,
+                term_id,
+                spec_index,
+                counts_term,
+                1.0,
+                query.term_boost,
+                data,
+                field_boosts,
+                options.bm25,
+            );
+        }
 
-        SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            scratch.begin(self.next_id as usize);
+        if query.prefix {
+            self.index.for_each_prefix(&query.term, |term, data| {
+                // Term length is measured in characters (code points), matching
+                // JS MiniSearch's `term.length`. Using byte length here would
+                // skew weights for multi-byte UTF-8 terms (umlauts, accents).
+                let term_len = term.chars().count();
+                let distance = term_len.saturating_sub(query.term.chars().count());
+                if distance == 0 {
+                    return;
+                }
 
-            if let Some(data) = self.index.get(&query.term) {
+                let weight = options.weights.prefix * term_len as f64
+                    / (term_len as f64 + 0.3 * distance as f64);
+                let term_id = scratch.intern(term);
                 self.accumulate_dense(
-                    &mut scratch,
-                    &query.term,
-                    1.0,
+                    scratch,
+                    term_id,
+                    spec_index,
+                    counts_term,
+                    weight,
                     query.term_boost,
                     data,
-                    &field_boosts,
+                    field_boosts,
                     options.bm25,
                 );
+            });
+        }
+
+        if let Some(fuzzy) = query.fuzzy {
+            let term_len = query.term.chars().count();
+            let max_distance = if fuzzy < 1.0 {
+                options
+                    .max_fuzzy
+                    .min((term_len as f64 * fuzzy).round() as usize)
+            } else {
+                fuzzy as usize
+            };
+
+            if max_distance > 0 {
+                self.index
+                    .for_each_fuzzy(&query.term, max_distance, |term, data, distance| {
+                        // A term already surfaced by the prefix pass (it
+                        // starts with the query term) was added there; skip
+                        // it here so it isn't double-counted. Equivalent to
+                        // the old per-query HashSet<String> dedup, without
+                        // the allocations or hashing.
+                        if distance == 0 || (query.prefix && term.starts_with(query.term.as_str()))
+                        {
+                            return;
+                        }
+
+                        let term_len = term.chars().count();
+                        let weight = options.weights.fuzzy * term_len as f64
+                            / (term_len as f64 + distance as f64);
+                        let term_id = scratch.intern(term);
+                        self.accumulate_dense(
+                            scratch,
+                            term_id,
+                            spec_index,
+                            counts_term,
+                            weight,
+                            query.term_boost,
+                            data,
+                            field_boosts,
+                            options.bm25,
+                        );
+                    });
             }
-
-            if query.prefix {
-                self.index.for_each_prefix(&query.term, |term, data| {
-                    let term_len = term.chars().count();
-                    let distance = term_len.saturating_sub(query.term.chars().count());
-                    if distance == 0 {
-                        return;
-                    }
-
-                    let weight = options.weights.prefix * term_len as f64
-                        / (term_len as f64 + 0.3 * distance as f64);
-                    self.accumulate_dense(
-                        &mut scratch,
-                        term,
-                        weight,
-                        query.term_boost,
-                        data,
-                        &field_boosts,
-                        options.bm25,
-                    );
-                });
-            }
-
-            if let Some(fuzzy) = query.fuzzy {
-                let term_len = query.term.chars().count();
-                let max_distance = if fuzzy < 1.0 {
-                    options
-                        .max_fuzzy
-                        .min((term_len as f64 * fuzzy).round() as usize)
-                } else {
-                    fuzzy as usize
-                };
-
-                if max_distance > 0 {
-                    self.index
-                        .for_each_fuzzy(&query.term, max_distance, |term, data, distance| {
-                            // A term already surfaced by the prefix pass (it
-                            // starts with the query term) was added there; skip
-                            // it here so it isn't double-counted. Equivalent to
-                            // the old per-query HashSet<String> dedup, without
-                            // the allocations or hashing.
-                            if distance == 0
-                                || (query.prefix && term.starts_with(query.term.as_str()))
-                            {
-                                return;
-                            }
-
-                            let term_len = term.chars().count();
-                            let weight = options.weights.fuzzy * term_len as f64
-                                / (term_len as f64 + distance as f64);
-                            self.accumulate_dense(
-                                &mut scratch,
-                                term,
-                                weight,
-                                query.term_boost,
-                                data,
-                                &field_boosts,
-                                options.bm25,
-                            );
-                        });
-                }
-            }
-
-            // Materialize the per-spec result from the touched docs. Within a
-            // spec every contribution shares the same source term, so
-            // `query_terms` is always just `[query.term]` — set here instead of
-            // accumulating it per posting. `mem::take` hands the collected term
-            // strings to the result without cloning.
-            let mut results = RawCompactResult::default();
-            results.reserve(scratch.touched.len());
-            let touched = std::mem::take(&mut scratch.touched);
-            for &doc_id in &touched {
-                let i = doc_id as usize;
-                let terms = std::mem::take(&mut scratch.terms[i]);
-                results.insert(
-                    doc_id,
-                    RawCompactResultValue {
-                        score: scratch.score[i],
-                        query_terms: vec![query.term.clone()],
-                        terms,
-                    },
-                );
-            }
-            scratch.touched = touched;
-            results
-        })
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1350,17 +1508,19 @@ impl MiniSearch {
         }
     }
 
-    // Dense accumulation for the compact path: add each posting's BM25
+    // Dense accumulation for the fused compact path: add each posting's BM25
     // contribution into the doc-id-indexed `Scratch` arrays instead of hashing
     // into a map. Mirrors `term_results` exactly (same loop order, so the
-    // floating-point score sums are bit-identical), minus the `match` map and
-    // the per-spec-constant `query_terms` (handled by the caller). `source_term`
-    // is implicit — it is always the spec's own term.
+    // floating-point score sums are bit-identical), minus the `match` map;
+    // the matched-query-term bookkeeping is the `spec_index`/`counts_term`
+    // counters and the derived term is an id into the per-query intern table.
     #[allow(clippy::too_many_arguments)]
     fn accumulate_dense(
         &self,
         scratch: &mut Scratch,
-        derived_term: &str,
+        term_id: u32,
+        spec_index: u32,
+        counts_term: bool,
         term_weight: f64,
         term_boost: f64,
         field_term_data: &FieldTermData,
@@ -1417,10 +1577,11 @@ impl MiniSearch {
                     );
                 let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
 
-                scratch.touch(*doc_id);
-                let i = *doc_id as usize;
-                scratch.score[i] += weighted_score;
-                assign_unique(&mut scratch.terms[i], derived_term);
+                let i = scratch.touch(*doc_id, spec_index, counts_term);
+                scratch.spec_score[i] += weighted_score;
+                if !scratch.terms[i].contains(&term_id) {
+                    scratch.terms[i].push(term_id);
+                }
             }
         }
     }
@@ -1760,53 +1921,6 @@ fn combine_results(results: Vec<RawResult>, combine_with: CombineWith) -> RawRes
                     existing.score += value.score;
                     assign_unique_many(&mut existing.terms, &value.terms);
                     merge_matches(&mut existing.matches, value.matches);
-                    combined.insert(doc_id, existing);
-                }
-            }
-
-            combined
-        }
-        CombineWith::AndNot => {
-            for doc_id in right.keys() {
-                left.remove(doc_id);
-            }
-
-            left
-        }
-    })
-}
-
-fn combine_compact_results(
-    results: Vec<RawCompactResult>,
-    combine_with: CombineWith,
-) -> RawCompactResult {
-    let mut iter = results.into_iter();
-    let Some(first) = iter.next() else {
-        return RawCompactResult::default();
-    };
-
-    iter.fold(first, |mut left, right| match combine_with {
-        CombineWith::Or => {
-            for (doc_id, value) in right {
-                if let Some(existing) = left.get_mut(&doc_id) {
-                    existing.score += value.score;
-                    assign_unique_many(&mut existing.query_terms, &value.query_terms);
-                    assign_unique_many(&mut existing.terms, &value.terms);
-                } else {
-                    left.insert(doc_id, value);
-                }
-            }
-
-            left
-        }
-        CombineWith::And => {
-            let mut combined = RawCompactResult::default();
-
-            for (doc_id, value) in right {
-                if let Some(mut existing) = left.remove(&doc_id) {
-                    existing.score += value.score;
-                    assign_unique_many(&mut existing.query_terms, &value.query_terms);
-                    assign_unique_many(&mut existing.terms, &value.terms);
                     combined.insert(doc_id, existing);
                 }
             }

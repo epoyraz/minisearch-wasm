@@ -2,9 +2,9 @@ mod mini_search;
 mod searchable_map;
 
 pub use mini_search::{
-    AutoSuggestOptions, Bm25Params, CombineWith, CompactSearchResult, FuzzySetting, MiniSearch,
-    MiniSearchOptions, PackedSearchResults, SearchOptions, SearchResult, Suggestion, TokenizerMode,
-    Weights,
+    AutoSuggestOptions, Bm25Params, CombineWith, CompactSearchResult, FuzzySetting,
+    JoinedSearchResults, MiniSearch, MiniSearchOptions, PackedSearchResults, SearchOptions,
+    SearchResult, Suggestion, TokenizerMode, Weights,
 };
 pub use searchable_map::{FuzzyMatch, SearchableMap};
 
@@ -116,7 +116,7 @@ impl MiniSearchWasm {
     /// `search()` (same ids, same BM25 scores).
     #[wasm_bindgen(js_name = searchJoined)]
     pub fn search_joined_js(&self, query: &str, or_mode: bool) -> JsValue {
-        packed_to_joined_js(&self.inner.search_packed_default(query, or_mode))
+        joined_to_js(&self.inner.search_joined_default(query, or_mode))
     }
 
     /// MiniSearch-compatible `autoSuggest(query, options?)`: suggestions for
@@ -243,52 +243,31 @@ impl MiniSearchWasm {
     }
 }
 
-/// Most boundary-frugal packed shape: `scores` as a `Float64Array`, plus
-/// `ids` and `terms` as single newline-joined strings. Within a `terms` row the
-/// individual terms are space-joined. The consumer splits natively in JS, so the
-/// entire result set crosses the boundary as just two strings + one typed array.
-fn packed_to_joined_js(packed: &PackedSearchResults) -> JsValue {
-    let len = packed.ids.len();
-
-    let scores = Float64Array::new_with_length(len as u32);
-    scores.copy_from(&packed.scores);
-
-    let mut ids = String::new();
-    for (index, id) in packed.ids.iter().enumerate() {
-        if index > 0 {
-            ids.push('\n');
-        }
-        match id {
-            Value::String(string) => ids.push_str(string),
-            other => ids.push_str(&other.to_string()),
-        }
-    }
-
-    let mut terms = String::new();
-    for (index, result_terms) in packed.terms.iter().enumerate() {
-        if index > 0 {
-            terms.push('\n');
-        }
-        for (term_index, term) in result_terms.iter().enumerate() {
-            if term_index > 0 {
-                terms.push(' ');
-            }
-            terms.push_str(term);
-        }
-    }
+/// Most boundary-frugal shape: `scores` as a `Float64Array`, plus `ids` and
+/// `terms` as single newline-joined strings (already built by the engine).
+/// Within a `terms` row the individual terms are space-joined. The consumer
+/// splits natively in JS, so the entire result set crosses the boundary as
+/// just two strings + one typed array.
+fn joined_to_js(joined: &JoinedSearchResults) -> JsValue {
+    let scores = Float64Array::new_with_length(joined.scores.len() as u32);
+    scores.copy_from(&joined.scores);
 
     let object = Object::new();
     let _ = Reflect::set(
         &object,
         &JsValue::from_str("count"),
-        &JsValue::from_f64(len as f64),
+        &JsValue::from_f64(joined.scores.len() as f64),
     );
-    let _ = Reflect::set(&object, &JsValue::from_str("ids"), &JsValue::from_str(&ids));
+    let _ = Reflect::set(
+        &object,
+        &JsValue::from_str("ids"),
+        &JsValue::from_str(&joined.ids),
+    );
     let _ = Reflect::set(&object, &JsValue::from_str("scores"), &scores);
     let _ = Reflect::set(
         &object,
         &JsValue::from_str("terms"),
-        &JsValue::from_str(&terms),
+        &JsValue::from_str(&joined.terms),
     );
     object.into()
 }

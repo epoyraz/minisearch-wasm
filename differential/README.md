@@ -40,3 +40,15 @@ first):
 ```powershell
 node wasm_smoke.mjs
 ```
+
+## Benchmarks
+
+`gen_corpus.mjs` takes an optional document count for a larger benchmark
+corpus. Native engine benchmark and end-to-end Wasm-vs-JS benchmark (the
+latter needs `npm run build` first):
+
+```powershell
+node gen_corpus.mjs bench_corpus.json 20000
+cargo run --release --example bench_search differential/bench_corpus.json   # from repo root
+node bench_wasm.mjs bench_corpus.json
+```

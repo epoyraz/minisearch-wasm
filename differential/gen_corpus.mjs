@@ -29,7 +29,8 @@ vocab.push('a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'and', 'or', 'not')
 const words = (count) => Array.from({ length: count }, () => pick(vocab)).join(' ')
 
 const docs = []
-for (let i = 0; i < 3000; i++) {
+const docCount = Number(process.argv[3] || 3000)
+for (let i = 0; i < docCount; i++) {
   docs.push({
     id: i,
     title: words(3 + Math.floor(rand() * 6)),
@@ -49,6 +50,8 @@ const queryTerms = [
   'splitting', 'compacted', 'snapshoting', 'merg spli', 'batch shard str'
 ]
 for (const q of queryTerms) queries.push(q)
+// wide query (>64 terms, with duplicates) exercising the non-bitmask fallback
+queries.push(Array.from({ length: 70 }, (_, i) => vocab[(i * 37) % 40]).join(' '))
 
 writeFileSync(process.argv[2] || 'corpus.json', JSON.stringify({ docs, queries }))
 console.log(`corpus: ${docs.length} docs, ${queries.length} queries, vocab ${vocab.length}`)
