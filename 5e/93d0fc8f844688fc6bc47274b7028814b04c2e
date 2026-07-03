@@ -1,0 +1,83 @@
+differential/compare_bulk.mjs
+  s_8b4cf46389d021::t_195c49519f8f1c 71
+examples/bench_search.rs
+  s_8b4cf46389d021::t_858f196a2f09e0 60
+package.json
+  s_8b4cf46389d021::t_551f92cc14c482 7-11
+  s_8b4cf46389d021::t_a94f61f9e44e7b 3
+README.md
+  s_8b4cf46389d021::t_33e30ceee8bd5e 82-90,133-134
+  s_8b4cf46389d021::t_938e58adde8458 157-163
+tests/tokenization_conformance.rs
+  s_8b4cf46389d021::t_bac3b1dc20607e 1-81
+differential/wasm_smoke.mjs
+  s_8b4cf46389d021::t_8e0b21f0036a19 94-95,136-199
+  s_8b4cf46389d021::t_7140fc18e73fc1 109-118,121-131
+  s_8b4cf46389d021::t_c855afd9cdc6d5 202
+  s_8b4cf46389d021::t_20c301a25ba60a 96-108,119-120,132-135,200-201
+  s_8b4cf46389d021::t_6d1aa479d4817a 1-2
+src/lib.rs
+  s_8b4cf46389d021::t_a474431ab0da58 417-461,463-498,501-510
+  s_8b4cf46389d021::t_20c301a25ba60a 146,148,150-162,164-167,179-181,183-186
+  s_8b4cf46389d021::t_3b3ff4422ed808 52,56,61,67,72,77-80,82-84,87,91-123,125,130,136,141,147,149,163,169,174-178,182,187-194,200-231
+  s_8b4cf46389d021::t_55585ca0370b1c 5-6,12-13,15,17-19,25-38,41-42
+  s_8b4cf46389d021::t_662406d7bee036 7-8,81,85-86,88-90,195-199,379,462,499-500
+  s_8b4cf46389d021::t_4be2c774949df0 264,266,282,303,336,368-372,384,389-390,395-398,406,413
+differential/js_bulk.mjs
+  s_8b4cf46389d021::t_195c49519f8f1c 87-101
+  s_8b4cf46389d021::t_20c301a25ba60a 75-86
+PORTING.md
+  s_8b4cf46389d021::t_938e58adde8458 156-166
+  s_8b4cf46389d021::t_33e30ceee8bd5e 136-155
+  s_8b4cf46389d021::t_20c301a25ba60a 126-135
+tests/minisearch_conformance.rs
+  s_8b4cf46389d021::t_082b0a1400a42f 444-449,465-487
+  s_8b4cf46389d021::t_e4c0f5f67b8514 2-4,379-443,450-464
+  s_8b4cf46389d021::t_858f196a2f09e0 46,118
+  s_8b4cf46389d021::t_20c301a25ba60a 38-39,47-51,291-378
+  s_8b4cf46389d021::t_7655270ed5daf4 497,553,705
+differential/README.md
+  s_8b4cf46389d021::t_551f92cc14c482 60-67
+  s_8b4cf46389d021::t_33e30ceee8bd5e 17-22
+examples/dump_autosuggest.rs
+  s_8b4cf46389d021::t_858f196a2f09e0 41
+Cargo.toml
+  s_8b4cf46389d021::t_a94f61f9e44e7b 3
+  s_8b4cf46389d021::t_883231449b3974 20-21
+differential/bench_maintenance.mjs
+  s_8b4cf46389d021::t_a0c138de51d0e0 99-100
+  s_8b4cf46389d021::t_551f92cc14c482 1-98,101-114
+examples/dump_bulk.rs
+  s_8b4cf46389d021::t_858f196a2f09e0 48
+  s_8b4cf46389d021::t_195c49519f8f1c 9-10,232-247,251-252
+  s_8b4cf46389d021::t_20c301a25ba60a 220-231,248-250,253
+src/mini_search.rs
+  s_8b4cf46389d021::t_0444b43a8bffd3 588-591
+  s_8b4cf46389d021::t_20c301a25ba60a 725-737,778,788,790
+  s_8b4cf46389d021::t_226b541ffcbb6c 371-405
+  s_8b4cf46389d021::t_6e9053563cf376 329-370,470-474,556-562,582-583,616
+  s_8b4cf46389d021::t_0b8edccc33ae8f 739-748,779-787,789,792-793,810-917
+  s_8b4cf46389d021::t_4b565bf0ce83cd 791,794,1545
+tests/serialization_conformance.rs
+  s_8b4cf46389d021::t_bac3b1dc20607e 1-80
+tests/ranking_conformance.rs
+  s_8b4cf46389d021::t_97fe84fa1bce76 1-179
+Cargo.lock
+  s_8b4cf46389d021::t_eee988f1f6433c 66,75,216-225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "5e93d0fc8f844688fc6bc47274b7028814b04c2e",
+  "prompts": {},
+  "sessions": {
+    "s_8b4cf46389d021": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f28a2-5aa3-7860-b4c0-c6273fcd91d5",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
