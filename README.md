@@ -122,24 +122,23 @@ traversal exactly) — but deliberately diverges from its API and internals:
 
 ## Benchmark results
 
-Measured by `keyword-search/scripts/bench-search-engines.mjs` on the real
-jobboard corpus (~21k documents, 30 representative queries), comparing against
+Measured by `keyword-search/scripts/bench-minisearch-vs-wasm.mjs` on the real
+jobboard corpus (~22k documents, 30 representative queries), comparing against
 JS MiniSearch. Search ratios are reported by median (robust to system noise);
 expect some run-to-run variance.
 
 | Category | Rust vs JS MiniSearch |
 |---|---|
-| **Search — app workload** (`{id, score, terms}`, end to end) | **~1.5–1.6× faster** (pure engine ~1.9–2×) |
+| **Search — app workload** (`{id, score, terms}`, end to end) | **~2.7× faster** (median; mean ~1.8×) |
 | **Index download** (prebuilt, brotli) | **~0.73× — smaller on the wire than JS** |
-| Load prebuilt index — `loadBytes` vs `loadJSON` | ~2.4× faster |
+| Load prebuilt index — `loadBytes` vs `loadJSON` | ~8× faster |
 | Serialize index — `toBytes` vs `JSON.stringify` | ~8× faster |
-| Build index — `addAllJSON` vs `addAll` | ~1.3× faster |
-| Full compat `search()` vs JS `search()` | ~0.5× (slower by design — see Design) |
+| Build index — `addAllJSON` vs `addAll` | ~2.7× faster |
+| Full compat `search()` vs JS `search()` | ~0.7× (slower by design — see Design) |
 
 The compact binary snapshot is delta+varint encoded, so it is both smaller than
 the JSON index and low-entropy enough to compress well; `loadBytes` rebuilds the
-term tree from the sorted terms (hence ~2.4× rather than ~8×, but still far
-ahead of JS `loadJSON`).
+term tree from the sorted terms and still loads ~8× faster than JS `loadJSON`.
 
 **Truthfulness:** the benchmark verifies the two engines return identical
 results — `set-identical 30/30`, `max score delta ≈ 1e-14` (float epsilon),
