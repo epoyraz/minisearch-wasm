@@ -1,0 +1,66 @@
+tests/minisearch_conformance.rs
+  s_55291276258039::t_517c114bc60eb3 487-702
+  s_55291276258039::t_89fc9f13f31d99 2-3
+PORTING.md
+  s_55291276258039::t_922a492ce83fd3 102-125,129,131-133
+  s_55291276258039::t_a306bb816663a3 85-87
+examples/dump_bulk.rs
+  s_55291276258039::t_42ae6a1a5d5948 143-172
+  s_55291276258039::t_b2cc6231dc5a16 98-102
+  s_55291276258039::t_eb11bbfb770700 187-202
+  s_55291276258039::t_62270167b833ed 217
+  s_55291276258039::t_e7994f465cdcbf 9-10,14-38
+  s_55291276258039::t_eafeff098bfd30 39
+differential/gen_corpus.mjs
+  s_55291276258039::t_44b8dad6282638 56-101
+differential/README.md
+  s_55291276258039::t_375d348f76cd56 12-15
+src/mini_search.rs
+  s_55291276258039::t_ab1171fe59f1e8 1314-1360
+  s_55291276258039::t_4cd710e4c3847c 329-375
+  s_55291276258039::t_2fad9c61b6420c 683-711,734-744
+  s_55291276258039::t_3e86b0a49b047a 2022-2073
+README.md
+  s_55291276258039::t_c682bcf40e9f7c 63-75
+  s_55291276258039::t_9f0787832b11e6 125-128
+differential/wasm_smoke.mjs
+  s_55291276258039::t_7f4a13a0fd47d8 62-98
+src/lib.rs
+  s_55291276258039::t_f8185bf7ddbe56 88-100,102,110-111,117-118,120
+  s_55291276258039::t_2295def6c4436c 17-20
+  s_55291276258039::t_778a31a4e33aa8 6-7
+  s_55291276258039::t_0da29536fdbf51 363-404
+differential/js_bulk.mjs
+  s_55291276258039::t_5938d6cac92c73 48-56
+  s_55291276258039::t_ae3a732ecd32df 6-13
+Cargo.toml
+  s_4535e2d701c42f::t_7c80b30b1aa7af 3
+package.json
+  s_4535e2d701c42f::t_a1bb4d09268570 3
+Cargo.lock
+  s_55291276258039::t_7f07c0895b5e35 66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.9",
+  "base_commit_sha": "2f414345eb8ff19a5070238f5fd42b8a84db10e1",
+  "prompts": {},
+  "sessions": {
+    "s_4535e2d701c42f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6b116e18-9ab1-4b45-9285-e7eed782ecde",
+        "model": "unknown"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    },
+    "s_55291276258039": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdab0e1b-609f-4a05-a2a7-a5bc369bf28c",
+        "model": "claude-fable-5"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
