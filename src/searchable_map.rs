@@ -8,8 +8,8 @@ pub struct FuzzyMatch<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RadixNode<T> {
-    leaf: Option<T>,
+pub(crate) struct RadixNode<T> {
+    pub(crate) leaf: Option<T>,
     /// Position of the leaf entry within this node's key order. JS MiniSearch
     /// stores the leaf under an ordinary map key (`LEAF`), so it has an
     /// insertion position among the children; iteration order — and therefore
@@ -19,8 +19,8 @@ struct RadixNode<T> {
     /// is `None`; absent in data serialized by older versions (defaults to 0,
     /// matching their leaf-first behavior).
     #[serde(default)]
-    leaf_pos: u32,
-    children: Vec<(String, RadixNode<T>)>,
+    pub(crate) leaf_pos: u32,
+    pub(crate) children: Vec<(String, RadixNode<T>)>,
 }
 
 impl<T> Default for RadixNode<T> {
@@ -47,7 +47,7 @@ impl<T> RadixNode<T> {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchableMap<T> {
-    root: RadixNode<T>,
+    pub(crate) root: RadixNode<T>,
 }
 
 impl<T> Default for SearchableMap<T> {
@@ -135,20 +135,23 @@ impl<T> SearchableMap<T> {
         visit_prefix(&self.root, prefix, &mut key, &mut visitor);
     }
 
+    /// Visit every key within `max_distance` edits of `query`. Distances are
+    /// measured in UTF-16 code units, like JS `fuzzySearch`, which indexes
+    /// strings by code unit; identical to characters for all BMP text.
     pub fn for_each_fuzzy<F>(&self, query: &str, max_distance: usize, mut visitor: F)
     where
         F: FnMut(&str, &T, usize),
     {
-        let query_chars: Vec<char> = query.chars().collect();
-        let m = query_chars.len();
+        let query_units: Vec<u16> = query.encode_utf16().collect();
+        let m = query_units.len();
 
-        // Bit-parallel (Myers) path for queries up to 64 chars — the common case
+        // Bit-parallel (Myers) path for queries up to 64 units — the common case
         // for search terms. The DP column is carried as two bit vectors (vp/vn)
         // in registers instead of a matrix in memory; the column for the next
         // character is computed with a handful of word ops. Produces exactly the
         // same matches and edit distances as the banded-matrix fallback below.
         if (1..=64).contains(&m) {
-            let peq = PeqMasks::build(&query_chars);
+            let peq = PeqMasks::build(&query_units);
             let high_bit = 1u64 << (m - 1);
             let vp = if m == 64 { u64::MAX } else { (1u64 << m) - 1 };
             let mut key = String::new();
@@ -173,8 +176,8 @@ impl<T> SearchableMap<T> {
         let rows = columns + max_distance;
         let sentinel = (max_distance + 1).min(u16::MAX as usize) as u16;
         let mut matrix = vec![sentinel; rows * columns];
-        for j in 0..columns {
-            matrix[j] = j as u16;
+        for (j, cell) in matrix.iter_mut().enumerate().take(columns) {
+            *cell = j as u16;
         }
         for i in 1..rows {
             matrix[i * columns] = i as u16;
@@ -182,7 +185,7 @@ impl<T> SearchableMap<T> {
         let mut key = String::new();
         fuzzy_visit(
             &self.root,
-            &query_chars,
+            &query_units,
             max_distance,
             &mut matrix,
             1,
@@ -241,14 +244,14 @@ impl<T: Clone> SearchableMap<T> {
     }
 
     pub fn fuzzy_get(&self, query: &str, max_distance: usize) -> Vec<FuzzyMatch<T>> {
-        let query_chars: Vec<char> = query.chars().collect();
-        let columns = query_chars.len() + 1;
+        let query_units: Vec<u16> = query.encode_utf16().collect();
+        let columns = query_units.len() + 1;
         let rows = columns + max_distance;
         let sentinel = (max_distance + 1).min(u16::MAX as usize) as u16;
         let mut matrix = vec![sentinel; rows * columns];
 
-        for j in 0..columns {
-            matrix[j] = j as u16;
+        for (j, cell) in matrix.iter_mut().enumerate().take(columns) {
+            *cell = j as u16;
         }
 
         for i in 1..rows {
@@ -258,7 +261,7 @@ impl<T: Clone> SearchableMap<T> {
         let mut results = Vec::new();
         fuzzy_recurse(
             &self.root,
-            &query_chars,
+            &query_units,
             max_distance,
             &mut matrix,
             1,
@@ -519,7 +522,7 @@ fn collect_prefix<T: Clone>(
 #[allow(clippy::too_many_arguments)]
 fn fuzzy_recurse<T: Clone>(
     node: &RadixNode<T>,
-    query: &[char],
+    query: &[u16],
     max_distance: usize,
     matrix: &mut [u16],
     row: usize,
@@ -552,7 +555,7 @@ fn fuzzy_recurse<T: Clone>(
         let mut i = row;
         let mut skipped = false;
 
-        for character in child_key.chars() {
+        for character in child_key.encode_utf16() {
             if i >= columns + max_distance {
                 skipped = true;
                 break;
@@ -603,7 +606,7 @@ fn fuzzy_recurse<T: Clone>(
 #[allow(clippy::too_many_arguments)]
 fn fuzzy_visit<T, F>(
     node: &RadixNode<T>,
-    query: &[char],
+    query: &[u16],
     max_distance: usize,
     matrix: &mut [u16],
     row: usize,
@@ -634,7 +637,7 @@ fn fuzzy_visit<T, F>(
         let mut i = row;
         let mut skipped = false;
 
-        for character in child_key.chars() {
+        for character in child_key.encode_utf16() {
             if i >= columns + max_distance {
                 skipped = true;
                 break;
@@ -683,24 +686,24 @@ fn fuzzy_visit<T, F>(
     }
 }
 
-/// Per-character equality bitmasks for the Myers DP (the `Peq` table): bit `i`
-/// of `get(c)` is set iff query character `i` equals `c`. Looked up for every
-/// character of every trie edge visited during fuzzy traversal — the hottest
-/// inner loop — so it must be O(1), not a linear scan over the query's distinct
-/// characters. ASCII (the overwhelming common case) hits a flat array; the rare
-/// non-ASCII query character falls back to a tiny linear list.
+/// Per-code-unit equality bitmasks for the Myers DP (the `Peq` table): bit `i`
+/// of `get(c)` is set iff query unit `i` equals `c`. Looked up for every unit
+/// of every trie edge visited during fuzzy traversal — the hottest inner loop —
+/// so it must be O(1), not a linear scan over the query's distinct units. ASCII
+/// (the overwhelming common case) hits a flat array; the rare non-ASCII query
+/// unit falls back to a tiny linear list.
 struct PeqMasks {
     ascii: [u64; 128],
-    other: Vec<(char, u64)>,
+    other: Vec<(u16, u64)>,
 }
 
 impl PeqMasks {
-    fn build(query_chars: &[char]) -> Self {
+    fn build(query_units: &[u16]) -> Self {
         let mut masks = PeqMasks {
             ascii: [0u64; 128],
             other: Vec::new(),
         };
-        for (index, &character) in query_chars.iter().enumerate() {
+        for (index, &character) in query_units.iter().enumerate() {
             let bit = 1u64 << index;
             if (character as u32) < 128 {
                 masks.ascii[character as usize] |= bit;
@@ -714,7 +717,7 @@ impl PeqMasks {
     }
 
     #[inline]
-    fn get(&self, character: char) -> u64 {
+    fn get(&self, character: u16) -> u64 {
         if (character as u32) < 128 {
             self.ascii[character as usize]
         } else {
@@ -772,7 +775,7 @@ fn fuzzy_visit_myers<T, F>(
         let mut cdepth = depth;
         let mut pruned = false;
 
-        for character in child_key.chars() {
+        for character in child_key.encode_utf16() {
             // Myers transition (Hyyrö): advance the DP column by one text char.
             let eq = peq.get(character);
             let xv = eq | cvn;

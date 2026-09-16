@@ -51,7 +51,7 @@ fn main() {
         store_fields: vec![],
         tokenizer: TokenizerMode::Default,
         search_options: SearchOptions {
-            prefix: true,
+            prefix: true.into(),
             fuzzy: Some(FuzzySetting::Distance(0.2)),
             combine_with: CombineWith::And,
             ..SearchOptions::default()
@@ -127,7 +127,7 @@ fn main() {
         let mut hits = 0u64;
         for query in &queries {
             let opts = SearchOptions {
-                prefix: true,
+                prefix: true.into(),
                 fuzzy: Some(FuzzySetting::Distance(0.2)),
                 combine_with: CombineWith::And,
                 ..SearchOptions::default()

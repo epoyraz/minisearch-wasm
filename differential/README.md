@@ -44,7 +44,24 @@ first):
 
 ```powershell
 node wasm_smoke.mjs
+node high_priority_regressions.mjs
+node compat_parity.mjs
+node api_parity.mjs
 ```
+
+Or run `npm run test:wasm` from the repository root. The high-priority suite
+checks field statistics against JS on a seeded sparse corpus and fields with
+65,535/65,536/70,000 distinct tokens, all three result formats, both snapshot
+formats, tree-order preservation, mixed ID types and generation changes, plus
+malformed/truncated/mutated binary inputs through the actual WASM boundary.
+`compat_parity.mjs` checks exact result order (ties included), `terms`/`match`
+order, suggestions, JS number formatting of field values and ids, UTF-16 term
+lengths, `has`/`replace`/`getStoredFields`, and MiniSearch JSON import/export
+in both directions against the JS engine on fresh, dirty and vacuumed indexes.
+`api_parity.mjs` covers the API surface: `Error` objects and messages,
+rejection of callback options and the declarative forms that replace them,
+`Date`/`toString` field values, the tokenizer's Unicode tables, `getDefault`,
+`logger`, `loadJSONAsync` and MiniSearch-format `toJSON`/`loadJSON`.
 
 ## Benchmarks
 

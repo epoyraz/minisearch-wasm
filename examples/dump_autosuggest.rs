@@ -69,7 +69,7 @@ fn main() {
         "vita",
         Some(&AutoSuggestOptions {
             fuzzy: Some(FuzzySetting::Enabled(true)),
-            prefix: Some(true),
+            prefix: Some(true.into()),
             ..AutoSuggestOptions::default()
         }),
     );

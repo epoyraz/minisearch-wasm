@@ -31,7 +31,7 @@ fn stored_values(
 fn fuzzy_prefix() -> SearchOptions {
     SearchOptions {
         fuzzy: Some(FuzzySetting::Distance(1.0)),
-        prefix: true,
+        prefix: true.into(),
         ..SearchOptions::default()
     }
 }

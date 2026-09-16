@@ -38,6 +38,14 @@ const jsBuild = bench('js  addAll', () => {
 const wasmBuild = bench('wasm addAllJSON', () => {
   const ms = new MiniSearchWasm({ fields: ['title', 'text'], searchOptions })
   ms.addAllJSON(docsJson)
+  ms.free()
+  return 1
+})
+
+const wasmBuildObjects = bench('wasm addAll (JS objects)', () => {
+  const ms = new MiniSearchWasm({ fields: ['title', 'text'], searchOptions })
+  ms.addAll(docs)
+  ms.free()
   return 1
 })
 
@@ -59,13 +67,22 @@ const wasmSearch = bench('wasm searchJoined AND prefix+fuzzy', () => {
   for (const q of queries) {
     const r = wasm.searchJoined(q, false)
     if (!r.count) continue
-    const ids = r.ids.split('\n')
+    const ids = JSON.parse(r.ids)
     const terms = r.terms.split('\n')
     for (let i = 0; i < r.count; i++) {
       n += terms[i] ? terms[i].split(' ').length : 0
       n += r.scores[i] > 0 ? 1 : 0
       if (ids[i] === '') n += 1
     }
+  }
+  return n
+})
+
+// --- search: MiniSearch-compatible result objects ---
+const wasmSearchCompat = bench('wasm search (compat objects)', () => {
+  let n = 0
+  for (const q of queries) {
+    for (const r of wasm.search(q)) { n += r.terms.length + (r.score > 0 ? 1 : 0) }
   }
   return n
 })
@@ -97,11 +114,13 @@ console.log(`js JSON: ${jsSerialized.length} chars, wasm bytes: ${wasmBytes.leng
 const jsSave = bench('js  JSON.stringify', () => JSON.stringify(js).length)
 const wasmSave = bench('wasm toBytes', () => wasm.toBytes().length)
 const jsLoad = bench('js  loadJSON', () => MiniSearch.loadJSON(jsSerialized, { fields: ['title', 'text'], searchOptions }).termCount)
-const wasmLoad = bench('wasm loadBytes', () => { const m = MiniSearchWasm.loadBytes(wasmBytes); return 1 })
+const wasmLoad = bench('wasm loadBytes', () => { const m = MiniSearchWasm.loadBytes(wasmBytes); m.free(); return 1 })
 
 console.log('--- ratios (js/wasm, >1 means wasm faster) ---')
 console.log(`build:        ${(jsBuild / wasmBuild).toFixed(2)}x`)
 console.log(`search app:   ${(jsSearch / wasmSearch).toFixed(2)}x`)
+console.log(`search compat: ${(jsSearch / wasmSearchCompat).toFixed(2)}x   (full result objects)`)
+console.log(`build objects: ${(jsBuild / wasmBuildObjects).toFixed(2)}x   (addAll from JS objects)`)
 console.log(`autoSuggest:  ${(jsSuggest / wasmSuggest).toFixed(2)}x   (joined: ${(jsSuggest / wasmSuggestJoined).toFixed(2)}x)`)
 console.log(`serialize:    ${(jsSave / wasmSave).toFixed(2)}x`)
 console.log(`load:         ${(jsLoad / wasmLoad).toFixed(2)}x`)

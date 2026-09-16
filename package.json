@@ -1,12 +1,18 @@
 {
   "name": "minisearch-wasm-build",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": true,
   "description": "Build orchestration for the minisearch-wasm npm package (not published; the publishable artifact is pkg/).",
   "type": "module",
   "scripts": {
     "build": "wasm-pack build --target web --release && node scripts/finalize-pkg.mjs",
+    "test:wasm": "node differential/wasm_smoke.mjs && node differential/high_priority_regressions.mjs && node differential/compat_parity.mjs && node differential/api_parity.mjs",
     "bench:maintenance": "npm run build && node differential/bench_maintenance.mjs",
-    "publish:pkg": "npm run build && npm publish ./pkg"
+    "publish:pkg": "npm run build && npm publish ./pkg",
+    "test:types": "tsc -p types/tsconfig.json",
+    "check:separators": "node scripts/gen-separators.mjs --check"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
   }
 }

@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Second Review: WASM vs MiniSearch</title>
+<meta name="description" content="Ten improvements that would bring minisearch-wasm 0.9.0 closer to MiniSearch 7.2.0, with evidence from probes through the built package.">
+<style>
+:root{--ink:#172b3a;--muted:#627383;--accent:#06786d;--line:#dce5e9;--paper:#fff;--bg:#f5f7f9;--high-bg:#fff0e6;--high-ink:#a3470b;--medium-bg:#eaf2f8;--medium-ink:#3e6886;--done-bg:#e3f3ec;--done-ink:#0f6a4c;--code-bg:#eef2f5}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--ink:#e6edf3;--muted:#9fb0bf;--accent:#3fb8a9;--line:#2a3a47;--paper:#141c24;--bg:#0d141b;--high-bg:#3a2417;--high-ink:#f0b48a;--medium-bg:#1c2b3a;--medium-ink:#9cc3e6;--done-bg:#153126;--done-ink:#8fd6b5;--code-bg:#1b2630}}
+:root[data-theme="dark"]{--ink:#e6edf3;--muted:#9fb0bf;--accent:#3fb8a9;--line:#2a3a47;--paper:#141c24;--bg:#0d141b;--high-bg:#3a2417;--high-ink:#f0b48a;--medium-bg:#1c2b3a;--medium-ink:#9cc3e6;--done-bg:#153126;--done-ink:#8fd6b5;--code-bg:#1b2630}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent)}
+code{font:0.92em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code-bg);padding:1px 5px;border-radius:4px}
+pre{background:var(--code-bg);padding:12px 14px;border-radius:6px;overflow-x:auto}
+pre code{background:none;padding:0}
+.topbar{position:sticky;top:0;z-index:2;background:var(--paper);border-bottom:1px solid var(--line)}
+.topbar-inner{max-width:1180px;margin:0 auto;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:13px;color:var(--muted)}
+.brand{font-weight:700;color:var(--ink);letter-spacing:-.01em}
+.hero{max-width:1180px;margin:0 auto;padding:44px 16px 26px}
+.eyebrow{font-size:12px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent);font-weight:700}
+h1{font-size:clamp(30px,5vw,48px);line-height:1.08;letter-spacing:-.03em;margin:10px 0 14px}
+.subtitle{max-width:760px;font-size:17px;color:var(--muted);margin:0}
+.meta{display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:18px;font-size:13px;color:var(--muted)}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;max-width:960px;margin-top:28px;border-top:1px solid var(--line);padding-top:22px}
+.metric strong{display:block;font-size:28px;line-height:1.2;letter-spacing:-.04em}
+.metric span{font-size:12px;color:var(--muted)}
+.layout{max-width:1180px;margin:0 auto;padding:0 16px 60px;display:grid;grid-template-columns:260px 1fr;gap:32px}
+.sidebar{position:sticky;top:58px;align-self:start;max-height:calc(100vh - 70px);overflow:auto;padding-right:4px}
+.sidebar h2{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin:14px 0 8px}
+.sidebar a{display:flex;gap:10px;padding:6px 8px;border-radius:6px;color:var(--ink);text-decoration:none;font-size:13px;line-height:1.35}
+.sidebar a:hover{background:var(--paper)}
+.sidebar a span{color:var(--muted);font-variant-numeric:tabular-nums;min-width:20px}
+main{min-width:0}
+section.overview,article.finding{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:22px 24px;margin-bottom:18px}
+section.overview h2{margin-top:0;font-size:20px;letter-spacing:-.02em}
+.table-wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
+.finding-heading{display:flex;gap:16px;align-items:flex-start}
+.finding-number{font-size:30px;font-weight:800;letter-spacing:-.04em;color:var(--accent);line-height:1;min-width:44px;font-variant-numeric:tabular-nums}
+.finding-label{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.badge{font-size:10px;line-height:1.6;font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:3px 7px;border-radius:4px;white-space:nowrap}
+.badge.high{background:var(--high-bg);color:var(--high-ink)}
+.badge.medium{background:var(--medium-bg);color:var(--medium-ink)}
+.badge.carried{background:var(--medium-bg);color:var(--medium-ink)}.badge.done{background:var(--done-bg);color:var(--done-ink)}.status-note{border-left:3px solid var(--done-ink);padding:6px 12px;background:var(--done-bg)}
+.status{font-size:12px;color:var(--muted)}
+.finding h2{margin:0 0 4px;font-size:20px;letter-spacing:-.02em;line-height:1.3}
+.finding-body p{margin:12px 0}
+.finding-body p.improve{border-left:3px solid var(--accent);padding-left:12px}
+.finding-body p.verify{color:var(--muted)}
+.probe{font-size:13px}
+.probe td:first-child{white-space:nowrap}
+.mobile-nav{display:none}
+@media (max-width:900px){.layout{grid-template-columns:1fr}.sidebar{display:none}.metrics{grid-template-columns:repeat(2,1fr)}.mobile-nav{display:inline-block;margin-top:18px}}
+@media print{.topbar,.sidebar{display:none}.layout{grid-template-columns:1fr}article.finding{break-inside:avoid;border:none;padding:0 0 16px}}
+</style>
+</head>
+<body>
+<div class="topbar"><div class="topbar-inner"><span class="brand">minisearch-wasm · second review</span><span>16 September 2026 · working tree on d7b87fd · vs MiniSearch 7.2.0</span></div></div>
+
+<div class="hero">
+  <div class="eyebrow">Code review · September 2026 · second pass</div>
+  <h1>Ten more ways to get closer<br>to MiniSearch.</h1>
+  <p class="subtitle">After today's correctness, performance and parity work, rankings, result order and suggestions match the JavaScript library exactly. What still separates the port is how it fails, what it silently ignores, how it treats non-JSON values, and the package around the engine.</p>
+  <div class="meta"><span>Working tree, 0.9.0 (uncommitted on d7b87fd)</span><span>MiniSearch 7.2.0 as oracle</span><span>Node 24.21.0 · Rust 1.96.0 · wasm-bindgen 0.2.128</span></div>
+  <div class="metrics">
+    <div class="metric"><strong>8 / 10</strong><span>Improvements implemented the same day</span></div>
+    <div class="metric"><strong>21</strong><span>Behavior probes vs JS, 16 differ</span></div>
+    <div class="metric"><strong>62 / 62</strong><span>Rust tests passing</span></div>
+    <div class="metric"><strong>132,824</strong><span>WASM differential checks passing</span></div>
+  </div>
+  <a class="mobile-nav" href="#finding-1">Jump to the findings ↓</a>
+</div>
+
+<div class="layout">
+<nav class="sidebar" aria-label="Review contents">
+  <h2>In this review</h2>
+  <a href="#overview"><span>—</span>Scope &amp; validation</a>
+  <a href="#probes"><span>—</span>Probe results</a>
+  <a href="#finding-1"><span>01</span>Throw real Error objects with MiniSearch's messages</a>
+  <a href="#finding-2"><span>02</span>Reject callback options instead of ignoring them</a>
+  <a href="#finding-3"><span>03</span>Stringify field values the way MiniSearch does</a>
+  <a href="#finding-4"><span>04</span>Bring the tokenizer to Unicode 16</a>
+  <a href="#finding-5"><span>05</span>Finish the API surface and the toJSON naming trap</a>
+  <a href="#finding-6"><span>06</span>Ship accurate TypeScript declarations</a>
+  <a href="#finding-7"><span>07</span>Make Node loading work out of the box</a>
+  <a href="#finding-8"><span>08</span>Put the package on a size budget</a>
+  <a href="#finding-9"><span>09</span>One command and a CI gate</a>
+  <a href="#finding-10"><span>10</span>Speed up the compatibility search() path, or state its cost</a>
+</nav>
+
+<main id="review">
+<section id="overview" class="overview">
+  <h2>Scope &amp; validation</h2>
+  <p>Since the morning review (<code>IMPROVEMENTS.md</code>), the four high-priority items were implemented as 0.9.0, a performance pass landed (expansion cache with posting handles, inline snapshot validation, faster varint decoding), and a parity pass aligned tie order, <code>terms</code>/<code>match</code> order, number formatting, UTF-16 lengths, the <code>has</code>/<code>replace</code>/<code>getStoredFields</code> API and MiniSearch JSON import/export with the JavaScript library. This review looks at what still separates the port from the original. Items 5 (memory bounding under churn) and 6 (synchronous work inside async maintenance) of the morning review remain open and are not repeated. <strong>Items 1 to 7 and 10 below were implemented later the same day</strong>; see the status note under each. Items 8 and 9 remain open.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Check</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td><code>cargo test --locked</code></td><td>62 tests passed</td></tr>
+      <tr><td><code>cargo clippy --locked --all-targets -- -D warnings</code></td><td>Clean</td></tr>
+      <tr><td><code>npm run test:wasm</code></td><td>Smoke passed; 30,764 high-priority regression checks; 102,060 compat parity checks</td></tr>
+      <tr><td>Behavior probes against JS MiniSearch 7.2.0 through the built package</td><td>21 probes: 5 identical, 16 differ in behavior, error shape or API presence</td></tr>
+      <tr><td>Package size experiments</td><td>3 scratch builds: without <code>float_roundtrip</code>, <code>panic = "abort"</code>, <code>opt-level = "s"</code></td></tr>
+      <tr><td>Node install fixture</td><td>Plain <code>await init()</code> fails; passing the <code>.wasm</code> bytes works</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="probes" class="overview">
+  <h2>Probe results</h2>
+  <p>Each probe ran the same call against JS MiniSearch and the built WASM package.</p>
+  <div class="table-wrap"><table class="probe">
+    <thead><tr><th>Probe</th><th>JS MiniSearch 7.2.0</th><th>minisearch-wasm</th></tr></thead>
+    <tbody>
+      <tr><td>Duplicate <code>add</code></td><td>throws <code>Error</code>, "MiniSearch: duplicate ID 1"</td><td>throws a <em>string</em> with the same text</td></tr>
+      <tr><td>Constructor without <code>fields</code></td><td>"MiniSearch: option "fields" must be provided"</td><td>string "Error: missing field `fields`"</td></tr>
+      <tr><td><code>combineWith: "XOR"</code></td><td>"Invalid combination operator: XOR"</td><td>string "Error: invalid combineWith value"</td></tr>
+      <tr><td><code>combineWith: "and"</code> (lowercase)</td><td>accepted</td><td>accepted</td></tr>
+      <tr><td><code>search(42)</code></td><td>TypeError from internals</td><td>descriptive string error</td></tr>
+      <tr><td>Remove a document whose content changed</td><td>continues, <code>logger("warn", …, "version_conflict")</code></td><td>continues silently</td></tr>
+      <tr><td><code>getDefault("idField")</code> · <code>loadJSONAsync</code></td><td>"id" · function</td><td>missing · missing</td></tr>
+      <tr><td><code>prefix</code> / <code>fuzzy</code> as functions</td><td>supported</td><td>serde type error</td></tr>
+      <tr><td><code>filter: () => false</code></td><td>0 hits</td><td>1 hit, no error</td></tr>
+      <tr><td><code>boostDocument: () => 2</code></td><td>score 0.8630</td><td>score 0.4315, no error</td></tr>
+      <tr><td><code>logger</code> option · unknown option typo</td><td>used · accepted silently</td><td>ignored · accepted silently</td></tr>
+      <tr><td>Field with <code>Date</code> / custom <code>toString</code></td><td>indexes the string form</td><td><code>add</code> throws on the function; <code>Date</code> becomes <code>{}</code></td></tr>
+      <tr><td>Unicode tokenization, 14 test strings</td><td>splits on U+1B7F and U+10D6E</td><td>keeps them; the other 12 identical</td></tr>
+      <tr><td>Stored field named <code>score</code> · unknown <code>fields</code> · <code>autoSuggest</code> with <code>prefix:false</code></td><td colspan="2">identical on both sides</td></tr>
+      <tr><td><code>JSON.stringify(index)</code></td><td>the loadable MiniSearch format</td><td>the native Rust-struct format</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<article id="finding-1" class="finding">
+  <div class="finding-heading"><div class="finding-number">01</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge high">High priority</span><span class="status">Confirmed compatibility defect</span></div><h2>Throw real <code>Error</code> objects with MiniSearch's messages</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented on 16 September 2026 (same day, after this review): every error is a JS <code>Error</code>; serde-produced messages are translated to MiniSearch's wording (<code>option &quot;fields&quot; must be provided</code>, <code>Invalid combination operator: X</code>). Verified by <code>differential/api_parity.mjs</code>.</p>
+    <p><strong>Evidence:</strong> Every failure crosses the boundary as a plain string: <code>src/lib.rs</code> maps errors with <code>JsValue::from_str</code> at 38 sites. <code>typeof e === "string"</code>, so <code>e.message</code> is <code>undefined</code>, <code>e.stack</code> does not exist and <code>e instanceof Error</code> is false; a consumer's <code>catch (e) { log(e.message) }</code> logs nothing. Where serde produces the text the message also diverges: constructing without <code>fields</code> throws <code>Error: missing field `fields`</code> (JS: <code>MiniSearch: option "fields" must be provided</code>) and <code>combineWith: "XOR"</code> throws <code>Error: invalid combineWith value</code> (JS: <code>Invalid combination operator: XOR</code>). The port's own messages already match JS word for word. The regression suite currently asserts <code>typeof error === "string"</code>.</p>
+    <p class="improve"><strong>Improve:</strong> Convert every error to a <code>js_sys::Error</code> (a <code>TypeError</code> where JS throws one) whose <code>message</code> is MiniSearch's text; translate constructor and option deserialization errors into MiniSearch's wording and drop the <code>Error:</code> prefix serde adds; keep wasm-specific messages under the <code>MiniSearch:</code> prefix.</p>
+    <p class="verify"><strong>Verify:</strong> Extend <code>compat_parity.mjs</code> with <code>instanceof Error</code> and message equality for duplicate add, missing-id remove/discard, missing <code>fields</code>, invalid <code>combineWith</code> and invalid queries; update the regression tests that assert strings.</p>
+  </div>
+</article>
+
+<article id="finding-2" class="finding">
+  <div class="finding-heading"><div class="finding-number">02</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge high">High priority</span><span class="status">Confirmed silent divergence</span></div><h2>Reject callback options instead of ignoring them</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: function-valued options throw an <code>Error</code> naming the option and its alternative (constructor, per call, query-tree nodes, <code>autoSuggest</code>); <code>prefix</code>/<code>fuzzy</code>/<code>boostTerm</code> accept per-term arrays and <code>filter</code> a stored-field object, verified against the JS callbacks.</p>
+    <p><strong>Evidence:</strong> Function-valued search options are dropped by the option parser without notice, so the same call returns different results than JS: <code>search("hello", { filter: () => false })</code> returns 1 hit (JS: 0); <code>search("hello", { boostDocument: () => 2 })</code> scores 0.4315 (JS: 0.8630). <code>boostTerm</code> goes the same way. <code>prefix</code> and <code>fuzzy</code> given as functions, which MiniSearch allows, fail with a serde type message. Constructor callbacks (<code>extractField</code>, <code>stringifyField</code>, <code>tokenize</code>, <code>processTerm</code>, <code>logger</code>) are likewise accepted and ignored.</p>
+    <p class="improve"><strong>Improve:</strong> Detect function-valued keys in the constructor and search options and throw a clear error naming the option and the reason (callbacks do not cross the Wasm boundary), with a pointer to the supported alternative. Offer declarative forms for the two options that are usually functions: per-term arrays for <code>prefix</code> and <code>fuzzy</code> (<code>prefix: [false, true]</code>) and a stored-field equality filter. <code>filter</code>, <code>boostDocument</code> and <code>boostTerm</code> stay unsupported but loud.</p>
+    <p class="verify"><strong>Verify:</strong> A probe per callback option asserts a thrown error naming the option; declarative forms are compared with JS results computed through the equivalent callbacks.</p>
+  </div>
+</article>
+
+<article id="finding-3" class="finding">
+  <div class="finding-heading"><div class="finding-number">03</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge high">High priority</span><span class="status">Confirmed indexing defect</span></div><h2>Stringify field values the way MiniSearch does</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: documents are converted through a schema so indexed object values (<code>Date</code>, <code>toString()</code>, arrays with objects) become <code>String(value)</code>; primitives, ids and stored-only fields stay JSON; function properties are skipped. A field that is both indexed and stored keeps the string form.</p>
+    <p><strong>Evidence:</strong> MiniSearch 7.2 indexes <code>stringifyField(value)</code>, by default <code>value.toString()</code>. A document whose field holds a <code>Date</code> or an object with <code>toString()</code> indexes the string form in JS (a <code>Date</code> becomes <code>thu jan 01 1970 …</code>; a custom <code>toString</code> yields <code>custom</code>). Through <code>add</code>/<code>addAll</code> the port converts the whole document with <code>serde_wasm_bindgen::from_value</code>, which rejects any function-valued property (<code>invalid type: JsValue(Function(toString)), expected any valid JSON value</code>) and turns a <code>Date</code> into <code>{}</code>, indexed as <code>object</code>. <code>addAllJSON</code> is unaffected because JSON text cannot carry these values.</p>
+    <p class="improve"><strong>Improve:</strong> Convert indexed field values at the boundary with JS semantics: strings, numbers, booleans and arrays pass through; anything else goes through <code>String(value)</code> on the JS side before reaching Rust; function-valued properties are skipped rather than fatal. Keep ids and stored fields as JSON values (they are compared and returned, not tokenized). Document that a custom <code>stringifyField</code> is not available.</p>
+    <p class="verify"><strong>Verify:</strong> Parity probes for <code>Date</code>, custom <code>toString</code>, nested arrays containing objects, documents with methods, and <code>null</code>/<code>undefined</code> mixes; only unserializable ids may still throw.</p>
+  </div>
+</article>
+
+<article id="finding-4" class="finding">
+  <div class="finding-heading"><div class="finding-number">04</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge medium">Medium priority</span><span class="status">Confirmed tokenization difference</span></div><h2>Bring the tokenizer to Unicode 16</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: <code>src/separators.rs</code> is generated from the running Node's <code>\p{Z}</code>/<code>\p{P}</code> by <code>scripts/gen-separators.mjs</code> (Node 24 reports Unicode 17.0, so the two probe characters are Unicode 16 and 17 additions rather than 16 as stated above); <code>npm run check:separators</code> guards it. The Unicode 15 crate is gone.</p>
+    <p><strong>Evidence:</strong> The default tokenizer classifies characters with <code>unicode-general-category</code> 0.6.0, which implements Unicode 15.0. Node 24 (ICU with Unicode 16) treats U+1B7F BALINESE PANTI BAWAK and U+10D6E GARAY punctuation as <code>\p{P}</code>: JS splits <code>a᭿b</code> and <code>e𐵮f</code> into <code>a</code>, <code>b</code>, <code>e</code>, <code>f</code>; the port keeps them as single tokens. Every other probe matched (final sigma, İ, ǅ, ẞ, soft hyphen, word joiner, zero-width space, tab).</p>
+    <p class="improve"><strong>Improve:</strong> Move separator classification to a Unicode 16 source (<code>icu_properties</code>, or tables generated from UCD 16 at build time), pin the Unicode version in the README, and add the Unicode 16 additions to <code>tests/tokenization_conformance.rs</code>. Track the browsers' Unicode version at release time.</p>
+    <p class="verify"><strong>Verify:</strong> A one-off script compares <code>is_space_or_punctuation</code> with Node's <code>/[\n\r\p{Z}\p{P}]/u</code> over every code point and reports differences; the differences become a fixed fixture.</p>
+  </div>
+</article>
+
+<article id="finding-5" class="finding">
+  <div class="finding-heading"><div class="finding-number">05</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge medium">Medium priority</span><span class="status">Confirmed API gaps</span></div><h2>Finish the API surface: <code>getDefault</code>, <code>loadJSONAsync</code>, <code>logger</code>, and the <code>toJSON</code> naming trap</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: <code>getDefault</code>, <code>loadJSONAsync</code>, <code>logger</code> (with the <code>version_conflict</code> warning) added; <code>toJSON</code>/<code>toJSONString</code>/<code>loadJSON</code> now use MiniSearch's format and the engine's own JSON moved to <code>toNativeJSON</code>/<code>toNativeJSONString</code>/<code>loadNativeJSON</code> (breaking rename, documented in the README).</p>
+    <p><strong>Evidence:</strong> <code>MiniSearchWasm.getDefault</code> is undefined (JS returns <code>"id"</code> for <code>idField</code>); <code>loadJSONAsync</code> does not exist. The <code>logger</code> option is accepted and ignored: removing a document whose content changed makes JS warn <code>MiniSearch: document with ID 1 has changed before removal … can corrupt the index!</code> with code <code>version_conflict</code>, while the port continues silently. <code>toJSON()</code> returns the native Rust-struct format, so <code>JSON.stringify(wasmIndex)</code> produces something <code>MiniSearch.loadJSON</code> cannot read while <code>toMiniSearchJSON()</code> produces exactly that; JS users expect <code>JSON.stringify(index)</code> to be the portable form.</p>
+    <p class="improve"><strong>Improve:</strong> Add <code>getDefault(name)</code> for the non-callback defaults, <code>loadJSONAsync</code> that yields between chunks like JS, and an optional <code>logger(level, message, code)</code> invoked only for the rare version-conflict warning (not per token, so it does not violate the boundary rule). Decide the <code>toJSON</code> naming before 1.0: either make <code>toJSON()</code> emit the MiniSearch format and rename the native one, or document the difference prominently in the API section.</p>
+    <p class="verify"><strong>Verify:</strong> An API checklist test enumerates MiniSearch's public members and asserts presence or a documented exclusion; a remove-after-change test captures the logger call.</p>
+  </div>
+</article>
+
+<article id="finding-6" class="finding">
+  <div class="finding-heading"><div class="finding-number">06</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge medium">Medium priority</span><span class="badge carried">Carried from the morning review</span><span class="status">Confirmed consumer-facing defect</span></div><h2>Ship accurate TypeScript declarations</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: typed declarations via wasm-bindgen annotations plus a custom TypeScript section, optional arguments declared through interface merging, and strict fixtures in <code>types/</code> compiled with TypeScript 7.0.2 (<code>npm run test:types</code>).</p>
+    <p><strong>Evidence:</strong> The generated <code>pkg/minisearch_wasm.d.ts</code> contains 39 <code>any</code> types. <code>search(query: any, options: any)</code>, <code>searchRaw(query: string, options: any)</code>, <code>autoSuggest(query: string, options: any)</code> and <code>removeAll(documents: any)</code> declare optional runtime arguments as required, so the README's one-argument calls fail with <code>TS2554</code>; today's additions (<code>has</code>, <code>getStoredFields</code>, <code>replace</code>, <code>loadMiniSearchJSON</code>) are typed <code>any</code> as well. TypeScript 7.0.2 is current and the project has no TypeScript dependency.</p>
+    <p class="improve"><strong>Improve:</strong> Generate a typed facade at build time: constructor and search options, query trees, <code>SearchResult</code>, <code>Suggestion</code>, joined and raw result shapes, typed arrays, <code>Promise&lt;void&gt;</code> maintenance methods, and correct optionality. Compile strict fixtures containing the README examples against the packed artifact with TypeScript 7.</p>
+    <p class="verify"><strong>Verify:</strong> <code>tsc --strict</code> on the fixtures, including expected failures for misspelled options and wrong result-field access.</p>
+  </div>
+</article>
+
+<article id="finding-7" class="finding">
+  <div class="finding-heading"><div class="finding-number">07</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge medium">Medium priority</span><span class="badge carried">Carried, now documented</span><span class="status">Confirmed installation defect</span></div><h2>Make Node loading work out of the box</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: <code>finalize-pkg.mjs</code> adds <code>minisearch_wasm_node.js</code> and a conditional <code>exports</code> map, so a bare <code>await init()</code> works in Node while browser bundles keep the web loader; verified with a scratch install.</p>
+    <p><strong>Evidence:</strong> Verified today against a scratch install of the packed package: plain <code>await init()</code> fails with <code>TypeError: fetch failed</code> because the web-target loader fetches a <code>file:</code> URL; <code>init({ module_or_path: readFileSync(new URL(import.meta.resolve("minisearch-wasm/minisearch_wasm_bg.wasm"))) })</code> works. The README now documents the workaround, but MiniSearch itself needs no setup step anywhere.</p>
+    <p class="improve"><strong>Improve:</strong> Make <code>init()</code> fall back to reading the file when it detects a <code>file:</code> URL under Node (dynamic <code>import("node:fs")</code>), or add a <code>minisearch-wasm/node</code> conditional export built with <code>--target nodejs</code>. Keep browser bundles free of Node imports.</p>
+    <p class="verify"><strong>Verify:</strong> Pack, install into a clean ESM fixture, and run the documented import plus a search in Node, a browser and a worker.</p>
+  </div>
+</article>
+
+<article id="finding-8" class="finding">
+  <div class="finding-heading"><div class="finding-number">08</div><div><div class="finding-label"><span class="badge medium">Medium priority</span><span class="status">Confirmed growth</span></div><h2>Put the package on a size budget</h2></div></div>
+  <div class="finding-body">
+    <p><strong>Evidence:</strong> <code>minisearch_wasm_bg.wasm</code> grew from 580,890 bytes at 0.8.0 to 718,724 bytes today (+24%); brotli 200 KB and gzip 262 KB, against 18 KB gzip for the JS library. Scratch builds: without <code>float_roundtrip</code> 684,136 bytes (−4.8%); <code>panic = "abort"</code> unchanged; <code>opt-level = "s"</code> 615,406 bytes (−14%, speed impact not measured). The rest of today's growth comes from the MiniSearch JSON import/export (<code>serde_json::Value</code> construction), <code>MatchInfo</code> serialization and float formatting through <code>format!("{:e}")</code>.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Build</th><th><code>.wasm</code> bytes</th><th>vs shipped</th></tr></thead>
+      <tbody>
+        <tr><td>0.8.0 (<code>d7b87fd</code>)</td><td>580,890</td><td>−19%</td></tr>
+        <tr><td>Shipped today (all features, <code>opt-level = 3</code>)</td><td>718,724</td><td>—</td></tr>
+        <tr><td>Without <code>float_roundtrip</code></td><td>684,136</td><td>−4.8%</td></tr>
+        <tr><td><code>panic = "abort"</code></td><td>718,724</td><td>0%</td></tr>
+        <tr><td><code>opt-level = "s"</code></td><td>615,406</td><td>−14%</td></tr>
+      </tbody>
+    </table></div>
+    <p class="improve"><strong>Improve:</strong> Add a size check to the release gate and record sizes per release. Try <code>opt-level = "s"</code> or <code>"z"</code> with <code>wasm-opt -Oz</code>, guarded by the benchmark. Gate the interop code and <code>float_roundtrip</code> behind cargo features or a separate entry point so the default bundle stays lean, and write the export through a streaming serializer instead of a <code>Value</code> tree.</p>
+    <p class="verify"><strong>Verify:</strong> A size table per feature in the README; CI fails on unexplained growth above an agreed percentage.</p>
+  </div>
+</article>
+
+<article id="finding-9" class="finding">
+  <div class="finding-heading"><div class="finding-number">09</div><div><div class="finding-label"><span class="badge medium">Medium priority</span><span class="badge carried">Carried, sharpened</span><span class="status">Confirmed workflow gap</span></div><h2>One command and a CI gate for the whole verification</h2></div></div>
+  <div class="finding-body">
+    <p><strong>Evidence:</strong> The gate is five commands across two <code>package.json</code> files (<code>cargo fmt</code>, <code>cargo clippy</code>, <code>cargo test</code>, <code>npm run build</code>, <code>npm run test:wasm</code>); <code>differential/</code> needs a manual <code>npm install</code> first; no CI workflow is checked in; <code>bench_wasm.mjs</code> prints checksums without asserting them; the review documents and three test files are untracked.</p>
+    <p class="improve"><strong>Improve:</strong> A root <code>npm test</code> that runs everything including the differential install and a size check; a GitHub Actions workflow on push and pull request; benchmark checksum assertions; publishing only from CI. Decide whether the review documents are committed or ignored.</p>
+    <p class="verify"><strong>Verify:</strong> A fresh clone passes with one documented command; the workflow runs green.</p>
+  </div>
+</article>
+
+<article id="finding-10" class="finding">
+  <div class="finding-heading"><div class="finding-number">10</div><div><div class="finding-label"><span class="badge done">Implemented</span><span class="badge medium">Medium priority</span><span class="status">Confirmed measurement gap</span></div><h2>Speed up the compatibility <code>search()</code> path, or state its cost</h2></div></div>
+  <div class="finding-body"><p class="status-note"><strong>Status:</strong> Implemented: the compat path transfers ids, scores and interned term/field tables and builds result objects in one JavaScript call. Measured 304 ms vs 502 ms in JS (about 1.7× faster; 0.58× before), 236 ms with <code>includeMatch: false</code>; <code>bench_wasm.mjs</code> now has a compat row and the README row is updated.</p>
+    <p><strong>Evidence:</strong> Measured today on the 20,000-document corpus with prefix and fuzzy queries: full <code>search()</code> takes 754 ms for 38 queries against 441 ms in JS (0.58×; 0.8.0 measured 0.56×), and 0.85× with <code>includeMatch: false</code>. The README benchmark table claims <code>~parity (~1.3× faster with includeMatch: false)</code>, a figure from the jobboard benchmark. Per hit the path allocates a JS object and arrays through <code>Reflect::set</code>, interns strings across the boundary, clones stored fields into each <code>SearchResult</code>, and builds a <code>MatchInfo</code>.</p>
+    <p class="improve"><strong>Improve:</strong> Either make the compat path cheaper (build results on the JS side from <code>searchRaw</code> plus one interned string table, avoid cloning stored fields, skip <code>match</code> construction unless requested), or document the compat path as a drop-in convenience with the measured range. Update the README row either way.</p>
+    <p class="verify"><strong>Verify:</strong> Add the compat <code>search()</code> to <code>bench_wasm.mjs</code> and re-measure on both corpora; the README table reflects the new numbers.</p>
+  </div>
+</article>
+</main>
+</div>
+</body>
+</html>

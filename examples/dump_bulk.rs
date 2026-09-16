@@ -65,22 +65,22 @@ fn option_combos() -> Vec<(&'static str, SearchOptions)> {
         (
             "prefix",
             SearchOptions {
-                prefix: true,
+                prefix: true.into(),
                 ..SearchOptions::default()
             },
         ),
         (
             "fuzzy",
             SearchOptions {
-                fuzzy,
+                fuzzy: fuzzy.clone(),
                 ..SearchOptions::default()
             },
         ),
         (
             "pf_and",
             SearchOptions {
-                prefix: true,
-                fuzzy,
+                prefix: true.into(),
+                fuzzy: fuzzy.clone(),
                 combine_with: CombineWith::And,
                 ..SearchOptions::default()
             },
@@ -88,8 +88,8 @@ fn option_combos() -> Vec<(&'static str, SearchOptions)> {
         (
             "pf_or",
             SearchOptions {
-                prefix: true,
-                fuzzy,
+                prefix: true.into(),
+                fuzzy: fuzzy.clone(),
                 ..SearchOptions::default()
             },
         ),
@@ -210,7 +210,7 @@ fn main() {
     }
     index = 3;
     while index < docs.len() {
-        if index % 7 != 0 {
+        if !index.is_multiple_of(7) {
             mutated.discard(&json!(index)).unwrap();
         }
         index += 11;
@@ -237,7 +237,7 @@ fn main() {
     }
     index = 3;
     while index < docs.len() {
-        if index % 7 != 0 {
+        if !index.is_multiple_of(7) {
             vacuumed.discard(&docs[index]["id"]).unwrap();
         }
         index += 11;

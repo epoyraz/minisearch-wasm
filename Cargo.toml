@@ -1,6 +1,6 @@
 [package]
 name = "minisearch-wasm"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 description = "Rust and WebAssembly full-text search engine inspired by MiniSearch"
@@ -13,10 +13,11 @@ js-sys = "0.3"
 # Fast, deterministic hasher for the transient per-query result maps (integer
 # doc-id keys). std's SipHash is overkill for these and dominates accumulation.
 rustc-hash = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+# `float_roundtrip`: parse decimals from JSON text with correct rounding, like
+# JS `JSON.parse`, so field values and ids stringify identically to JS.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde-wasm-bindgen = "0.6"
-unicode-general-category = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 

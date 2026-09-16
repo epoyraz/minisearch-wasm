@@ -64,9 +64,11 @@ fn binary_snapshot_round_trips() {
     assert_eq!(reloaded.term_count(), search.term_count());
 
     for query in ["zen art motorcycle", "ishmael", "neuro", "zaen", "archery"] {
-        let mut options = SearchOptions::default();
-        options.prefix = true;
-        options.fuzzy = Some(FuzzySetting::Distance(0.3));
+        let options = SearchOptions {
+            prefix: true.into(),
+            fuzzy: Some(FuzzySetting::Distance(0.3)),
+            ..SearchOptions::default()
+        };
         assert_eq!(
             reloaded.search(query, options.clone()),
             search.search(query, options),
@@ -161,7 +163,7 @@ fn supports_prefix_and_fuzzy_search() {
     let prefix = search.search(
         "moto",
         SearchOptions {
-            prefix: true,
+            prefix: true.into(),
             ..SearchOptions::default()
         },
     );
@@ -625,7 +627,7 @@ fn auto_suggest_does_not_duplicate_suggested_terms() {
         "vita",
         Some(&AutoSuggestOptions {
             fuzzy: Some(FuzzySetting::Enabled(true)),
-            prefix: Some(true),
+            prefix: Some(true.into()),
             ..AutoSuggestOptions::default()
         }),
     );
@@ -779,7 +781,7 @@ fn cascades_subquery_options() {
                 Query::Combination(QueryCombination {
                     queries: vec![text("vit")],
                     options: PartialSearchOptions {
-                        prefix: Some(true),
+                        prefix: Some(true.into()),
                         fields: Some(vec!["title".to_owned()]),
                         ..PartialSearchOptions::default()
                     },
@@ -912,7 +914,7 @@ fn wildcard_matches_all_documents() {
 fn expansion_cache_invalidates_on_mutation() {
     let mut search = mini_search();
     let prefix_fuzzy = || SearchOptions {
-        prefix: true,
+        prefix: true.into(),
         fuzzy: Some(FuzzySetting::Distance(0.2)),
         ..SearchOptions::default()
     };
@@ -947,21 +949,16 @@ fn search_raw_matches_packed_results() {
     let mut search = mini_search();
     search.discard(&json!(3)).unwrap(); // leave a hole in the id table
 
-    let table: Vec<&str> = {
-        // Owned copy so the borrow doesn't outlive this block.
-        Box::leak(search.doc_id_table().into_boxed_str())
-            .split('\n')
-            .collect()
-    };
+    let table: Vec<serde_json::Value> = serde_json::from_str(&search.doc_id_table()).unwrap();
     assert_eq!(table.len(), 4);
-    assert_eq!(table[2], "", "discarded doc leaves an empty row");
+    assert_eq!(table[2], json!(null), "discarded doc leaves a null slot");
 
     for (query, per_call) in [
         ("zen art motorcycle", PartialSearchOptions::default()),
         (
             "zen",
             PartialSearchOptions {
-                prefix: Some(true),
+                prefix: Some(true.into()),
                 fuzzy: Some(FuzzySetting::Distance(0.2)),
                 ..PartialSearchOptions::default()
             },
@@ -970,8 +967,8 @@ fn search_raw_matches_packed_results() {
     ] {
         let raw = search.search_raw(query, &per_call);
         let options = SearchOptions {
-            prefix: per_call.prefix.unwrap_or(false),
-            fuzzy: per_call.fuzzy,
+            prefix: per_call.prefix.clone().unwrap_or_default(),
+            fuzzy: per_call.fuzzy.clone(),
             ..SearchOptions::default()
         };
         let packed = search.search_packed(query, options);
@@ -982,11 +979,7 @@ fn search_raw_matches_packed_results() {
         for (i, (short_id, packed_id)) in raw.doc_ids.iter().zip(&packed.ids).enumerate() {
             // Short id resolves through the table to the same external id.
             assert_eq!(
-                table[*short_id as usize],
-                match packed_id {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                },
+                table[*short_id as usize], *packed_id,
                 "query={query} row={i}"
             );
             let terms: Vec<&str> = raw.term_ids
@@ -1003,7 +996,7 @@ fn search_raw_matches_packed_results() {
 fn search_joined_opts_overrides_are_partial() {
     let mut options = mini_search_options();
     options.search_options = SearchOptions {
-        prefix: true,
+        prefix: true.into(),
         fuzzy: Some(FuzzySetting::Distance(0.2)),
         combine_with: CombineWith::And,
         ..SearchOptions::default()
@@ -1015,7 +1008,7 @@ fn search_joined_opts_overrides_are_partial() {
     let exact = search.search_joined_opts(
         "zen archery",
         &PartialSearchOptions {
-            prefix: Some(false),
+            prefix: Some(false.into()),
             fuzzy: Some(FuzzySetting::Enabled(false)),
             ..PartialSearchOptions::default()
         },
@@ -1027,14 +1020,10 @@ fn search_joined_opts_overrides_are_partial() {
             ..SearchOptions::default()
         },
     );
-    let ids: Vec<&str> = if exact.ids.is_empty() {
-        vec![]
-    } else {
-        exact.ids.split('\n').collect()
-    };
+    let ids: Vec<serde_json::Value> = serde_json::from_str(&exact.ids).unwrap();
     assert_eq!(ids.len(), reference.len());
     for (id, result) in ids.iter().zip(&reference) {
-        assert_eq!(*id, result.id.to_string());
+        assert_eq!(*id, result.id);
     }
 
     // Empty overrides reproduce searchJoined's default AND path exactly.

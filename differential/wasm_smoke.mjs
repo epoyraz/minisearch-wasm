@@ -60,9 +60,9 @@ const reloaded = MiniSearchWasm.loadBytes(wasmCtor.toBytes())
 check('loadBytes autoSuggest', wasmCtor.autoSuggest('nosta vi'), reloaded.autoSuggest('nosta vi'))
 
 // --- query trees + wildcard through the wasm boundary -----------------------
-// Full-path term/match ordering differs (sorted vs insertion, documented), so
-// compare ids and scores; per-row terms as sorted sets.
-const rowsOf = (results) => results.map(r => ({ id: r.id, score: r.score, terms: [...r.terms].sort() }))
+// Full-path rows compare exactly, including result order on ties and the
+// per-row `terms` order (JS `Object.keys(match)` order).
+const rowsOf = (results) => results.map(r => ({ id: r.id, score: r.score, terms: r.terms }))
 const checkSearch = (name, jsQuery, wasmQuery, options) =>
   check(name, rowsOf(js.search(jsQuery, options)), rowsOf(wasm.search(wasmQuery, options)))
 
@@ -110,7 +110,7 @@ let removeAllError
 try {
   wasmBatch.removeAll(null)
 } catch (error) {
-  removeAllError = String(error)
+  removeAllError = error instanceof Error ? error.message : String(error)
 }
 check('removeAll(non-array) error',
   'Expected documents to be present. Omit the argument to remove all documents.',
@@ -212,12 +212,12 @@ check('addAllAsync default chunk parity',
   }
   const decodeJoined2 = (r) => {
     if (!r.count) return []
-    const ids = r.ids.split('\n')
+    const ids = JSON.parse(r.ids)
     const termRows = r.terms.split('\n')
     return ids.map((id, i) => ({ id, score: r.scores[i], terms: termRows[i] ? termRows[i].split(' ') : [] }))
   }
 
-  const idTable = wasm.docIdTable().split('\n')
+  const idTable = JSON.parse(wasm.docIdTable())
   for (const q of ['vita', 'del', 'vit', 'nosuchterm']) {
     check(`searchRaw parity (${q})`,
       decodeJoined2(wasm.searchJoined(q, false)),
@@ -227,8 +227,8 @@ check('addAllAsync default chunk parity',
     decodeJoined2(wasm.searchJoinedOpts('vit', { prefix: true, fuzzy: 0.2 })),
     decodeRaw(wasm.searchRaw('vit', { prefix: true, fuzzy: 0.2 }), idTable))
   check('searchJoinedOpts exact lookup',
-    js.search('vita', { prefix: false, fuzzy: false, combineWith: 'OR' }).map(r => String(r.id)),
-    (() => { const r = wasm.searchJoinedOpts('vita', { prefix: false, fuzzy: false, combineWith: 'OR' }); return r.count ? r.ids.split('\n') : [] })())
+    js.search('vita', { prefix: false, fuzzy: false, combineWith: 'OR' }).map(r => r.id),
+    (() => { const r = wasm.searchJoinedOpts('vita', { prefix: false, fuzzy: false, combineWith: 'OR' }); return r.count ? JSON.parse(r.ids) : [] })())
 }
 
 console.log(failures === 0 ? 'WASM SMOKE: ALL PASS' : `${failures} FAILURES`)

@@ -2,3 +2,4 @@
 /pkg
 *.wasm
 !.gitignore
+/node_modules
