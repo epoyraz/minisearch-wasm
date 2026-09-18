@@ -2,7 +2,7 @@
 // JS MiniSearch: search, suggestions, mutations, vacuuming, and async indexing.
 import { readFileSync } from 'fs'
 import MiniSearch from 'minisearch'
-import init, { MiniSearchWasm } from '../pkg/minisearch_wasm.js'
+import init, { MiniSearchWasm } from '../pkg/minisearch_wasm_core.js'
 
 await init(readFileSync(new URL('../pkg/minisearch_wasm_bg.wasm', import.meta.url)))
 

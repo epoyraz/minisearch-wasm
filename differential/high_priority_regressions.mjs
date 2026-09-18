@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import MiniSearch from 'minisearch'
-import init, { MiniSearchWasm } from '../pkg/minisearch_wasm.js'
+import init, { MiniSearchWasm } from '../pkg/minisearch_wasm_core.js'
 
 await init({ module_or_path: readFileSync(new URL('../pkg/minisearch_wasm_bg.wasm', import.meta.url)) })
 let assertions = 0

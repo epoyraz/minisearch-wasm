@@ -21,6 +21,37 @@ fn reloaded(search: &MiniSearch) -> Vec<MiniSearch> {
 }
 
 #[test]
+fn compaction_bounds_churn_and_preserves_radix_order_and_raw_ids() {
+    let mut index = engine();
+    for _ in 0..10 {
+        for id in 0..1000 {
+            index.add(json!({"id":id,"text":"apple apricot"})).unwrap();
+        }
+        for id in 0..1000 {
+            index.discard(&json!(id)).unwrap();
+        }
+        assert!(index.compact().is_err());
+        index.vacuum();
+        index.compact().unwrap();
+        assert_eq!(snapshot(&index)["next_id"], 0);
+        assert_eq!(snapshot(&index)["field_length"], json!([]));
+    }
+    for (id, text) in [(1, "abcde"), (2, "abc"), (3, "ab"), (4, "abcd")] {
+        index.add(json!({"id":id,"text":text})).unwrap();
+    }
+    index.remove(&json!({"id":2,"text":"abc"})).unwrap();
+    let before = index.search("ab", SearchOptions::default());
+    let version = index.id_table_version();
+    index.compact().unwrap();
+    assert_ne!(index.id_table_version(), version);
+    assert_eq!(index.search("ab", SearchOptions::default()), before);
+    assert_eq!(index.doc_id_table(), "[1,3,4]");
+    for copy in reloaded(&index) {
+        assert_eq!(copy.search("ab", SearchOptions::default()), before);
+    }
+}
+
+#[test]
 fn field_presence_and_boundary_empty_tokens_survive_reload_and_discard() {
     let mut search = engine();
     search

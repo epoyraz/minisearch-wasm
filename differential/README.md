@@ -1,25 +1,30 @@
 # Differential test harness
 
-Runs identical documents and queries through the original JS MiniSearch and
-this port, then compares outputs:
+There are two distinct contracts. The generated `minisearch_wasm_core.js` tests
+the native subset. `public_api.mjs` tests the public compatibility facade against
+the pinned MiniSearch engine, including callbacks and the first dirty query.
+Public tests do not warm dirty queries before comparison.
+
+The older native bulk comparator runs identical documents and queries through
+the original JS MiniSearch and the Rust engine, then compares outputs:
 
 - **search** (packed/`searchJoined` path): result ids, BM25 scores
   (rel. tolerance `1e-12`; observed max ≈ `5e-16`, last-ulp `Math.log` vs
   `ln`), and each document's matched **terms in order**. Result order must
   match except inside near-tie score bands, where members are compared as sets
-  (the documented tie-order difference).
+  (a historical comparator allowance, not the current public contract).
 - **autoSuggest**: suggestion phrases and terms exactly, scores as above.
 - **query trees + wildcard** (full `search(query)` path): ids and scores as
   above; per-row terms as sorted sets (`{wildcard: true}` in the corpus JSON
-  stands in for the wildcard symbol). JS match keys are insertion-ordered
-  while this port's full-path match map is sorted — a documented divergence.
+  stands in for the wildcard symbol). The stricter `compat_parity.mjs` suite
+  also checks exact match-key, term and tie order through the native boundary.
 
 A fresh index, one mutated by `remove`/`discard`, one mutated by
 `removeAll`/`discardAll`, and one explicitly vacuumed are checked. On dirty
 indexes the JS side is dumped at its post-lazy-cleanup fixpoint (each query runs
 twice, the second run is recorded), because JS mutates the index during dirty
-searches while this port never does — the port's dirty-search scores equal JS's
-post-cleanup scores by design.
+searches while the native core does not. This native-only check does not verify
+public first-query parity; `public_api.mjs` covers that separately.
 
 ## Run
 
@@ -47,6 +52,7 @@ node wasm_smoke.mjs
 node high_priority_regressions.mjs
 node compat_parity.mjs
 node api_parity.mjs
+node public_api.mjs
 ```
 
 Or run `npm run test:wasm` from the repository root. The high-priority suite
@@ -58,12 +64,48 @@ malformed/truncated/mutated binary inputs through the actual WASM boundary.
 order, suggestions, JS number formatting of field values and ids, UTF-16 term
 lengths, `has`/`replace`/`getStoredFields`, and MiniSearch JSON import/export
 in both directions against the JS engine on fresh, dirty and vacuumed indexes.
-`api_parity.mjs` covers the API surface: `Error` objects and messages,
+`api_parity.mjs` covers the **core subset**: `Error` objects and messages,
 rejection of callback options and the declarative forms that replace them,
 `Date`/`toString` field values, the tokenizer's Unicode tables, `getDefault`,
 `logger`, `loadJSONAsync` and MiniSearch-format `toJSON`/`loadJSON`.
 
+The public suite verifies all supported callbacks, JS object identity and stored
+references, first dirty-query scores and lazy cleanup, mixed mutation histories,
+radix ordering across engine transfers, actual async yields, snapshots, active
+versus queued vacuum promises, compaction and ID generations. Its CSP child
+process also exercises the actual Wasm result builder with string code generation
+disabled. Core callback-rejection checks do not imply public callback rejection.
+
+From the repository root, `npm run test:package` packs and installs the actual
+artifact in a temporary directory. It tests ESM and CommonJS constructors,
+SearchableMap, strict ES2022 types (including generic type annotations), and the
+global bundle in a Node VM with string code generation disabled.
+
+For a real browser, run `node differential/serve_browser.mjs` and open the printed
+URL. The page loads the generated files without an import map, under CSP that
+allows Wasm compilation but forbids JavaScript eval. It reports ESM, global
+bundle, module Worker, callback and async JSON checks in the page and in
+`globalThis.browserContract`. A Node VM pass alone is not a browser pass.
+
 ## Benchmarks
+
+The public compatibility package has a separate paired benchmark:
+
+```powershell
+npm run bench:public -- differential/bench_corpus.json differential/results/public-benchmark.json 9
+```
+
+It compares pinned MiniSearch with the public package, verifies full/compact
+results before timing, alternates engine order, and reports medians plus raw
+samples. It separates first-batch and warmed queries, includes compact-result
+decoding, and measures callbacks, first dirty queries, vacuum, asynchronous
+loading, snapshot sizes and fresh-process module import. Setup, forced GC and
+disposal are outside the timed regions. Both engines use the same input and
+search options. First transfer timings include the compatibility conversion.
+
+See the [18 September public-package report](results/2026-09-18-public-vs-original.md)
+for measured results and limitations. These Node/synthetic measurements do not
+replace a browser or production-workload benchmark.
 
 `gen_corpus.mjs` takes an optional document count for a larger benchmark
 corpus. Native engine benchmark and end-to-end Wasm-vs-JS benchmark (the

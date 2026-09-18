@@ -1234,6 +1234,10 @@ const DEFAULT_AUTO_VACUUM_MIN_DIRT_COUNT: usize = 20;
 const DEFAULT_AUTO_VACUUM_MIN_DIRT_FACTOR: f64 = 0.1;
 
 impl MiniSearch {
+    pub(crate) fn set_auto_vacuum(&mut self, setting: Option<AutoVacuumSetting>) {
+        self.options.auto_vacuum = setting;
+    }
+
     pub fn new(options: MiniSearchOptions) -> Self {
         let field_ids = options
             .fields
@@ -1609,6 +1613,73 @@ impl MiniSearch {
 
     pub fn is_vacuuming(&self) -> bool {
         self.vacuum_state.is_some()
+    }
+
+    /// Reclaim dense ID/field tables after churn, preserving insertion and
+    /// radix traversal order. Raw-result consumers must refresh their ID table.
+    /// An active/dirty index cannot be remapped while stale postings exist.
+    pub fn compact(&mut self) -> Result<(), String> {
+        if self.is_vacuuming() || self.dirt_count != 0 {
+            return Err("MiniSearch: vacuum must finish before compacting the index".into());
+        }
+        if self.next_id as usize == self.document_count {
+            return Ok(());
+        }
+        // Removing an already-modified document can leave untracked stale
+        // postings (the original API warns about this). Reject that state before
+        // remapping anything, rather than panicking on an absent mapping.
+        self.validate_snapshot()?;
+        self.invalidate_expansions();
+        let mut ids: Vec<_> = self.document_ids.keys().copied().collect();
+        ids.sort_unstable();
+        let mapping: HashMap<_, _> = ids
+            .iter()
+            .enumerate()
+            .map(|(new, old)| (*old, new as ShortId))
+            .collect();
+        let fields = self.options.fields.len();
+        let mut lengths = Vec::with_capacity(ids.len() * fields);
+        let mut present = Vec::with_capacity(ids.len() * fields);
+        for old in &ids {
+            let start = *old as usize * fields;
+            lengths.extend_from_slice(&self.field_length[start..start + fields]);
+            present.extend_from_slice(&self.field_present[start..start + fields]);
+        }
+        for (_, value) in self.id_to_short_id.iter_mut() {
+            *value = mapping[value];
+        }
+        self.document_ids = std::mem::take(&mut self.document_ids)
+            .into_iter()
+            .map(|(id, value)| (mapping[&id], value))
+            .collect();
+        self.stored_fields = std::mem::take(&mut self.stored_fields)
+            .into_iter()
+            .map(|(id, value)| (mapping[&id], value))
+            .collect();
+        // Mutate postings in place: rebuilding the radix tree would change ties.
+        let terms: Vec<_> = self
+            .index
+            .sorted_entries()
+            .into_iter()
+            .map(|(term, _)| term)
+            .collect();
+        for term in terms {
+            let data = Rc::make_mut(self.index.get_mut(&term).expect("existing term"));
+            for (_, postings) in &mut data.0 {
+                for (id, _) in &mut postings.0 {
+                    *id = mapping[id];
+                }
+            }
+        }
+        self.field_length = lengths;
+        self.field_present = present;
+        self.alive = vec![true; ids.len()];
+        self.next_id = ids.len() as ShortId;
+        self.id_table_version += 1;
+        // Scratch is thread-local rather than index-owned. Release its high-water
+        // allocation at this explicit maintenance boundary, between queries.
+        SCRATCH.with(|scratch| *scratch.borrow_mut() = Scratch::default());
+        Ok(())
     }
 
     pub fn dirt_count(&self) -> usize {
@@ -2292,6 +2363,19 @@ impl MiniSearch {
 
     pub fn options(&self) -> &MiniSearchOptions {
         &self.options
+    }
+
+    /// Legacy native snapshots can contain JSON objects/arrays. The public
+    /// facade restores those into JS once, so subsequent reads retain identity.
+    pub(crate) fn has_reference_values(&self) -> bool {
+        self.document_ids
+            .values()
+            .chain(
+                self.stored_fields
+                    .values()
+                    .flat_map(|fields| fields.values()),
+            )
+            .any(|value| matches!(value, Value::Array(_) | Value::Object(_)))
     }
 
     pub fn term_count(&self) -> usize {

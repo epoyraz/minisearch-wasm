@@ -2,10 +2,42 @@
 
 The original MiniSearch Jest tests live in `reference-tests/` and are the
 behavior contract for this port. Each Rust test added under `tests/` should link
-back to one or more behaviors from those files. The 0.9.0 sections come first;
+back to one or more behaviors from those files. The 0.10.0 section is current;
+the 0.9.0 sections describe the published native-only API;
 the sections after them are the porting history in chronological order, each
 describing its own release, and a later section supersedes an earlier one where
-they disagree. Open work is tracked in `IMPROVEMENTS.md`.
+they disagree. Open native work is tracked in `IMPROVEMENTS.md`.
+
+## 0.10.0: public JavaScript compatibility
+
+The six API review findings are addressed by a public facade, static native
+interop helpers and native ID compaction. See [COMPATIBILITY.md](COMPATIBILITY.md)
+for the execution-mode contract and limitations. This supersedes historical
+callback rejection, copied stored values and dirty-search behavior **for the
+public package**, not for the generated core glue or standalone Rust library.
+
+- Callbacks and JavaScript values use a bundled, pinned MiniSearch 7.2.0 engine.
+  Eligible clean indexes use Wasm; `executionMode` makes transfers observable.
+- `addAllAsync` normalizes documents inside chunks. Public `loadJSONAsync` uses
+  upstream's yielding loader, including its synchronous initial JSON parse.
+- Dirty queries transfer before execution, preserving first-query lazy cleanup
+  and compressed radix ordering without warming the reference query.
+- Static interop functions replace dynamic `Function` construction in Wasm
+  search/getDefault, allowing CSP without JavaScript `unsafe-eval`.
+- Generic default/named constructors, original callback types, case variants,
+  ESM/CommonJS/global entries and the `SearchableMap` subpath are provided.
+- Vacuum retains distinct active/queued promises. Clean completion compacts JS
+  internal IDs; explicit native `compact()` also remaps dense field tables and
+  releases scratch allocations. ID generations invalidate cached raw tables.
+
+Gate: `cargo fmt -- --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+`cargo test --locked`, `npm run build`, `npm run test:wasm`, `npm run test:types`,
+`npm run test:package`, `npm run check:separators`. The real-browser contract
+served by `node differential/serve_browser.mjs` checks packaged ESM, global
+bundle, module Worker, async JSON loading and CSP separately from Node VM tests.
+The public facade is measured separately in
+`differential/results/2026-09-18-public-vs-original.md`; historical native
+measurements below refer to their original release and workload.
 
 ## 0.9.0 correctness fixes
 
@@ -26,7 +58,7 @@ changes. Regression coverage is in `tests/high_priority_regressions.rs` and
 `differential/high_priority_regressions.mjs`; the latter compares the rebuilt
 WASM package with JS MiniSearch on sparse fields, long fields and maintenance.
 
-Current gate: `cargo fmt -- --check`, `cargo clippy --locked --all-targets --
+The published 0.9.0 gate was: `cargo fmt -- --check`, `cargo clippy --locked --all-targets --
 -D warnings`, `cargo test --locked` (66 tests), `npm run build`, then
 `npm run test:wasm` (smoke, high-priority regressions, JS parity and API parity
 through the built package), `npm run test:types` (strict TypeScript 7 fixtures)

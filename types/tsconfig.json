@@ -5,10 +5,16 @@
     "target": "es2022",
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "lib": ["esnext", "dom"],
+    "lib": [
+      "es2022",
+      "dom"
+    ],
     "types": [],
     "skipLibCheck": false,
     "noUnusedLocals": false
   },
-  "files": ["fixtures.ts"]
+  "files": [
+    "fixtures.ts",
+    "compatibility.ts"
+  ]
 }

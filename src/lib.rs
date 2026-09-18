@@ -67,22 +67,9 @@ impl MiniSearchWasm {
             "storeFields" => Array::new().into(),
             "autoVacuum" => JsValue::TRUE,
             "tokenizer" => JsValue::from_str("default"),
-            "extractField" => {
-                Function::new_with_args("document, fieldName", "return document[fieldName]").into()
+            "extractField" | "stringifyField" | "tokenize" | "processTerm" | "logger" => {
+                callback_default(option_name)?
             }
-            "stringifyField" => {
-                Function::new_with_args("fieldValue", "return fieldValue.toString()").into()
-            }
-            "tokenize" => {
-                Function::new_with_args("text", "return text.split(/[\\n\\r\\p{Z}\\p{P}]+/u)")
-                    .into()
-            }
-            "processTerm" => Function::new_with_args("term", "return term.toLowerCase()").into(),
-            "logger" => Function::new_with_args(
-                "level, message",
-                "if (typeof console?.[level] === 'function') console[level](message)",
-            )
-            .into(),
             _ => {
                 return Err(js_error(&format!(
                     "MiniSearch: unknown option \"{option_name}\""
@@ -123,7 +110,11 @@ impl MiniSearchWasm {
         #[wasm_bindgen(unchecked_param_type = "readonly object[]")] documents: JsValue,
         #[wasm_bindgen(unchecked_param_type = "AddAllAsyncOptions")] options: Option<JsValue>,
     ) -> Result<Promise, JsValue> {
-        let documents = normalize_documents(&documents, &self.schema())?;
+        if !Array::is_array(&documents) {
+            return Err(js_error("MiniSearch: documents must be an array"));
+        }
+        let documents: Array = documents.unchecked_into();
+        let schema = self.schema();
         let options: AddAllAsyncOptions = match options {
             None => AddAllAsyncOptions {
                 chunk_size: default_async_chunk_size(),
@@ -133,31 +124,25 @@ impl MiniSearchWasm {
         let inner = Rc::clone(&self.inner);
 
         Ok(future_to_promise(async move {
-            if options.chunk_size == 0 {
-                inner
-                    .borrow_mut()
-                    .add_all(documents)
-                    .map_err(|err| js_error(&err))?;
-                return Ok(JsValue::UNDEFINED);
-            }
-
-            let mut chunk = Vec::with_capacity(options.chunk_size);
-            for document in documents {
-                chunk.push(document);
-                if chunk.len() == options.chunk_size {
+            let size = if options.chunk_size == 0 {
+                documents.length().max(1) as usize
+            } else {
+                options.chunk_size
+            };
+            for start in (0..documents.length() as usize).step_by(size) {
+                // Yield before inspecting or converting a full batch.
+                if start + size <= documents.length() as usize {
                     yield_to_timer(0).await?;
+                }
+                let end = (start + size).min(documents.length() as usize);
+                for i in start..end {
+                    let document = normalize_document(&documents.get(i as u32), &schema)?;
                     inner
                         .borrow_mut()
-                        .add_all(std::mem::take(&mut chunk))
+                        .add(document)
                         .map_err(|err| js_error(&err))?;
-                    chunk = Vec::with_capacity(options.chunk_size);
                 }
             }
-
-            inner
-                .borrow_mut()
-                .add_all(chunk)
-                .map_err(|err| js_error(&err))?;
             Ok(JsValue::UNDEFINED)
         }))
     }
@@ -308,6 +293,38 @@ impl MiniSearchWasm {
     #[wasm_bindgen(getter, js_name = isVacuuming)]
     pub fn is_vacuuming_js(&self) -> bool {
         self.vacuum_runtime.borrow().active || self.inner.borrow().is_vacuuming()
+    }
+
+    /// Reclaim dense tables after vacuuming. Changes `idTableVersion`.
+    pub fn compact(&self) -> Result<(), JsValue> {
+        if self.vacuum_runtime.borrow().active {
+            return Err(js_error(
+                "MiniSearch: vacuum must finish before compacting the index",
+            ));
+        }
+        self.inner
+            .borrow_mut()
+            .compact()
+            .map_err(|err| js_error(&err))
+    }
+
+    /// The JS facade owns scheduling and restores this setting for snapshots.
+    #[wasm_bindgen(js_name = setAutoVacuum)]
+    pub fn set_auto_vacuum_js(&self, setting: JsValue) -> Result<(), JsValue> {
+        let setting = serde_wasm_bindgen::from_value(setting).map_err(boundary_error)?;
+        self.inner.borrow_mut().set_auto_vacuum(setting);
+        Ok(())
+    }
+
+    /// Internal facade metadata, without serializing the entire index on load.
+    #[wasm_bindgen(js_name = getOptions)]
+    pub fn get_options_js(&self) -> Result<JsValue, JsValue> {
+        to_json_compatible_value(self.inner.borrow().options()).map_err(|err| js_error(&err))
+    }
+
+    #[wasm_bindgen(js_name = hasReferenceValues)]
+    pub fn has_reference_values_js(&self) -> bool {
+        self.inner.borrow().has_reference_values()
     }
 
     #[wasm_bindgen(getter, js_name = dirtCount)]
@@ -1056,39 +1073,12 @@ fn normalize_documents(
 
 /// Builds MiniSearch-shaped result objects from the engine's transfer in one
 /// JavaScript call (see `MiniSearch::search_query_transfer`).
-const BUILD_RESULTS_JS: &str = r"
-const parsedIds = JSON.parse(ids);
-const terms = table ? table.split('\n') : [];
-const fields = fieldNames ? fieldNames.split('\n') : [];
-const storedRows = stored ? JSON.parse(stored) : null;
-const count = scores.length;
-const out = new Array(count);
-for (let i = 0; i < count; i++) {
-  const termList = [];
-  for (let k = termOffsets[i]; k < termOffsets[i + 1]; k++) termList.push(terms[termIds[k]]);
-  const queryList = [];
-  for (let k = queryOffsets[i]; k < queryOffsets[i + 1]; k++) queryList.push(terms[queryIds[k]]);
-  const result = { id: parsedIds[i], score: scores[i], terms: termList, queryTerms: queryList };
-  if (includeMatch) {
-    const match = {};
-    for (let k = termOffsets[i]; k < termOffsets[i + 1]; k++) {
-      const fieldList = [];
-      for (let m = fieldOffsets[k]; m < fieldOffsets[k + 1]; m++) fieldList.push(fields[fieldIds[m]]);
-      match[terms[termIds[k]]] = fieldList;
-    }
-    result.match = match;
-  }
-  if (storedRows !== null && storedRows[i] !== null) Object.assign(result, storedRows[i]);
-  out[i] = result;
-}
-return out;
-";
-
-thread_local! {
-    static BUILD_RESULTS: Function = Function::new_with_args(
-        "ids, scores, table, termIds, termOffsets, queryIds, queryOffsets, fieldIds, fieldOffsets, fieldNames, stored, includeMatch",
-        BUILD_RESULTS_JS,
-    );
+#[wasm_bindgen(module = "/src/interop.js")]
+extern "C" {
+    #[wasm_bindgen(catch, js_name = buildResults)]
+    fn build_results_module(args: &Array) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = callbackDefault)]
+    fn callback_default(name: &str) -> Result<JsValue, JsValue>;
 }
 
 fn build_results(transfer: &CompatTransfer, include_match: bool) -> Result<JsValue, JsValue> {
@@ -1105,7 +1095,7 @@ fn build_results(transfer: &CompatTransfer, include_match: bool) -> Result<JsVal
     args.push(&JsValue::from_str(&transfer.field_names));
     args.push(&JsValue::from_str(&transfer.stored));
     args.push(&JsValue::from_bool(include_match));
-    BUILD_RESULTS.with(|build| Reflect::apply(build, &JsValue::UNDEFINED, &args))
+    build_results_module(&args)
 }
 
 #[wasm_bindgen(typescript_custom_section)]

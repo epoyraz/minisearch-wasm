@@ -86,7 +86,7 @@ export function mistakes(mini: MiniSearchWasm): void {
   mini.search("x", { prefx: true });
   // @ts-expect-error invalid combineWith.
   mini.search("x", { combineWith: "XOR" });
-  // @ts-expect-error callbacks are not supported.
+  // Original MiniSearch callbacks are supported through the compatibility path.
   mini.search("x", { filter: (result: SearchResult) => result.score > 1 });
   // @ts-expect-error score is a number.
   const wrong: string = mini.search("x")[0].score;
