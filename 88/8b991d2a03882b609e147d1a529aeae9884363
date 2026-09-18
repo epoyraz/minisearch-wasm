@@ -1,0 +1,127 @@
+differential/results/2026-09-18-public-vs-original.md
+  s_c75d56a0202530::t_f086ef5a1c0c15 1-100
+js/minisearch.d.ts
+  s_c75d56a0202530::t_c0129e774344d4 103-104
+  s_c75d56a0202530::t_a4b3987582a6f0 1-9,11-15,17-90,92-102
+  s_c75d56a0202530::t_a3cab9d98d0bea 10,16,91
+scripts/finalize-pkg.mjs
+  s_c75d56a0202530::t_89afee465a20a8 3-6,8,11,23,30-36,38-39,41-43,45-49,51-63,67-70,74,90-94,97-98,101-104,111-118
+  s_c75d56a0202530::t_af60ac6c1fbe7a 18-21,37,50
+  s_c75d56a0202530::t_f086ef5a1c0c15 24-29,119
+  s_c75d56a0202530::t_9d0280d5bcd1d6 64-66
+differential/public_api.mjs
+  s_c75d56a0202530::t_588aa3db36ede9 209-219
+  s_c75d56a0202530::t_00d8393989a737 1-108,110,161-208,233-248
+  s_c75d56a0202530::t_aba85c73de1de2 109,159,220-232
+  s_c75d56a0202530::t_e0c79e636f6f05 111-141,151-158,160
+  s_c75d56a0202530::t_fa56590d65dbff 142-150
+tests/high_priority_regressions.rs
+  s_c75d56a0202530::t_e0645718f5304d 24-53
+  s_c75d56a0202530::t_e15d27de28221e 23
+types/compatibility.ts
+  s_c75d56a0202530::t_00d8393989a737 1-4,7-16
+  s_c75d56a0202530::t_9d0280d5bcd1d6 5-6
+differential/package_contract.mjs
+  s_c75d56a0202530::t_af60ac6c1fbe7a 73-74
+  s_c75d56a0202530::t_1b3526c137be0f 33
+  s_c75d56a0202530::t_9d0280d5bcd1d6 53,66
+  s_c75d56a0202530::t_53ac78da8bb7b1 1-32,34-52,54-65,67-72,75-89
+src/interop.js
+  s_c75d56a0202530::t_978e42c8925373 1-37
+js/minisearch.js
+  s_c75d56a0202530::t_b9d9510474a19d 98-108,215-220,229-232,315,334-336
+  s_c75d56a0202530::t_89afee465a20a8 207-209,211-212,307,310
+  s_c75d56a0202530::t_aba85c73de1de2 320,323
+  s_c75d56a0202530::t_9d0280d5bcd1d6 51,210
+  s_298311d2958204::t_e64830468b8cc8 27,37-39,47-49,57,59,111-112,114-115,233-236,258,265,365
+  s_c75d56a0202530::t_a3cab9d98d0bea 372
+  s_c75d56a0202530::t_f95d047bbae30e 1-26,28-36,40-41,43-46,50,52-56,60-97,109-110,113,116-118,124-206,213-214,221-228,237-257,259-264,266-306,308-309,311-313,316-319,322,324-333,337-340,342-348,354-364,366-371,374
+  s_c75d56a0202530::t_fa56590d65dbff 42
+  s_c75d56a0202530::t_a4b3987582a6f0 58,373
+  s_c75d56a0202530::t_eff31e617fd2c6 314,321,341,349-353
+  s_c75d56a0202530::t_588aa3db36ede9 119-123
+COMPATIBILITY.md
+  s_c75d56a0202530::t_c66e059f208f00 32-35
+  s_c75d56a0202530::t_aba85c73de1de2 24
+  s_c75d56a0202530::t_d0c34de10afe16 1-23,25-31,36-152
+package.json
+  s_c75d56a0202530::t_c66e059f208f00 11
+  s_c75d56a0202530::t_6fcde9cddcafc7 3,8-9,14-15,18,20-22
+differential/browser_contract.mjs
+  s_c75d56a0202530::t_e0c79e636f6f05 1-56
+differential/serve_browser.mjs
+  s_c75d56a0202530::t_e0c79e636f6f05 1-24
+PORTING.md
+  s_c75d56a0202530::t_c66e059f208f00 38-40
+  s_c75d56a0202530::t_f9b724f53562a4 5-6,9-37,61
+RELEASE_NOTES.md
+  s_c75d56a0202530::t_fd86eff2c4ae93 1-51
+differential/browser_contract.html
+  s_c75d56a0202530::t_e0c79e636f6f05 1-7
+README.md
+  s_298311d2958204::t_958671265da8fa 22-84,86-98,340,406,409,419,457
+  s_c75d56a0202530::t_b7851d9d0c6a02 3-11,18-20,116,118-121,136,208,220-221,236-244,246-248,268-273,278,281,306-307
+  s_c75d56a0202530::t_c66e059f208f00 85,344-348
+  s_c75d56a0202530::t_3fe9b24dd0f12b 21,99,103,308-310,315-339,349-361,407-408,410-411,422-424,427-429,432-434,437-442,456,459-460
+src/mini_search.rs
+  s_c75d56a0202530::t_0b3bc51d75721f 1618-1627,1632-1634,1640-1650,1659,1666-1667,1669-1684
+  s_c75d56a0202530::t_eff31e617fd2c6 1237-1240,1635-1639,1651-1658,1660-1665,1668
+  s_c75d56a0202530::t_588aa3db36ede9 1628-1631,2373-2377
+  s_c75d56a0202530::t_aba85c73de1de2 2368-2372,2378-2380
+differential/README.md
+  s_c75d56a0202530::t_c66e059f208f00 92-109
+  s_c75d56a0202530::t_f9b724f53562a4 3-9,15,19-20,26-27,55,67,72-88
+  s_c75d56a0202530::t_6a6eb7efa32c0b 89
+differential/bench_public.mjs
+  s_c75d56a0202530::t_d4506582182ba5 95-114
+  s_c75d56a0202530::t_c24ccb5d30c5f4 45,180-189,255-256,259
+  s_c75d56a0202530::t_b9c03711c97e74 1-44,46-94,115-179,190-254,257-258,260
+types/fixtures.ts
+  s_c75d56a0202530::t_a3cab9d98d0bea 89
+src/lib.rs
+  s_c75d56a0202530::t_aba85c73de1de2 319-329
+  s_c75d56a0202530::t_0b3bc51d75721f 298-300
+  s_c75d56a0202530::t_eff31e617fd2c6 70-71,113-117,127-134,136-139,142,301-318,1076-1081,1098
+differential/csp_regression.mjs
+  s_c75d56a0202530::t_00d8393989a737 1-11
+Cargo.lock
+  s_c75d56a0202530::t_b93997dac8cd03 66
+Cargo.toml
+  s_c75d56a0202530::t_94a1f100453634 3
+differential/api_parity.mjs
+  s_c75d56a0202530::t_f96b442e78491f 9
+differential/compat_parity.mjs
+  s_c75d56a0202530::t_aa286e27c925a6 8
+differential/high_priority_regressions.mjs
+  s_c75d56a0202530::t_987ddcfbb3a12e 6
+differential/wasm_smoke.mjs
+  s_c75d56a0202530::t_e8c7438fe5ea3c 5
+package-lock.json
+  s_c75d56a0202530::t_a50df1b08f4ff6 3,9-12,14,18-459,800-847
+types/tsconfig.json
+  s_c75d56a0202530::t_2fa64337205882 8-11,16-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "888b991d2a03882b609e147d1a529aeae9884363",
+  "prompts": {},
+  "sessions": {
+    "s_298311d2958204": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c5a8b43-dec2-4ca9-9c9d-3c085b589fb9",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    },
+    "s_c75d56a0202530": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0b084-4d04-7732-af54-a7724b390d4b",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
