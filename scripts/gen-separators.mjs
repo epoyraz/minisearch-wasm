@@ -74,7 +74,10 @@ const content = lines.join('\n')
 if (process.argv.includes('--check')) {
   let current = ''
   try { current = readFileSync(target, 'utf8') } catch {}
-  if (current !== content) {
+  // The table is what matters: the header records which Node wrote the file,
+  // and another Node with the same Unicode data writes the same table.
+  const table = text => text.slice(text.indexOf('/// Unicode version'))
+  if (table(current) !== table(content)) {
     console.error(`src/separators.rs is out of date for Node ${process.versions.node} (Unicode ${process.versions.unicode}); run node scripts/gen-separators.mjs`)
     process.exit(1)
   }

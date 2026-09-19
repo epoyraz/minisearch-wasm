@@ -5,20 +5,32 @@
   "description": "Build orchestration for the minisearch-wasm npm package (not published; the publishable artifact is pkg/).",
   "type": "module",
   "scripts": {
-    "build": "wasm-pack build --target web --release --no-pack && node scripts/finalize-pkg.mjs",
-    "test:wasm": "node differential/wasm_smoke.mjs && node differential/high_priority_regressions.mjs && node differential/compat_parity.mjs && node differential/api_parity.mjs && node differential/public_api.mjs",
+    "build": "wasm-pack build --target web --release --no-pack --out-dir target/wasm-glue && node scripts/finalize-pkg.mjs",
+    "test:wasm": "node differential/wasm_smoke.mjs && node differential/high_priority_regressions.mjs && node differential/compat_parity.mjs && node differential/api_parity.mjs && node differential/public_api.mjs && node differential/wasm_residency.mjs && node differential/core_robustness.mjs",
     "bench:maintenance": "npm run build && node differential/bench_maintenance.mjs",
-    "bench:public": "npm run build && node --expose-gc differential/bench_public.mjs",
-    "publish:pkg": "npm run build && npm publish ./pkg",
+    "bench:public": "npm run build && node differential/gen_corpus.mjs differential/bench_corpus.json 20000 && node --expose-gc differential/bench_public.mjs",
+    "publish:pkg": "npm run build && npm test && npm publish ./pkg",
     "test:types": "tsc -p types/tsconfig.json",
     "check:separators": "node scripts/gen-separators.mjs --check",
-    "test:package": "node differential/package_contract.mjs"
+    "test:package": "node differential/package_contract.mjs",
+    "build:pkg": "node scripts/finalize-pkg.mjs",
+    "test:upstream": "vitest run --config upstream-suite/vitest.config.mjs",
+    "test:differential": "node scripts/differential.mjs",
+    "test:native": "cargo fmt -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo test --locked --release --test snapshot_robustness",
+    "test:js": "npm run test:wasm && npm run test:types && npm run test:package && npm run test:upstream && npm run check:separators && npm run check:size",
+    "test": "npm run test:native && npm run test:differential && npm run test:js",
+    "check:size": "node scripts/check-size.mjs"
   },
   "devDependencies": {
     "esbuild": "0.25.12",
-    "typescript": "^7.0.2"
+    "fast-check": "3.23.2",
+    "typescript": "^7.0.2",
+    "vitest": "3.2.4"
   },
   "dependencies": {
     "minisearch": "7.2.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

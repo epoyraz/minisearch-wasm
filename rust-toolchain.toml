@@ -1,0 +1,7 @@
+# The toolchain releases are built and linted with. CI installs exactly this;
+# bump it together with a clean `cargo clippy --all-targets -- -D warnings`.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
