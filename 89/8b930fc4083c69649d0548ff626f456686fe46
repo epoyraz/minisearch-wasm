@@ -1,0 +1,52 @@
+scripts/differential.mjs
+  s_d5e94ebe2c49f9::t_b6659ea91e5417 1-27
+upstream-suite/vitest.config.mjs
+  s_d5e94ebe2c49f9::t_1da23bf338e578 25-26,28-29
+  s_d5e94ebe2c49f9::t_bf9582e5ae1d58 1-24,30-36
+  s_d5e94ebe2c49f9::t_afe24bca365156 27
+upstream-suite/expected-failures.mjs
+  s_d5e94ebe2c49f9::t_bf9582e5ae1d58 1-21
+package.json
+  s_d5e94ebe2c49f9::t_726b89fd1cfc7d 11
+  s_d5e94ebe2c49f9::t_e6988e3452e7b4 21-22
+  s_d5e94ebe2c49f9::t_5658090baace25 27-28
+  s_d5e94ebe2c49f9::t_4b705121b63c24 8-9,15,32-34
+  s_d5e94ebe2c49f9::t_bf9582e5ae1d58 16,26
+  s_d5e94ebe2c49f9::t_b6659ea91e5417 12,17-20
+upstream-suite/harness.mjs
+  s_d5e94ebe2c49f9::t_afe24bca365156 9-17,20
+  s_d5e94ebe2c49f9::t_1da23bf338e578 1-8,18-19,21-33
+scripts/gen-separators.mjs
+  s_d5e94ebe2c49f9::t_ca9e52dc1fcd2d 77-80
+scripts/size-budget.json
+  s_d5e94ebe2c49f9::t_e6988e3452e7b4 3-4
+  s_d5e94ebe2c49f9::t_ca9e52dc1fcd2d 1-2,5-22
+scripts/finalize-pkg.mjs
+  s_d5e94ebe2c49f9::t_4b705121b63c24 73
+  s_d5e94ebe2c49f9::t_2fae690e3a52d2 89
+  s_d5e94ebe2c49f9::t_d407b5583b1c30 1,3-10,12,17-24,27-42,44-45,47-51,53-72,74-88,90,93-100,102,104-108,112-113,115-122,124,126-128,130-138,143-145,148,151,154-157,159,162-164,166,170-174,176
+.github/workflows/ci.yml
+  s_d5e94ebe2c49f9::t_b13c32743c83fa 1-47
+scripts/check-size.mjs
+  s_d5e94ebe2c49f9::t_ca9e52dc1fcd2d 1-36
+package-lock.json
+  s_d5e94ebe2c49f9::t_26fa81a2cd7649 15-20,465-475,477,480-483,486,489,492-509,514,517-525,527-532,534-537,542,546,548-551,556,560,562-565,570,574,576-579,584-587,591-598,600-608,610-613,618-621,625-632,634-642,644-647,652-655,659,661-664,666,669-672,676,678-681,686-689,693,695-698,700,703-706,710,712-715,717,720-723,727,729-732,734,737-740,744,746-749,751,754-757,760-761,763-766,771-774,777-778,780-783,785,788-791,794-795,797-800,805,809,811-814,816,819,822-823,825-1877,1879-2302,2307-2409,2415,2418-2438,2443,2449,2452-2455,2466-2491,2494-2497,2499-2524,2526,2529,2531-2581
+rust-toolchain.toml
+  s_d5e94ebe2c49f9::t_ebb2b1fbc498f6 1-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "898b930fc4083c69649d0548ff626f456686fe46",
+  "prompts": {},
+  "sessions": {
+    "s_d5e94ebe2c49f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ec96d6b-a913-482b-bd80-1bef5edaca2b",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
