@@ -1,51 +1,55 @@
-# minisearch-wasm 0.10.0
+# minisearch-wasm 0.11.0
 
-This release adds a public compatibility facade for the documented MiniSearch
-7.2.0 API. Eligible plain documents and declarative searches use Rust/Wasm;
-callbacks, JavaScript value identity and dirty-index maintenance use bundled
-MiniSearch 7.2.0. `index.executionMode` reports the active engine.
+This release keeps more MiniSearch-compatible operations on the Rust/Wasm
+engine, fixes callback and asynchronous scheduling differences, and strengthens
+snapshot safety and release validation. The compatibility target is MiniSearch
+7.2.0; `index.executionMode` reports the engine in use.
 
 ## Changes
 
-- Support original callbacks, object IDs, live stored-field references, query
-  trees, wildcard searches, defaults and generic TypeScript types.
-- Add default-constructor, Node ESM/CommonJS, browser-global, module Worker and
-  `SearchableMap` imports. Existing callable default initialization still works.
-- Yield during chunked document conversion and upstream-compatible async JSON
-  loading; preserve active and queued vacuum Promise behavior.
-- Replace dynamic JavaScript function construction with static helpers for CSP
-  compatibility, and compact internal IDs after clean maintenance.
-- Preserve native version-4 snapshots and add a separate compatibility snapshot
-  envelope for JavaScript-mode indexes. Re-supply callbacks when loading.
+- Dirty queries reproduce MiniSearch's first-query scores and lazy cleanup in
+  Wasm. Vacuum, stored-field reads, JSON loading and supported search/extraction
+  callbacks also stay native instead of transferring the whole index.
+- Scores use V8's logarithm algorithm for exact parity with MiniSearch on V8.
+- Filters observe traversal order before sorting, including stateful callbacks
+  and score edits. Compact searches evaluate each query and callback once.
+- Native `loadJSONAsync` yields between document-map and posting batches.
+  `addAllAsync` uses MiniSearch's scheduler, including deferred short batches.
+- Removal uses posting tombstones instead of repeatedly shifting large lists.
+- Snapshot writers reject states they cannot reload; readers charge allocations
+  before reserving memory. Fuzzy-query limits avoid trapping the Wasm module.
+- Native vacuum preserves radix order and supports searches and mutations while
+  maintenance is running. Compact results handle repeated query terms correctly.
+- Deterministic packaging ships the current README and licenses, improves
+  CommonJS types and browser bundling, and gates publication on `npm test`.
 
-## Migration and performance
+## Compatibility and migration
 
-In Node, `import MiniSearch from 'minisearch-wasm'` initializes Wasm automatically.
-In browsers and module Workers, call `await MiniSearch.init()` before creating
-an index to use Wasm. The constructor also works without initialization in
-JavaScript mode.
+Existing default/named imports, initialization, MiniSearch JSON versions 1 and
+2, and native version-4 snapshots remain supported. No reindexing is required
+solely to upgrade from 0.10.0. Internal ID tables must still be refreshed after
+mutations or compaction when `idTableVersion` changes.
 
-Transfer to JavaScript is permanent for an instance. Callbacks, non-scalar values,
-`getStoredFields()`, dirty queries, vacuum and upstream JSON loading select that
-mode. Native `loadBytes()` retains the fast Wasm loading path. Compact extensions
-still require JSON-safe IDs and delimiter-safe terms.
+`tokenize`, `processTerm`, `boostDocument`, reference-valued documents and edits
+to returned stored-field objects still select the bundled JavaScript engine.
+Native async JSON loading batches reconstruction; parsing, initial allocation,
+per-list sorting and final validation remain synchronous.
 
-On the measured 20,000-document workload, full-result `search()` was **1.42x**
-faster than original MiniSearch; decoded joined/raw results were **4.48x/13.18x**
-faster and `autoSuggest()` **8.27x** faster. Compact APIs return fewer fields.
-The first callback or dirty query, including synchronous engine transfer, took
-**1.28-1.59 seconds**. Later queries run at roughly upstream JavaScript speed.
-These are workload-specific measurements, not universal speed guarantees.
-
-Read the [compatibility and migration guide](https://github.com/epoyraz/minisearch-wasm/blob/v0.10.0/COMPATIBILITY.md)
-and [paired benchmark report](https://github.com/epoyraz/minisearch-wasm/blob/v0.10.0/differential/results/2026-09-18-public-vs-original.md)
-for formats, limitations, reproduction commands and timing methodology.
+Read the [compatibility guide](https://github.com/epoyraz/minisearch-wasm/blob/v0.11.0/COMPATIBILITY.md)
+for remaining differences, engine selection and persistence limitations.
+Historical benchmark reports retain their original versions and environments;
+their timings are not new measurements of this final release artifact.
 
 ## Validation
 
-The release gate covers Rust formatting, strict Clippy and native tests; Wasm
-and public API parity; strict TypeScript; installation of the packed npm artifact;
-Unicode separator generation; and real Chrome ESM, global bundle, module Worker,
-async loading and CSP behavior.
+The release gate includes formatting, strict Clippy, native and release-mode
+snapshot tests, differential comparisons with MiniSearch, Wasm and facade
+regressions, TypeScript, packed-package checks, upstream tests, Unicode tables
+and package-size budgets. The upstream runner explicitly records expected
+failures for private implementation details and unsupported internals.
 
-Install with `npm install minisearch-wasm@0.10.0`.
+The browser contract separately checks ESM, SearchableMap, the global bundle,
+module Workers, native callbacks and incremental JSON loading under CSP that
+allows Wasm compilation without JavaScript string evaluation.
+
+Install with `npm install minisearch-wasm@0.11.0`.

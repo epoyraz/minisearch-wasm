@@ -9,8 +9,8 @@ scoring, and JavaScript values such as object ids, use a bundled, pinned
 MiniSearch implementation. Check `index.executionMode` to see which engine owns
 the index.
 
-Version **0.10.0** added the public compatibility facade. This repository is
-ahead of it: see [Unreleased changes](#unreleased-changes-after-0100) and
+Version **0.11.0** keeps more operations in Wasm and fixes callback and async
+compatibility. See [Changes in 0.11.0](#changes-in-0110) and
 [CHANGELOG.md](CHANGELOG.md).
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the API, import formats, engine
 selection and persistence limitations.
@@ -59,7 +59,7 @@ something only JavaScript can do:
   named like result properties (`score`, `terms`, …), `Infinity` in search
   options.
 
-`index.executionMode` reports `"wasm"` or `"javascript"`. In 0.10.0 on npm the
+`index.executionMode` reports `"wasm"` or `"javascript"`. In 0.10.0 the
 list is longer: there a `discard` or `replace` followed by a search, any vacuum,
 any search callback, `getStoredFields` and `loadJSON` also transfer.
 
@@ -94,11 +94,11 @@ The table above is 0.10.0, measured on Windows with Node 24. After a `discard`
 0.10.0 answers from the JavaScript engine for the lifetime of the instance.
 This repository keeps a dirty index in Wasm, reproducing MiniSearch's lazy
 cleanup query by query. The same 20,000 documents and queries with a quarter of
-the documents discarded and not yet vacuumed, on the unreleased tree (macOS,
+the documents discarded and not yet vacuumed, on a pre-release 0.11.0 tree (macOS,
 Intel i7-9750H, Node 26, medians of 5 paired rounds, `npm run bench:public`;
 [full report](differential/results/2026-09-19-unreleased-vs-original.md)):
 
-| Operation, dirty index | MiniSearch 7.2.0 | 0.10.0 (Windows) | unreleased (macOS) |
+| Operation, dirty index | MiniSearch 7.2.0 | 0.10.0 (Windows) | pre-release 0.11.0 (macOS) |
 | --- | --- | --- | --- |
 | `search()` | 1.0× (750 ms) | 1.2× | 1.6× |
 | `searchJoined`, decoded, vs `search()` | 1.0× (714 ms) | 1.05× | 5.2× |
@@ -256,9 +256,9 @@ const native = mini.toNativeJSONString();
 const reloaded = MiniSearchWasm.loadNativeJSON(native);
 ```
 
-## Unreleased changes (after 0.10.0)
+## Changes in 0.11.0
 
-Not on npm yet; [CHANGELOG.md](CHANGELOG.md) has the full list.
+[CHANGELOG.md](CHANGELOG.md) has the full list.
 
 - **Indexes stay in Wasm.** Discards and replaces, queries on a dirty index
   (the engine reproduces MiniSearch's lazy cleanup, first query included),
@@ -281,6 +281,9 @@ Not on npm yet; [CHANGELOG.md](CHANGELOG.md) has the full list.
   could differ afterwards), compact results score a repeated query term
   correctly, the declarative `filter` compares numbers by value, a zero `boost`
   means none, a mismatched `remove` no longer blocks `compact()`.
+- **Callback and async compatibility:** filters run before sorting; compact
+  searches evaluate callbacks once; native JSON loading yields while rebuilding
+  maps and postings; short async indexing batches are deferred.
 - **Package:** ships this README and `LICENSE.txt`; named types for TypeScript
   CommonJS consumers; declarations without the DOM library; MiniSearch is
   bundled, not a dependency; the Node entry survives bundlers; the global
@@ -376,9 +379,11 @@ modes and remaining limitations.
   `getStoredFields()` object select the pinned JavaScript engine. A transfer
   preserves radix traversal order. Dirty searches and vacuum stay native and
   perform the same lazy cleanup as MiniSearch, query by query.
-- **Asynchronous work:** `addAllAsync` converts documents within each chunk;
-  `loadJSONAsync` uses MiniSearch's yielding loader. Parsing the JSON string
-  itself is synchronous, as in MiniSearch.
+- **Asynchronous work:** `addAllAsync` uses MiniSearch's chunk scheduler and
+  converts documents within each deferred chunk. Native `loadJSONAsync` yields
+  between batches of document-map and posting reconstruction; JavaScript mode
+  uses MiniSearch's yielding loader. JSON parsing, native table allocation,
+  per-list sorting and final validation still run synchronously.
 - **Persistence:** `toJSON`/`loadJSON` use MiniSearch's format. Native version-4
   binary and JSON snapshots retain the fast native loading path. JavaScript
   indexes use a tagged compatibility envelope instead; callbacks must be
@@ -395,7 +400,7 @@ modes and remaining limitations.
 ## Benchmark results
 
 Measurements of the public package against MiniSearch, 0.8.0 and 0.9.0, and
-of the unreleased tree on a dirty index, are in
+of a pre-release 0.11.0 tree on a dirty index, are in
 [Migrating from MiniSearch](#migrating-from-minisearch) above. There are two
 ways of timing the compact APIs in this document: the first table times the
 calls alone, the paired runs (`npm run bench:public`) include decoding the
@@ -407,7 +412,7 @@ for 0.10.0 also measures the first query batch and that version's one-time
 transfer to JavaScript: full `search()` 1.42x faster, decoded `searchJoined`
 4.48x, decoded `searchRaw` 13.18x, and 1.28-1.59 seconds for the first callback
 or dirty query on 20,000 documents, after which 0.10.0 runs at MiniSearch's
-speed. The unreleased tree no longer transfers in those cases (see above).
+speed. Version 0.11.0 no longer transfers in those cases (see above).
 
 **Historical native measurements:** the numbers below predate the compatibility
 facade. They do not measure its transfer cost, bundled JavaScript size, JSON

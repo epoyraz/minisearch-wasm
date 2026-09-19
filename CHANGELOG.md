@@ -4,7 +4,7 @@ Notable changes to `minisearch-wasm`. Versions before 0.7.0 are summarized in
 `PORTING.md`. Release notes of the latest published version are in
 `RELEASE_NOTES.md`.
 
-## Unreleased
+## 0.11.0 - 2026-09-19
 
 ### Changed
 
@@ -33,6 +33,14 @@ Notable changes to `minisearch-wasm`. Versions before 0.7.0 are summarized in
 
 ### Fixed
 
+- Native `filter` callbacks run in traversal order before sorting, preserving
+  stateful predicates and score mutations without transferring the index.
+- Compact searches with stored fields named like result properties evaluate
+  queries and callbacks once; native compact searches with a row filter also
+  avoid evaluating per-term callbacks twice.
+- Native `loadJSONAsync` reconstructs document maps and postings in batches
+  with timer yields, instead of loading synchronously after one initial yield.
+- `addAllAsync` uses MiniSearch's scheduler, so short batches are deferred too.
 - The package ships the repository's README and `LICENSE.txt` (0.10.0 shipped
   the 0.9.0 README).
 - Snapshots: negative field averages and postings outside the dirt count load

@@ -1,5 +1,10 @@
 # MiniSearch WASM vs MiniSearch 7.2: second review
 
+Historical review of the published native API. Unreleased work after 0.9.0
+adds a public JavaScript compatibility facade; see `COMPATIBILITY.md` and the
+first section of `PORTING.md`. Callback rejection and copied stored values
+below describe the native core, not the current public facade.
+
 Review date: 16 September 2026, evening. Reviewed the current working tree of `minisearch-wasm` 0.9.0 (uncommitted on top of `d7b87fd`, 0.8.0) against MiniSearch 7.2.0 (`../minisearch`, also the pinned oracle in `differential/`).
 
 Since the morning review (`IMPROVEMENTS.md`) the four high-priority items were implemented as 0.9.0, a performance pass landed (expansion cache with posting handles, inline snapshot validation, faster varint decoding), and a parity pass aligned tie order, `terms`/`match` order, number formatting, UTF-16 lengths, the `has`/`replace`/`getStoredFields` API and MiniSearch JSON import/export with the JavaScript library. Ranking, result order and suggestions are now verified identical by `differential/compat_parity.mjs` (102,060 checks). This review looks at what still separates the port from the original: error handling, unsupported options, value handling, Unicode tables, the remaining API surface, types, Node loading, package size, the release gate and the compatibility path's speed. Items 1 to 7 and 10 were implemented later the same day; see the **Status** note under each. Items 8 and 9 remain open. Items 5 (memory bounding under churn) and 6 (synchronous work inside async maintenance) of the morning review remain open and are not repeated here.

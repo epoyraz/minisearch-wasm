@@ -1,12 +1,12 @@
 {
   "name": "minisearch-wasm-build",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "private": true,
   "description": "Build orchestration for the minisearch-wasm npm package (not published; the publishable artifact is pkg/).",
   "type": "module",
   "scripts": {
     "build": "wasm-pack build --target web --release --no-pack --out-dir target/wasm-glue && node scripts/finalize-pkg.mjs",
-    "test:wasm": "node differential/wasm_smoke.mjs && node differential/high_priority_regressions.mjs && node differential/compat_parity.mjs && node differential/api_parity.mjs && node differential/public_api.mjs && node differential/wasm_residency.mjs && node differential/core_robustness.mjs",
+    "test:wasm": "node differential/wasm_smoke.mjs && node differential/high_priority_regressions.mjs && node differential/compat_parity.mjs && node differential/api_parity.mjs && node differential/public_api.mjs && node differential/wasm_residency.mjs && node differential/core_robustness.mjs && node differential/facade_regressions.mjs",
     "bench:maintenance": "npm run build && node differential/bench_maintenance.mjs",
     "bench:public": "npm run build && node differential/gen_corpus.mjs differential/bench_corpus.json 20000 && node --expose-gc differential/bench_public.mjs",
     "publish:pkg": "npm run build && npm test && npm publish ./pkg",

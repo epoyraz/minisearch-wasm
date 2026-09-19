@@ -33,6 +33,16 @@ impl MiniSearch {
         per_call: &PartialSearchOptions,
         include_match: bool,
     ) -> CompatTransfer {
+        self.search_query_transfer_ordered_exact(query, per_call, include_match, true)
+    }
+
+    pub(crate) fn search_query_transfer_ordered_exact(
+        &mut self,
+        query: &Query,
+        per_call: &PartialSearchOptions,
+        include_match: bool,
+        sort_results: bool,
+    ) -> CompatTransfer {
         self.stale_hit.0.set(false);
         let raw_results = self.execute_query_tree(query, per_call);
         let raw_results = if self.take_stale_hit() {
@@ -41,7 +51,7 @@ impl MiniSearch {
         } else {
             raw_results
         };
-        self.transfer_from_raw(raw_results, query, per_call, include_match)
+        self.transfer_from_raw(raw_results, query, per_call, include_match, sort_results)
     }
 
     /// [`Self::search_query`] with JS MiniSearch's dirty-index behavior.

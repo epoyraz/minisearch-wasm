@@ -44,12 +44,167 @@ struct MiniSearchJson {
     serialization_version: u64,
 }
 
+// All partially rebuilt state is owned by the loader. A failed batch drops it;
+// no incomplete index escapes through either the synchronous or async API.
+pub(crate) struct MiniSearchJsonLoader {
+    index: MiniSearch,
+    documents: std::collections::hash_map::IntoIter<String, Value>,
+    lengths: std::collections::hash_map::IntoIter<String, Vec<Option<u32>>>,
+    stored: std::collections::hash_map::IntoIter<String, BTreeMap<String, Value>>,
+    terms: std::vec::IntoIter<(String, HashMap<String, Value>)>,
+    version: u64,
+    term: Option<(String, FieldTermData)>,
+    term_fields: std::collections::hash_map::IntoIter<String, Value>,
+    postings: Option<LoadingPostings>,
+}
+
+struct LoadingPostings {
+    field: FieldId,
+    entries: serde_json::map::IntoIter,
+    values: Vec<(ShortId, u32)>,
+}
+
+impl MiniSearchJsonLoader {
+    /// At most `budget` reconstruction steps. Posting entries count separately:
+    /// even an index with only one very common term yields within that term.
+    pub(crate) fn step(&mut self, budget: usize) -> Result<bool, String> {
+        for _ in 0..budget.max(1) {
+            if self.advance()? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn advance(&mut self) -> Result<bool, String> {
+        let index = &mut self.index;
+        let fields = index.options.fields.len();
+        if let Some((key, id)) = self.documents.next() {
+            let short = short_id(&key)?;
+            if short >= index.next_id || id.is_null() {
+                return Err(invalid("invalid document id entry"));
+            }
+            if index.id_to_short_id.insert(id_key(&id)?, short).is_some() {
+                return Err(invalid("duplicate document id"));
+            }
+            index.document_ids.insert(short, id);
+            index.alive[short as usize] = true;
+            return Ok(false);
+        }
+        if let Some((key, lengths)) = self.lengths.next() {
+            let short = short_id(&key)?;
+            if !index.alive.get(short as usize).copied().unwrap_or(false) || lengths.len() > fields
+            {
+                return Err(invalid(
+                    "fieldLength refers to an unknown document or field",
+                ));
+            }
+            for (field, length) in lengths.into_iter().enumerate() {
+                if let Some(length) = length {
+                    let slot = short as usize * fields + field;
+                    index.field_present[slot] = true;
+                    index.field_length[slot] = length;
+                }
+            }
+            return Ok(false);
+        }
+        if let Some((key, values)) = self.stored.next() {
+            let short = short_id(&key)?;
+            if !index.alive.get(short as usize).copied().unwrap_or(false) {
+                return Err(invalid("storedFields refers to an unknown document"));
+            }
+            if !values.is_empty() {
+                index.stored_fields.insert(short, values);
+            }
+            return Ok(false);
+        }
+        if let Some(postings) = &mut self.postings {
+            if let Some((doc_key, frequency)) = postings.entries.next() {
+                let doc = short_id(&doc_key)?;
+                let frequency = frequency
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| invalid("invalid term frequency"))?;
+                postings.values.push((doc, frequency));
+                return Ok(false);
+            }
+            let mut postings = self.postings.take().unwrap();
+            postings.values.sort_unstable_by_key(|(doc, _)| *doc);
+            if !self
+                .term
+                .as_mut()
+                .unwrap()
+                .1
+                .insert(postings.field, Postings(postings.values, 0))
+            {
+                return Err(invalid("duplicate field in index entry"));
+            }
+            return Ok(false);
+        }
+        if let Some((field_key, mut freqs)) = self.term_fields.next() {
+            let field: FieldId = field_key
+                .parse()
+                .map_err(|_| invalid("invalid field id in index entry"))?;
+            if field >= fields {
+                return Err(invalid("index entry refers to an unknown field"));
+            }
+            // Version 1 nested the frequencies inside a `ds` field.
+            if self.version == 1 {
+                freqs = freqs
+                    .as_object_mut()
+                    .and_then(|object| object.remove("ds"))
+                    .ok_or_else(|| invalid("version 1 index entry without ds"))?;
+            }
+            let Value::Object(object) = freqs else {
+                return Err(invalid("index entry frequencies must be an object"));
+            };
+            self.postings = Some(LoadingPostings {
+                field,
+                values: Vec::with_capacity(object.len()),
+                entries: object.into_iter(),
+            });
+            return Ok(false);
+        }
+        if let Some((term, data)) = self.term.take() {
+            if term.is_empty() || data.is_empty() {
+                return Err(invalid("empty index entry"));
+            }
+            index.index.set(&term, Rc::new(data));
+            return Ok(false);
+        }
+        if let Some((term, data)) = self.terms.next() {
+            self.term = Some((term, FieldTermData::default()));
+            self.term_fields = data.into_iter();
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn finish(self) -> Result<MiniSearch, String> {
+        self.index.validate_snapshot()?;
+        Ok(self.index)
+    }
+}
+
 impl MiniSearch {
     /// Load an index serialized by JS MiniSearch with the options its instance
     /// was created with. Rejects versions other than 1 and 2 with MiniSearch's
     /// own message, options whose `fields` differ from the serialized
     /// `fieldIds`, and any structurally inconsistent state.
     pub fn from_minisearch_json(json: &str, options: MiniSearchOptions) -> Result<Self, String> {
+        let mut loader = Self::start_minisearch_json(json, options)?;
+        while !loader.step(1000)? {}
+        loader.finish()
+    }
+
+    /// Parse once, then reconstruct the same validated index in bounded batches.
+    /// The Wasm async entry yields between batches; the synchronous loader uses
+    /// the identical steps without scheduling them.
+    pub(crate) fn start_minisearch_json(
+        json: &str,
+        options: MiniSearchOptions,
+    ) -> Result<MiniSearchJsonLoader, String> {
         if json.len() > MAX_INTEROP_BYTES {
             return Err(invalid("input exceeds byte limit"));
         }
@@ -77,35 +232,6 @@ impl MiniSearch {
         index.field_present = vec![false; slots];
         index.alive = vec![false; js.next_id as usize];
 
-        for (key, id) in js.document_ids {
-            let short = short_id(&key)?;
-            if short >= js.next_id || id.is_null() {
-                return Err(invalid("invalid document id entry"));
-            }
-            if index.id_to_short_id.insert(id_key(&id)?, short).is_some() {
-                return Err(invalid("duplicate document id"));
-            }
-            index.document_ids.insert(short, id);
-            index.alive[short as usize] = true;
-        }
-
-        for (key, lengths) in js.field_length {
-            let short = short_id(&key)?;
-            if !index.alive.get(short as usize).copied().unwrap_or(false) || lengths.len() > fields
-            {
-                return Err(invalid(
-                    "fieldLength refers to an unknown document or field",
-                ));
-            }
-            for (field, length) in lengths.into_iter().enumerate() {
-                if let Some(length) = length {
-                    let slot = short as usize * fields + field;
-                    index.field_present[slot] = true;
-                    index.field_length[slot] = length;
-                }
-            }
-        }
-
         if js.average_field_length.len() > fields {
             return Err(invalid("averageFieldLength has more entries than fields"));
         }
@@ -117,63 +243,17 @@ impl MiniSearch {
             index.average_field_length[field] = average;
         }
 
-        for (key, values) in js.stored_fields {
-            let short = short_id(&key)?;
-            if !index.alive.get(short as usize).copied().unwrap_or(false) {
-                return Err(invalid("storedFields refers to an unknown document"));
-            }
-            if !values.is_empty() {
-                index.stored_fields.insert(short, values);
-            }
-        }
-
-        for (term, data) in js.index {
-            let mut term_data = FieldTermData::default();
-            for (field_key, freqs) in &data {
-                let field: FieldId = field_key
-                    .parse()
-                    .map_err(|_| invalid("invalid field id in index entry"))?;
-                if field >= fields {
-                    return Err(invalid("index entry refers to an unknown field"));
-                }
-                // Version 1 nested the frequencies inside a `ds` field.
-                let freqs = if js.serialization_version == 1 {
-                    freqs
-                        .get("ds")
-                        .ok_or_else(|| invalid("version 1 index entry without ds"))?
-                } else {
-                    freqs
-                };
-                let object = freqs
-                    .as_object()
-                    .ok_or_else(|| invalid("index entry frequencies must be an object"))?;
-                let mut postings: Vec<(ShortId, u32)> = Vec::with_capacity(object.len());
-                for (doc_key, frequency) in object {
-                    let doc = short_id(doc_key)?;
-                    let frequency = frequency
-                        .as_u64()
-                        .and_then(|value| u32::try_from(value).ok())
-                        .filter(|value| *value > 0)
-                        .ok_or_else(|| invalid("invalid term frequency"))?;
-                    postings.push((doc, frequency));
-                }
-                postings.sort_unstable_by_key(|(doc, _)| *doc);
-                let mut list = Postings::default();
-                for (doc, frequency) in postings {
-                    list.push_sorted(doc, frequency);
-                }
-                if !term_data.insert(field, list) {
-                    return Err(invalid("duplicate field in index entry"));
-                }
-            }
-            if term.is_empty() || term_data.is_empty() {
-                return Err(invalid("empty index entry"));
-            }
-            index.index.set(&term, Rc::new(term_data));
-        }
-
-        index.validate_snapshot()?;
-        Ok(index)
+        Ok(MiniSearchJsonLoader {
+            index,
+            documents: js.document_ids.into_iter(),
+            lengths: js.field_length.into_iter(),
+            stored: js.stored_fields.into_iter(),
+            terms: js.index.into_iter(),
+            version: js.serialization_version,
+            term: None,
+            term_fields: HashMap::new().into_iter(),
+            postings: None,
+        })
     }
 
     /// Serialize in JS MiniSearch's `toJSON()` shape (serialization version 2).

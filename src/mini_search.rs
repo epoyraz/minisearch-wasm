@@ -1926,8 +1926,18 @@ impl MiniSearch {
         per_call: &PartialSearchOptions,
         include_match: bool,
     ) -> CompatTransfer {
+        self.search_query_transfer_ordered(query, per_call, include_match, true)
+    }
+
+    pub(crate) fn search_query_transfer_ordered(
+        &self,
+        query: &Query,
+        per_call: &PartialSearchOptions,
+        include_match: bool,
+        sort_results: bool,
+    ) -> CompatTransfer {
         let raw_results = self.execute_query_tree(query, per_call);
-        self.transfer_from_raw(raw_results, query, per_call, include_match)
+        self.transfer_from_raw(raw_results, query, per_call, include_match, sort_results)
     }
 
     fn transfer_from_raw(
@@ -1936,10 +1946,11 @@ impl MiniSearch {
         query: &Query,
         per_call: &PartialSearchOptions,
         include_match: bool,
+        sort_results: bool,
     ) -> CompatTransfer {
         use std::fmt::Write;
 
-        let sort_by_score = !matches!(query, Query::Wildcard);
+        let sort_by_score = sort_results && !matches!(query, Query::Wildcard);
         let filter = apply_partial_options(&self.options.search_options, per_call).filter;
         let ranked = self.ranked_raw_results(raw_results, sort_by_score, filter.as_ref());
 

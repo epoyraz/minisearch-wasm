@@ -11,8 +11,10 @@ async function basic() {
   assert(index.executionMode === 'wasm', 'native execution');
   assert(index.search('apple')[0].id === 1, 'native result builder under CSP');
   assert(index.searchRaw('pear').scores instanceof Float64Array, 'raw results');
-  index.search('apple', { filter: row => row.id === 1 });
-  assert(index.executionMode === 'javascript', 'callback promotion');
+  assert(index.search('apple', { filter: row => row.id === 1 })[0].id === 1, 'filter result');
+  assert(index.executionMode === 'wasm', 'filter stays native');
+  index.search('apple', { boostDocument: () => 1 });
+  assert(index.executionMode === 'javascript', 'scoring callback promotion');
   index.free();
 }
 
@@ -33,9 +35,12 @@ if (typeof document === 'undefined') {
     globalIndex.free();
     const large = new MiniSearch({ fields: ['text'] });
     large.addAll(Array.from({ length: 2500 }, (_, id) => ({ id, text: 'word' + id })));
-    let tick = false; setTimeout(() => { tick = true; }, 0);
-    const loaded = await MiniSearch.loadJSONAsync(JSON.stringify(large), { fields: ['text'] });
-    assert(tick && loaded.documentCount === 2500, 'async loader yields to browser');
+    let ticks = 0;
+    const timer = setInterval(() => { ticks++; }, 0);
+    let loaded;
+    try { loaded = await MiniSearch.loadJSONAsync(JSON.stringify(large), { fields: ['text'] }); }
+    finally { clearInterval(timer); }
+    assert(ticks >= 3 && loaded.documentCount === 2500 && loaded.executionMode === 'wasm', 'native async loader yields repeatedly to browser');
     large.free(); loaded.free();
     await new Promise((resolve, reject) => {
       const worker = new Worker(new URL('./browser_contract.mjs', import.meta.url), { type: 'module' });

@@ -411,29 +411,18 @@ impl MiniSearchWasm {
         #[wasm_bindgen(unchecked_param_type = "Query")] query: JsValue,
         #[wasm_bindgen(unchecked_param_type = "SearchOptions")] options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
-        let options = options.unwrap_or(JsValue::UNDEFINED);
-        // Optional `includeMatch` (default true, for MiniSearch compatibility):
-        // callers that never read the per-hit `match` map can set it false to
-        // skip building it. Read straight off the options object so neither the
-        // engine's option set nor the binary snapshot format is affected.
-        let include_match = read_bool_option(&options, "includeMatch", true);
-        let per_call = parse_search_options(&options)?;
-        let query = parse_query(&query)?;
+        self.search_results(query, options, true)
+    }
 
-        // The engine hands over ids, scores and interned term/field tables;
-        // the MiniSearch-shaped objects are built by one JavaScript function,
-        // where object literals are cheap, instead of one boundary call per
-        // property per hit.
-        let transfer = if self.exact_dirty() {
-            self.inner
-                .borrow_mut()
-                .search_query_transfer_exact(&query, &per_call, include_match)
-        } else {
-            self.inner
-                .borrow()
-                .search_query_transfer(&query, &per_call, include_match)
-        };
-        build_results(&transfer, include_match)
+    /// Internal facade boundary: rows in raw traversal order, so JavaScript
+    /// callbacks can filter and mutate them before the facade sorts them.
+    #[wasm_bindgen(js_name = searchUnsorted, skip_typescript)]
+    pub fn search_unsorted_js(
+        &self,
+        query: JsValue,
+        options: Option<JsValue>,
+    ) -> Result<JsValue, JsValue> {
+        self.search_results(query, options, false)
     }
 
     /// App-facing fast search and the recommended path for embedding apps. Only
@@ -769,16 +758,26 @@ impl MiniSearchWasm {
         Self::load_minisearch_json_js(json, options)
     }
 
-    /// `MiniSearch.loadJSONAsync(json, options)`: `loadJSON` as a Promise.
+    /// Parse the JSON synchronously, then reconstruct maps and postings in
+    /// batches with timer yields, without exposing a partially loaded index.
     #[wasm_bindgen(js_name = loadJSONAsync, unchecked_return_type = "Promise<MiniSearchWasm>")]
     pub fn load_json_async_js(
         #[wasm_bindgen(unchecked_param_type = "string")] json: JsValue,
         #[wasm_bindgen(unchecked_param_type = "MiniSearchWasmOptions")] options: JsValue,
     ) -> Promise {
-        match Self::load_minisearch_json_js(json, options) {
-            Ok(index) => Promise::resolve(&JsValue::from(index)),
-            Err(error) => Promise::reject(&error),
-        }
+        future_to_promise(async move {
+            let json = string_arg(&json, "the serialized index")?;
+            let (options, logger) = parse_constructor_options(&options)?;
+            let mut loader =
+                MiniSearch::start_minisearch_json(&json, options).map_err(|err| js_error(&err))?;
+            while !loader.step(1000).map_err(|err| js_error(&err))? {
+                yield_to_timer(0).await?;
+            }
+            let inner = loader.finish().map_err(|err| js_error(&err))?;
+            Ok(JsValue::from(
+                MiniSearchWasm::from_inner(inner).with_logger(logger),
+            ))
+        })
     }
 
     #[wasm_bindgen(js_name = loadBytes)]
@@ -820,6 +819,43 @@ impl MiniSearchWasm {
 }
 
 impl MiniSearchWasm {
+    fn search_results(
+        &self,
+        query: JsValue,
+        options: Option<JsValue>,
+        sort_results: bool,
+    ) -> Result<JsValue, JsValue> {
+        let options = options.unwrap_or(JsValue::UNDEFINED);
+        // Optional `includeMatch` (default true, for MiniSearch compatibility):
+        // callers that never read the per-hit `match` map can set it false to
+        // skip building it. Read straight off the options object so neither the
+        // engine's option set nor the binary snapshot format is affected.
+        let include_match = read_bool_option(&options, "includeMatch", true);
+        let per_call = parse_search_options(&options)?;
+        let query = parse_query(&query)?;
+
+        // The engine hands over ids, scores and interned term/field tables;
+        // the MiniSearch-shaped objects are built by one JavaScript function,
+        // where object literals are cheap, instead of one boundary call per
+        // property per hit.
+        let transfer = if self.exact_dirty() {
+            self.inner.borrow_mut().search_query_transfer_ordered_exact(
+                &query,
+                &per_call,
+                include_match,
+                sort_results,
+            )
+        } else {
+            self.inner.borrow().search_query_transfer_ordered(
+                &query,
+                &per_call,
+                include_match,
+                sort_results,
+            )
+        };
+        build_results(&transfer, include_match)
+    }
+
     fn from_inner(inner: MiniSearch) -> Self {
         Self {
             inner: Rc::new(RefCell::new(inner)),

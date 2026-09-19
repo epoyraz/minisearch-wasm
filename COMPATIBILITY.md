@@ -4,7 +4,7 @@ The public facade targets the documented MiniSearch **7.2.0** API. It uses the
 Rust/Wasm engine for everything that engine can reproduce exactly, and the
 bundled, exact-version JavaScript implementation for behavior that depends on
 JavaScript callbacks inside indexing or scoring, or on JavaScript values.
-Sections marked *unreleased* describe this repository after 0.10.0.
+Changes marked *since 0.11.0* distinguish this release from 0.10.0.
 
 ## Choosing an engine
 
@@ -16,12 +16,12 @@ Sections marked *unreleased* describe this repository after 0.10.0.
 | Constructor before browser initialization | JavaScript |
 | Plain documents with scalar, finite indexed/stored values and IDs | Remain in Wasm |
 | `add`, `remove`, `removeAll`, `discard`, `discardAll`, `replace` | Remain in Wasm |
-| Search or suggestions with discarded postings | Remain in Wasm; the engine reproduces MiniSearch's lazy cleanup, first query included (*unreleased*; 0.10.0 transfers) |
-| Manual or automatic vacuum, `compact()` | Remain in Wasm; the facade runs MiniSearch's scheduler over native vacuum steps (*unreleased*; 0.10.0 transfers) |
-| Search callbacks `filter`, `prefix`, `fuzzy`, `boostTerm`, in options, query-tree nodes or constructor defaults | Remain in Wasm; evaluated by the facade (*unreleased*; 0.10.0 transfers) |
-| Constructor callbacks `extractField`, `stringifyField`, `logger` | Remain in Wasm; evaluated by the facade, or called by the engine (*unreleased*) |
-| `getStoredFields(id)` | Remain in Wasm; one object per document. Editing a returned object transfers, keeping the edit (*unreleased*) |
-| `loadJSON` / `loadJSONAsync` | Wasm, through the native importer; what it refuses is loaded by MiniSearch's loader (*unreleased*) |
+| Search or suggestions with discarded postings | Remain in Wasm; the engine reproduces MiniSearch's lazy cleanup, first query included (*since 0.11.0*; 0.10.0 transfers) |
+| Manual or automatic vacuum, `compact()` | Remain in Wasm; the facade runs MiniSearch's scheduler over native vacuum steps (*since 0.11.0*; 0.10.0 transfers) |
+| Search callbacks `filter`, `prefix`, `fuzzy`, `boostTerm`, in options, query-tree nodes or constructor defaults | Remain in Wasm; evaluated by the facade (*since 0.11.0*; 0.10.0 transfers) |
+| Constructor callbacks `extractField`, `stringifyField`, `logger` | Remain in Wasm; evaluated by the facade, or called by the engine (*since 0.11.0*) |
+| `getStoredFields(id)` | Remain in Wasm; one object per document. Editing a returned object transfers, keeping the edit (*since 0.11.0*) |
+| `loadJSON` / `loadJSONAsync` | Wasm, through the native importer; the async loader reconstructs document maps and postings in batches with timer yields. What it refuses is loaded by MiniSearch's loader (*since 0.11.0*) |
 | Load a native version-4 snapshot | Wasm; legacy object IDs/stored values trigger a transfer |
 | Callbacks `tokenize`, `processTerm` (constructor or search) and `boostDocument` | JavaScript: they run inside tokenization or scoring |
 | Object IDs, Dates, arrays, getters, custom objects, nonfinite values, `-0`, strings with lone surrogates | Transfer before indexing, preserving JS values |
@@ -36,10 +36,6 @@ bundle size.
 
 Differences that remain, all in Wasm mode:
 
-- `filter` runs over the ranked rows, so it is called in rank order, not in
-  MiniSearch's internal order. The rows it keeps, and their order, are the same.
-- `loadJSONAsync` yields once and then loads synchronously (the native importer
-  does not yield between chunks).
 - `removeAll()` also resets `dirtCount`; MiniSearch keeps it.
 - After a vacuum that leaves no dirt the facade renumbers internal ids
   (`idTableVersion` changes); `toJSON()` then shows the new numbers.
@@ -48,7 +44,7 @@ Differences that remain, all in Wasm mode:
 
 Scores are the same bits as MiniSearch's, not approximations: the engine
 computes the inverse document frequency with the logarithm algorithm V8 uses
-(*unreleased*; up to 0.10.0 about 4% of scores on small indexes differed in the
+(*since 0.11.0*; up to 0.10.0 about 4% of scores on small indexes differed in the
 last bit).
 
 The public package has a [paired performance report](https://github.com/epoyraz/minisearch-wasm/blob/main/differential/results/2026-09-18-public-vs-original.md)
@@ -69,9 +65,14 @@ Every MiniSearch callback is supported: `extractField`, `stringifyField`,
 `boostDocument`, `boostTerm`, `prefix`, and `fuzzy`; the table above says which
 engine each one leaves an index on. Default functions
 returned by `getDefault` can be passed back as options. Object IDs use identity;
-stored objects and Dates retain their references. `loadJSONAsync` yields while
-rebuilding maps/index entries, following upstream; its initial `JSON.parse` is
-still synchronous. `addAllAsync` reads document properties within its chunks.
+stored objects and Dates retain their references. Native `filter` callbacks see
+rows in traversal order, before sorting, so stateful predicates and score edits
+behave like MiniSearch. `loadJSONAsync` yields while rebuilding document maps
+and postings, including within a common term's posting list. JSON parsing,
+initial table allocation, per-list sorting and final structural validation are
+still synchronous; it does not promise a fixed maximum pause. `addAllAsync`
+uses MiniSearch's chunk scheduler, including the deferred final short batch,
+and reads document properties within those chunks.
 
 `MiniSearch<T>`, `MiniSearchWasm<T>`, `Options<T>` and the original public option,
 query and result types are exported, for ESM and (through a merged namespace,

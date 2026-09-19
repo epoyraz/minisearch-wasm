@@ -9,7 +9,6 @@ import coreInit, { initSync as coreInitSync, MiniSearchWasm as Core } from './mi
 let initialized = false;
 export async function init(input) { const result = await coreInit(input); initialized = true; return result; }
 export function initSync(input) { const result = coreInitSync(input); initialized = true; return result; }
-const wait = () => new Promise(resolve => setTimeout(resolve, 0));
 const magic = new TextEncoder().encode('MSWJS01\n');
 const callbacks = ['extractField', 'stringifyField', 'tokenize', 'processTerm', 'logger', 'filter', 'boostDocument', 'boostTerm', 'prefix', 'fuzzy'];
 // A Wasm index keeps these search callbacks on this side of the boundary:
@@ -316,14 +315,11 @@ export class MiniSearchWasm {
     if (this._js || this._extracts || documents.some(document => needsValues(document, this._options))) return this.addAll(documents);
     return this._mutate(() => this._wasm.addAllJSON(json));
   }
-  async addAllAsync(documents, { chunkSize = 10 } = {}) {
+  addAllAsync(documents, options) {
     this._check();
-    const size = chunkSize > 0 ? Math.max(1, Math.floor(chunkSize)) : Math.max(1, documents.length);
-    for (let start = 0; start < documents.length; start += size) {
-      if (start + size <= documents.length) await wait();
-      const end = Math.min(start + size, documents.length);
-      for (let i = start; i < end; i++) this.add(documents[i]);
-    }
+    // The original schedules full chunks on timers and the final short chunk
+    // on its promise chain. Calling our addAll keeps eligible documents native.
+    return Original.prototype.addAllAsync.call(this, documents, options);
   }
   remove(document) {
     const [engine, plain] = this._prepare(document, false);
@@ -498,7 +494,10 @@ export class MiniSearchWasm {
     if (plan === unsupported) return unsupported;
     if (!plan.filter) return this._wasm.search(plan.query, plan.options);
     // The original filters finished result objects, `match` included.
-    const rows = this._wasm.search(plan.query, { ...plan.options, includeMatch: true }).filter(row => plan.filter(row));
+    const rows = this._wasm.searchUnsorted(plan.query, { ...plan.options, includeMatch: true }).filter(row => plan.filter(row));
+    // Filtering observes raw traversal order and may change scores. Sort only
+    // afterwards, retaining the original's top-level wildcard exception.
+    if (query !== Original.wildcard) rows.sort((a, b) => b.score - a.score);
     if (options.includeMatch === false) for (const row of rows) delete row.match;
     return rows;
   }
@@ -599,6 +598,9 @@ export class MiniSearchWasm {
   // the rows have to come from search(): callbacks over rows, other queries.
   _compactOptions(query, options) {
     if (this._js || typeof query !== 'string') return undefined;
+    // A row callback needs full results. Do not evaluate per-term callbacks
+    // speculatively here and then repeat them in search().
+    if (isFunction({ ...this._options.searchOptions, ...options }.filter)) return undefined;
     const plan = this._plan(query, options);
     return plan === unsupported || plan.filter ? undefined : plan.options;
   }
@@ -637,9 +639,8 @@ export class MiniSearchWasm {
   // of the same name take their place (it still decides the order, as it does
   // in search()).
   _identifiedRows(query, options) {
-    const rows = this.search(query, options);
     const shadowed = this._options.storeFields?.filter(name => shadowsResult(name, this._options.idField ?? 'id'));
-    if (!shadowed?.length || !this._js) return rows;
+    if (!shadowed?.length || !this._js) return this.search(query, options);
     const idField = this._options.idField ?? 'id', js = this._js;
     const given = searchOptions(options, idField), merged = { ...js._options.searchOptions, ...given };
     const results = [];
@@ -710,11 +711,10 @@ export class MiniSearchWasm {
   }
   static loadMiniSearchJSON(json, options) { return this.loadJSON(json, options); }
   static async loadJSONAsync(json, options) {
-    if (initialized && options != null && !needsJavaScript(options)) {
-      // The native loader is synchronous: yield once, then load.
-      await wait();
-      const native = this._loadJSONNative(json, options);
-      if (native) return native;
+    if (initialized && typeof json === 'string' && options != null && !needsJavaScript(options)) {
+      let core;
+      try { core = await Core.loadJSONAsync(json, coreOptions(options)); } catch { /* let the original loader decide */ }
+      if (core) return this._fromCore(core, options, true);
     }
     const js = await Original.loadJSONAsync(json, options == null ? options : originalOptions(options));
     return this._fromJS(js, options);

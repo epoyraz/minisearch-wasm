@@ -53,6 +53,7 @@ node differential/api_parity.mjs
 node differential/public_api.mjs
 node differential/wasm_residency.mjs
 node differential/core_robustness.mjs
+node differential/facade_regressions.mjs
 ```
 
 Or run `npm run test:wasm` from the repository root. The high-priority suite
@@ -77,6 +78,12 @@ callbacks, compact forms and suggestions, comparing every step with MiniSearch
 engine. `core_robustness.mjs` drives the raw core with hostile arguments,
 absurd fuzzy distances, snapshots of every state the engine reaches and a
 crafted snapshot that must not outgrow the decode budget.
+
+`facade_regressions.mjs` compares pre-sort stateful filters, single-evaluation
+compact callbacks, short-batch async scheduling and incremental native JSON
+loading with the original. It covers both JSON versions, dirty indexes, and a
+single common term with thousands of stale postings to require yields within
+the posting list.
 
 The public suite verifies all supported callbacks, JS object identity and stored
 references, first dirty-query scores and lazy cleanup, mixed mutation histories,

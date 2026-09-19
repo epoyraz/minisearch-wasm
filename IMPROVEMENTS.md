@@ -70,6 +70,8 @@ The passing bulk suite and failing edge cases are compatible: the generator curr
 
 5. **Bound retained memory under document churn and diverse queries. Priority: medium. Confirmed growth pattern; capacity recommendation.**
 
+   **Status (unreleased after 0.9.0):** Clean native `compact()` remaps dense IDs/field tables and releases scratch allocations; the public facade compacts after clean JavaScript vacuum completion. Generations invalidate cached ID tables, and ten rounds of 1,000-document churn are covered. A retained-byte budget and incremental eviction for expansion caches remain open. See `COMPATIBILITY.md` for engine selection and memory limits.
+
    **Evidence:** [Internal IDs only increase](src/mini_search.rs#L2321), field lengths are dense by internal ID, and [query scratch space](src/mini_search.rs#L165) grows to `next_id`. Vacuum removes postings but does not compact these structures. After ten add/discard/vacuum cycles of 1,000 documents, adding one live document left `documentCount = 1`, `dirtCount = 0`, but `next_id`, field-length slots, and ID-table rows all at `10001`.
 
    The thread-local scratch vectors retain their largest allocation independently of an individual index's lifetime. Separately, the [expansion cache](src/mini_search.rs#L699) caps the number of query keys at 4,096 per map, but each key can retain a large list of owned term strings; its actual memory cost has no byte budget.
