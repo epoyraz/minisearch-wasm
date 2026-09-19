@@ -144,6 +144,7 @@ impl<T> SearchableMap<T> {
     {
         let query_units: Vec<u16> = query.encode_utf16().collect();
         let m = query_units.len();
+        let max_distance = self.useful_distance(m, max_distance);
 
         // Bit-parallel (Myers) path for queries up to 64 units — the common case
         // for search terms. The DP column is carried as two bit vectors (vp/vn)
@@ -173,15 +174,9 @@ impl<T> SearchableMap<T> {
 
         // Fallback for empty or >64-char queries: banded DP matrix.
         let columns = m + 1;
-        let rows = columns + max_distance;
-        let sentinel = (max_distance + 1).min(u16::MAX as usize) as u16;
-        let mut matrix = vec![sentinel; rows * columns];
-        for (j, cell) in matrix.iter_mut().enumerate().take(columns) {
-            *cell = j as u16;
-        }
-        for i in 1..rows {
-            matrix[i * columns] = i as u16;
-        }
+        let Some(mut matrix) = fuzzy_matrix(columns, max_distance) else {
+            return;
+        };
         let mut key = String::new();
         fuzzy_visit(
             &self.root,
@@ -195,6 +190,19 @@ impl<T> SearchableMap<T> {
         );
     }
 
+    /// `max_distance`, lowered to the largest value that can still change the
+    /// result. Two strings are never further apart than the longer one is
+    /// long, so beyond that every key matches anyway. The longest key is only
+    /// looked up for a distance far outside what a search asks for; without the
+    /// bound such a distance would size the fallback matrix.
+    fn useful_distance(&self, query_units: usize, max_distance: usize) -> usize {
+        const ORDINARY: usize = 64;
+        if max_distance <= query_units.saturating_add(ORDINARY) {
+            return max_distance;
+        }
+        max_distance.min(query_units.max(longest_key_units(&self.root)))
+    }
+
     /// All (key, &value) entries sorted by key. Used by the compact serializer:
     /// sorting clusters shared term prefixes so front-coding + brotli are
     /// effective. Borrows values (no clone of the postings).
@@ -204,6 +212,38 @@ impl<T> SearchableMap<T> {
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         entries
     }
+}
+
+/// Length in UTF-16 units of the longest key below `node`.
+fn longest_key_units<T>(node: &RadixNode<T>) -> usize {
+    node.children
+        .iter()
+        .map(|(edge, child)| edge.encode_utf16().count() + longest_key_units(child))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The banded edit-distance matrix for a query of `columns - 1` units, or
+/// `None` when it would be unreasonably large: an absurdly long query term then
+/// finds no fuzzy matches instead of aborting the process.
+fn fuzzy_matrix(columns: usize, max_distance: usize) -> Option<Vec<u16>> {
+    // 128 MB of cells: a query term of several thousand characters.
+    const MAX_CELLS: usize = 1 << 26;
+    let rows = columns.checked_add(max_distance)?;
+    let cells = rows
+        .checked_mul(columns)
+        .filter(|cells| *cells <= MAX_CELLS)?;
+    let sentinel = max_distance.saturating_add(1).min(u16::MAX as usize) as u16;
+    let mut matrix = Vec::new();
+    matrix.try_reserve_exact(cells).ok()?;
+    matrix.resize(cells, sentinel);
+    for (j, cell) in matrix.iter_mut().enumerate().take(columns) {
+        *cell = j as u16;
+    }
+    for i in 1..rows {
+        matrix[i * columns] = i as u16;
+    }
+    Some(matrix)
 }
 
 fn collect_entries_ref<'a, T>(
@@ -246,19 +286,12 @@ impl<T: Clone> SearchableMap<T> {
     pub fn fuzzy_get(&self, query: &str, max_distance: usize) -> Vec<FuzzyMatch<T>> {
         let query_units: Vec<u16> = query.encode_utf16().collect();
         let columns = query_units.len() + 1;
-        let rows = columns + max_distance;
-        let sentinel = (max_distance + 1).min(u16::MAX as usize) as u16;
-        let mut matrix = vec![sentinel; rows * columns];
-
-        for (j, cell) in matrix.iter_mut().enumerate().take(columns) {
-            *cell = j as u16;
-        }
-
-        for i in 1..rows {
-            matrix[i * columns] = i as u16;
-        }
-
+        let max_distance = self.useful_distance(query_units.len(), max_distance);
         let mut results = Vec::new();
+        let Some(mut matrix) = fuzzy_matrix(columns, max_distance) else {
+            return results;
+        };
+
         fuzzy_recurse(
             &self.root,
             &query_units,

@@ -16,7 +16,9 @@ rustc-hash = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 # `float_roundtrip`: parse decimals from JSON text with correct rounding, like
 # JS `JSON.parse`, so field values and ids stringify identically to JS.
-serde_json = { version = "1", features = ["float_roundtrip"] }
+# `unbounded_depth`: the JSON snapshot reader bounds nesting itself, to the
+# radix depth the binary format allows (see `MAX_JSON_NESTING`).
+serde_json = { version = "1", features = ["float_roundtrip", "unbounded_depth"] }
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

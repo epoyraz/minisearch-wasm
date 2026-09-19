@@ -1,7 +1,9 @@
+mod js_math;
 mod mini_search;
 mod searchable_map;
 mod separators;
 
+pub use js_math::log as js_log;
 pub use mini_search::{
     AutoSuggestOptions, AutoVacuumOptions, AutoVacuumSetting, Bm25Params, CombineWith,
     CompactSearchResult, CompatTransfer, FuzzySetting, JoinedSearchResults, MatchInfo, MiniSearch,
@@ -15,7 +17,7 @@ pub use separators::UNICODE_VERSION;
 use js_sys::{Array, Float64Array, Function, Object, Promise, Reflect, Uint32Array};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::{future_to_promise, JsFuture};
@@ -27,7 +29,11 @@ const WILDCARD_KEY: &str = "minisearch-wasm.wildcard";
 #[derive(Default)]
 struct VacuumRuntime {
     active: bool,
-    rerun: bool,
+    /// A vacuum requested while one is running: the options of the first such
+    /// request, and whether every request so far was automatic. Like JS
+    /// MiniSearch's queued vacuum, it then runs only if the auto-vacuum
+    /// conditions still hold; one manual request makes it unconditional.
+    rerun: Option<(mini_search::ResolvedVacuumOptions, bool)>,
     current: Option<Promise>,
 }
 
@@ -44,6 +50,10 @@ pub struct MiniSearchWasm {
     vacuum_runtime: Rc<RefCell<VacuumRuntime>>,
     /// MiniSearch's `logger` option; `None` uses `console[level]` like JS.
     logger: Option<Function>,
+    /// Answer queries on a dirty index exactly like JS MiniSearch, including
+    /// its lazy removal of stale postings. Off by default: the queries of a
+    /// bare core instance never mutate the index.
+    exact_dirty_queries: Cell<bool>,
 }
 
 #[wasm_bindgen]
@@ -60,7 +70,11 @@ impl MiniSearchWasm {
     /// constructor option. The callback defaults are returned as JavaScript
     /// functions equivalent to the built-in behavior.
     #[wasm_bindgen(js_name = getDefault, unchecked_return_type = "unknown")]
-    pub fn get_default_js(option_name: &str) -> Result<JsValue, JsValue> {
+    pub fn get_default_js(
+        #[wasm_bindgen(unchecked_param_type = "string")] option_name: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let option_name = string_arg(&option_name, "the option name")?;
+        let option_name = option_name.as_str();
         Ok(match option_name {
             "idField" => JsValue::from_str("id"),
             "fields" | "searchOptions" | "autoSuggestOptions" => JsValue::UNDEFINED,
@@ -148,7 +162,11 @@ impl MiniSearchWasm {
     }
 
     #[wasm_bindgen(js_name = addAllJSON)]
-    pub fn add_all_json_js(&self, documents: &str) -> Result<(), JsValue> {
+    pub fn add_all_json_js(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "string")] documents: JsValue,
+    ) -> Result<(), JsValue> {
+        let documents = &string_arg(&documents, "the documents JSON")?;
         let documents: Vec<Value> = serde_json::from_str(documents).map_err(boundary_error)?;
 
         self.inner
@@ -287,6 +305,7 @@ impl MiniSearchWasm {
             Rc::clone(&self.inner),
             Rc::clone(&self.vacuum_runtime),
             options.resolved(),
+            false,
         ))
     }
 
@@ -314,6 +333,31 @@ impl MiniSearchWasm {
         let setting = serde_wasm_bindgen::from_value(setting).map_err(boundary_error)?;
         self.inner.borrow_mut().set_auto_vacuum(setting);
         Ok(())
+    }
+
+    /// Facade switch: answer queries on a dirty index exactly like JS
+    /// MiniSearch, which removes stale postings as a query meets them.
+    #[wasm_bindgen(js_name = setExactDirtyQueries)]
+    pub fn set_exact_dirty_queries_js(&self, enabled: bool) {
+        self.exact_dirty_queries.set(enabled);
+    }
+
+    /// One synchronous slice of a vacuum run, for a JS scheduler that owns the
+    /// timers and Promises: cleans at most `max_terms` terms, starting a run
+    /// when none is active. Returns `true` once the run is complete.
+    #[wasm_bindgen(js_name = vacuumStep)]
+    pub fn vacuum_step_js(&self, max_terms: u32) -> bool {
+        self.inner.borrow_mut().vacuum_step(max_terms as usize)
+    }
+
+    /// The processed terms of a query string, as `search` derives them. Lets
+    /// the facade evaluate per-term callbacks with the engine's tokenization.
+    #[wasm_bindgen(js_name = queryTerms)]
+    pub fn query_terms_js(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
+    ) -> Result<Vec<String>, JsValue> {
+        Ok(self.inner.borrow().query_terms(&query_arg(&query)?))
     }
 
     /// Internal facade metadata, without serializing the entire index on load.
@@ -380,10 +424,15 @@ impl MiniSearchWasm {
         // the MiniSearch-shaped objects are built by one JavaScript function,
         // where object literals are cheap, instead of one boundary call per
         // property per hit.
-        let transfer = self
-            .inner
-            .borrow()
-            .search_query_transfer(&query, &per_call, include_match);
+        let transfer = if self.exact_dirty() {
+            self.inner
+                .borrow_mut()
+                .search_query_transfer_exact(&query, &per_call, include_match)
+        } else {
+            self.inner
+                .borrow()
+                .search_query_transfer(&query, &per_call, include_match)
+        };
         build_results(&transfer, include_match)
     }
 
@@ -400,8 +449,21 @@ impl MiniSearchWasm {
     /// where each `terms` row is space-joined. Returns identical rankings to
     /// `search()` (same ids, same BM25 scores).
     #[wasm_bindgen(js_name = searchJoined, unchecked_return_type = "JoinedResults")]
-    pub fn search_joined_js(&self, query: &str, or_mode: bool) -> JsValue {
-        joined_to_js(&self.inner.borrow().search_joined_default(query, or_mode))
+    pub fn search_joined_js(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
+        or_mode: bool,
+    ) -> Result<JsValue, JsValue> {
+        let query = &query_arg(&query)?;
+        if self.exact_dirty() {
+            let mut inner = self.inner.borrow_mut();
+            return Ok(joined_to_js(
+                &inner.search_joined_default_exact(query, or_mode),
+            ));
+        }
+        Ok(joined_to_js(
+            &self.inner.borrow().search_joined_default(query, or_mode),
+        ))
     }
 
     /// `searchJoined` with per-call option overrides (partial, like `search`):
@@ -410,11 +472,18 @@ impl MiniSearchWasm {
     #[wasm_bindgen(js_name = searchJoinedOpts, skip_typescript)]
     pub fn search_joined_opts_js(
         &self,
-        query: &str,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
         #[wasm_bindgen(unchecked_param_type = "SearchOptions")] options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
+        let query = &query_arg(&query)?;
         let per_call = parse_search_options(&options.unwrap_or(JsValue::UNDEFINED))?;
 
+        if self.exact_dirty() {
+            let mut inner = self.inner.borrow_mut();
+            return Ok(joined_to_js(
+                &inner.search_joined_opts_exact(query, &per_call),
+            ));
+        }
         Ok(joined_to_js(
             &self.inner.borrow().search_joined_opts(query, &per_call),
         ))
@@ -431,12 +500,17 @@ impl MiniSearchWasm {
     #[wasm_bindgen(js_name = searchRaw, skip_typescript)]
     pub fn search_raw_js(
         &self,
-        query: &str,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
         #[wasm_bindgen(unchecked_param_type = "SearchOptions")] options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
+        let query = &query_arg(&query)?;
         let per_call = parse_search_options(&options.unwrap_or(JsValue::UNDEFINED))?;
 
-        let raw = self.inner.borrow().search_raw(query, &per_call);
+        let raw = if self.exact_dirty() {
+            self.inner.borrow_mut().search_raw_exact(query, &per_call)
+        } else {
+            self.inner.borrow().search_raw(query, &per_call)
+        };
 
         let doc_ids = js_sys::Uint32Array::new_with_length(raw.doc_ids.len() as u32);
         doc_ids.copy_from(&raw.doc_ids);
@@ -494,9 +568,10 @@ impl MiniSearchWasm {
     #[wasm_bindgen(js_name = autoSuggest, skip_typescript)]
     pub fn auto_suggest_js(
         &self,
-        query: &str,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
         #[wasm_bindgen(unchecked_param_type = "SearchOptions")] options: Option<JsValue>,
     ) -> Result<JsValue, JsValue> {
+        let query = &query_arg(&query)?;
         let options = options.unwrap_or(JsValue::UNDEFINED);
         let per_call: Option<AutoSuggestOptions> = if options.is_null() || options.is_undefined() {
             None
@@ -505,7 +580,13 @@ impl MiniSearchWasm {
             Some(serde_wasm_bindgen::from_value(options).map_err(boundary_error)?)
         };
 
-        let suggestions = self.inner.borrow().auto_suggest(query, per_call.as_ref());
+        let suggestions = if self.exact_dirty() {
+            self.inner
+                .borrow_mut()
+                .auto_suggest_exact(query, per_call.as_ref())
+        } else {
+            self.inner.borrow().auto_suggest(query, per_call.as_ref())
+        };
 
         let suggestion_key = JsValue::from_str("suggestion");
         let terms_key = JsValue::from_str("terms");
@@ -537,8 +618,16 @@ impl MiniSearchWasm {
     /// terms), so no per-suggestion JS objects or term arrays cross the
     /// boundary.
     #[wasm_bindgen(js_name = autoSuggestJoined, unchecked_return_type = "JoinedSuggestions")]
-    pub fn auto_suggest_joined_js(&self, query: &str) -> JsValue {
-        let entries = self.inner.borrow().auto_suggest(query, None);
+    pub fn auto_suggest_joined_js(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let query = &query_arg(&query)?;
+        let entries = if self.exact_dirty() {
+            self.inner.borrow_mut().auto_suggest_exact(query, None)
+        } else {
+            self.inner.borrow().auto_suggest(query, None)
+        };
 
         let scores = Float64Array::new_with_length(entries.len() as u32);
         let mut suggestions = String::new();
@@ -562,26 +651,49 @@ impl MiniSearchWasm {
             &JsValue::from_str(&suggestions),
         );
         let _ = Reflect::set(&object, &JsValue::from_str("scores"), &scores);
-        object.into()
+        Ok(object.into())
     }
 
     /// Profiling probe: runs the search but returns only the hit count, so
     /// result materialization/serialization is excluded. Lets the benchmark show
     /// pure engine compute cost separately from the boundary cost.
     #[wasm_bindgen(js_name = searchCountDefault)]
-    pub fn search_count_default_js(&self, query: &str, or_mode: bool) -> f64 {
-        self.inner
+    pub fn search_count_default_js(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
+        or_mode: bool,
+    ) -> Result<f64, JsValue> {
+        let query = &query_arg(&query)?;
+        if self.exact_dirty() {
+            let mut inner = self.inner.borrow_mut();
+            return Ok(inner
+                .search_joined_default_exact(query, or_mode)
+                .scores
+                .len() as f64);
+        }
+        Ok(self
+            .inner
             .borrow()
             .search_packed_default(query, or_mode)
             .ids
-            .len() as f64
+            .len() as f64)
     }
 
     /// Diagnostic probe: hit count for a query with prefix/fuzzy toggled, to
     /// profile where search time goes.
     #[wasm_bindgen(js_name = searchCountOpts)]
-    pub fn search_count_opts_js(&self, query: &str, prefix: bool, fuzzy: bool) -> f64 {
-        self.inner.borrow().search_count_opts(query, prefix, fuzzy) as f64
+    pub fn search_count_opts_js(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "string")] query: JsValue,
+        prefix: bool,
+        fuzzy: bool,
+    ) -> Result<f64, JsValue> {
+        let query = &query_arg(&query)?;
+        if self.exact_dirty() {
+            let mut inner = self.inner.borrow_mut();
+            return Ok(inner.search_count_opts_exact(query, prefix, fuzzy) as f64);
+        }
+        Ok(self.inner.borrow().search_count_opts(query, prefix, fuzzy) as f64)
     }
 
     /// `toJSON()` like the JavaScript library: the plain object that
@@ -612,12 +724,22 @@ impl MiniSearchWasm {
     /// `toJSON()` for that.
     #[wasm_bindgen(js_name = toNativeJSON, unchecked_return_type = "object")]
     pub fn to_native_json_js(&self) -> Result<JsValue, JsValue> {
-        to_json_compatible_value(&*self.inner.borrow()).map_err(|err| js_error(&err))
+        let inner = self.inner.borrow();
+        inner.check_persistable().map_err(|err| js_error(&err))?;
+        to_json_compatible_value(&*inner).map_err(|err| js_error(&err))
+    }
+
+    /// The radix tree alone, in the native snapshot's node shape and whatever
+    /// its depth: what the facade needs to rebuild the index in JavaScript with
+    /// the same key order.
+    #[wasm_bindgen(js_name = indexTree, unchecked_return_type = "object")]
+    pub fn index_tree_js(&self) -> Result<JsValue, JsValue> {
+        to_json_compatible_value(self.inner.borrow().index_root()).map_err(|err| js_error(&err))
     }
 
     #[wasm_bindgen(js_name = toNativeJSONString)]
     pub fn to_native_json_string_js(&self) -> Result<String, JsValue> {
-        serde_json::to_string(&*self.inner.borrow()).map_err(boundary_error)
+        self.inner.borrow().to_json().map_err(|err| js_error(&err))
     }
 
     #[wasm_bindgen(js_name = toBytes)]
@@ -627,8 +749,11 @@ impl MiniSearchWasm {
 
     /// Load the engine's own JSON snapshot (see `toNativeJSON`).
     #[wasm_bindgen(js_name = loadNativeJSON)]
-    pub fn load_native_json_js(serialized: &str) -> Result<MiniSearchWasm, JsValue> {
-        let inner = MiniSearch::from_json(serialized).map_err(|err| js_error(&err))?;
+    pub fn load_native_json_js(
+        #[wasm_bindgen(unchecked_param_type = "string")] serialized: JsValue,
+    ) -> Result<MiniSearchWasm, JsValue> {
+        let serialized = string_arg(&serialized, "the snapshot")?;
+        let inner = MiniSearch::from_json(&serialized).map_err(|err| js_error(&err))?;
 
         Ok(MiniSearchWasm::from_inner(inner))
     }
@@ -638,7 +763,7 @@ impl MiniSearchWasm {
     /// options the index was created with.
     #[wasm_bindgen(js_name = loadJSON)]
     pub fn load_json_js(
-        json: &str,
+        #[wasm_bindgen(unchecked_param_type = "string")] json: JsValue,
         #[wasm_bindgen(unchecked_param_type = "MiniSearchWasmOptions")] options: JsValue,
     ) -> Result<MiniSearchWasm, JsValue> {
         Self::load_minisearch_json_js(json, options)
@@ -647,7 +772,7 @@ impl MiniSearchWasm {
     /// `MiniSearch.loadJSONAsync(json, options)`: `loadJSON` as a Promise.
     #[wasm_bindgen(js_name = loadJSONAsync, unchecked_return_type = "Promise<MiniSearchWasm>")]
     pub fn load_json_async_js(
-        json: &str,
+        #[wasm_bindgen(unchecked_param_type = "string")] json: JsValue,
         #[wasm_bindgen(unchecked_param_type = "MiniSearchWasmOptions")] options: JsValue,
     ) -> Promise {
         match Self::load_minisearch_json_js(json, options) {
@@ -657,8 +782,11 @@ impl MiniSearchWasm {
     }
 
     #[wasm_bindgen(js_name = loadBytes)]
-    pub fn load_bytes_js(bytes: &[u8]) -> Result<MiniSearchWasm, JsValue> {
-        let inner = MiniSearch::from_bytes(bytes).map_err(|err| js_error(&err))?;
+    pub fn load_bytes_js(
+        #[wasm_bindgen(unchecked_param_type = "Uint8Array | ArrayBuffer | ArrayBufferView")]
+        bytes: JsValue,
+    ) -> Result<MiniSearchWasm, JsValue> {
+        let inner = MiniSearch::from_bytes(&bytes_arg(&bytes)?).map_err(|err| js_error(&err))?;
 
         Ok(MiniSearchWasm::from_inner(inner))
     }
@@ -669,12 +797,13 @@ impl MiniSearchWasm {
     /// of `MiniSearch.loadJSON(json, options)`.
     #[wasm_bindgen(js_name = loadMiniSearchJSON)]
     pub fn load_minisearch_json_js(
-        json: &str,
+        #[wasm_bindgen(unchecked_param_type = "string")] json: JsValue,
         #[wasm_bindgen(unchecked_param_type = "MiniSearchWasmOptions")] options: JsValue,
     ) -> Result<MiniSearchWasm, JsValue> {
+        let json = string_arg(&json, "the serialized index")?;
         let (options, logger) = parse_constructor_options(&options)?;
         let inner =
-            MiniSearch::from_minisearch_json(json, options).map_err(|err| js_error(&err))?;
+            MiniSearch::from_minisearch_json(&json, options).map_err(|err| js_error(&err))?;
 
         Ok(MiniSearchWasm::from_inner(inner).with_logger(logger))
     }
@@ -696,7 +825,12 @@ impl MiniSearchWasm {
             inner: Rc::new(RefCell::new(inner)),
             vacuum_runtime: Rc::new(RefCell::new(VacuumRuntime::default())),
             logger: None,
+            exact_dirty_queries: Cell::new(false),
         }
+    }
+
+    fn exact_dirty(&self) -> bool {
+        self.exact_dirty_queries.get() && self.inner.borrow().dirt_count() > 0
     }
 
     fn with_logger(mut self, logger: Option<Function>) -> Self {
@@ -743,6 +877,7 @@ impl MiniSearchWasm {
                 Rc::clone(&self.inner),
                 Rc::clone(&self.vacuum_runtime),
                 options,
+                true,
             );
         }
     }
@@ -752,11 +887,15 @@ fn schedule_vacuum(
     inner: Rc<RefCell<MiniSearch>>,
     runtime: Rc<RefCell<VacuumRuntime>>,
     options: mini_search::ResolvedVacuumOptions,
+    automatic: bool,
 ) -> Promise {
     {
         let mut state = runtime.borrow_mut();
         if state.active {
-            state.rerun = true;
+            match &mut state.rerun {
+                Some((_, all_automatic)) => *all_automatic = *all_automatic && automatic,
+                None => state.rerun = Some((options, automatic)),
+            }
             return state
                 .current
                 .as_ref()
@@ -766,29 +905,36 @@ fn schedule_vacuum(
         state.active = true;
     }
 
+    // Like JS MiniSearch, the run starts now: the dirt it will account for is
+    // today's, and its first batch is cleaned before this call returns.
+    let mut done = {
+        let mut index = inner.borrow_mut();
+        index.begin_vacuum();
+        index.vacuum_step(options.batch_size)
+    };
+
     let future_inner = Rc::clone(&inner);
     let future_runtime = Rc::clone(&runtime);
     let promise = future_to_promise(async move {
+        let mut options = options;
         let result = async {
             loop {
-                future_inner.borrow_mut().begin_vacuum();
-                loop {
-                    let done = future_inner.borrow_mut().vacuum_step(options.batch_size);
-                    if done {
-                        break;
-                    }
+                while !done {
                     yield_to_timer(options.batch_wait).await?;
+                    done = future_inner.borrow_mut().vacuum_step(options.batch_size);
                 }
 
-                let rerun = {
-                    let mut state = future_runtime.borrow_mut();
-                    let rerun = state.rerun;
-                    state.rerun = false;
-                    rerun
-                };
-                if !rerun {
-                    break;
+                let rerun = future_runtime.borrow_mut().rerun.take();
+                match rerun {
+                    Some((_, true)) if future_inner.borrow().auto_vacuum_request().is_none() => {
+                        break
+                    }
+                    Some((queued, _)) => options = queued,
+                    None => break,
                 }
+                let mut index = future_inner.borrow_mut();
+                index.begin_vacuum();
+                done = index.vacuum_step(options.batch_size);
             }
             Ok(JsValue::UNDEFINED)
         }
@@ -796,7 +942,7 @@ fn schedule_vacuum(
 
         let mut state = future_runtime.borrow_mut();
         state.active = false;
-        state.rerun = false;
+        state.rerun = None;
         state.current = None;
         result
     });
@@ -859,6 +1005,41 @@ fn to_json_compatible_value<T: Serialize>(value: &T) -> Result<JsValue, String> 
 
 /// A real JS `Error` carrying MiniSearch's message, so `e.message`,
 /// `e.stack` and `instanceof Error` behave as with the JavaScript library.
+/// A string argument. The generated glue reads a `&str` parameter without
+/// checking its type and traps on anything else, so string parameters arrive
+/// as values and are checked here.
+fn string_arg(value: &JsValue, what: &str) -> Result<String, JsValue> {
+    value
+        .as_string()
+        .ok_or_else(|| js_error(&format!("MiniSearch: {what} must be a string")))
+}
+
+fn query_arg(value: &JsValue) -> Result<String, JsValue> {
+    string_arg(value, "the query of this method")
+}
+
+/// Snapshot bytes: a `Uint8Array`, an `ArrayBuffer` (what `fetch` hands out)
+/// or any other view of one.
+fn bytes_arg(value: &JsValue) -> Result<Vec<u8>, JsValue> {
+    if let Some(buffer) = value.dyn_ref::<js_sys::ArrayBuffer>() {
+        return Ok(js_sys::Uint8Array::new(buffer).to_vec());
+    }
+    if js_sys::ArrayBuffer::is_view(value) {
+        let buffer = Reflect::get(value, &JsValue::from_str("buffer"))?;
+        let offset = Reflect::get(value, &JsValue::from_str("byteOffset"))?;
+        let length = Reflect::get(value, &JsValue::from_str("byteLength"))?;
+        let view = js_sys::Uint8Array::new_with_byte_offset_and_length(
+            &buffer,
+            offset.as_f64().unwrap_or(0.0) as u32,
+            length.as_f64().unwrap_or(0.0) as u32,
+        );
+        return Ok(view.to_vec());
+    }
+    Err(js_error(
+        "MiniSearch: snapshot bytes must be a Uint8Array, an ArrayBuffer or a view of one",
+    ))
+}
+
 fn js_error(message: &str) -> JsValue {
     js_sys::Error::new(message).into()
 }
@@ -963,6 +1144,8 @@ fn parse_constructor_options(
         .ok();
     let parsed: MiniSearchOptions =
         serde_wasm_bindgen::from_value(options.clone()).map_err(boundary_error)?;
+    // Refuse at construction what a snapshot could not hold.
+    parsed.validate().map_err(|err| js_error(&err))?;
     Ok((parsed, logger))
 }
 

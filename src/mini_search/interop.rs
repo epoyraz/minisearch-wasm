@@ -111,8 +111,8 @@ impl MiniSearch {
         }
         for (field, average) in js.average_field_length.into_iter().enumerate() {
             let average = average.unwrap_or(0.0);
-            if !average.is_finite() || average < 0.0 {
-                return Err(invalid("averageFieldLength must be finite and nonnegative"));
+            if !average.is_finite() {
+                return Err(invalid("averageFieldLength must be finite"));
             }
             index.average_field_length[field] = average;
         }

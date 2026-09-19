@@ -141,17 +141,13 @@ fn dump(
         }
     }
 
-    // Query trees: terms dumped SORTED, mirroring js_bulk.mjs (JS match keys
-    // are insertion-ordered, this port's full-path match map is sorted — a
-    // documented divergence; ids and scores are compared exactly).
+    // Query trees: ids, scores and the matched terms in their JS order.
     let tree_rows = |results: Vec<minisearch_wasm::SearchResult>| -> Value {
         Value::Array(
             results
                 .into_iter()
                 .map(|result| {
-                    let mut terms = result.terms;
-                    terms.sort();
-                    json!({ "id": result.id, "score": result.score, "terms": terms })
+                    json!({ "id": result.id, "score": result.score, "terms": result.terms })
                 })
                 .collect(),
         )

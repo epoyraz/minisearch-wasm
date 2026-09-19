@@ -3,13 +3,14 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 mod interop;
+mod lazy_cleanup;
 mod snapshot;
 
 type FieldId = usize;
@@ -141,49 +142,80 @@ impl<'de> Deserialize<'de> for FieldTermData {
 /// sorted by doc id, flat and contiguous. The BM25 loop iterates it linearly
 /// (no hash-bucket hopping), snapshots write it without re-sorting and read it
 /// with a straight push loop, and it costs one allocation instead of a hash
-/// table per (term, field). Mutation is binary-search insert/remove — `addAll`
-/// assigns doc ids monotonically, so build-time inserts append at the end.
+/// table per (term, field). `addAll` assigns doc ids monotonically, so
+/// build-time inserts append at the end.
+///
+/// Removal does not shift the list: an entry whose frequency reaches zero stays
+/// in place as a tombstone (the second field counts them) until they outnumber
+/// the live entries, and then one pass drops them all. Removing documents is
+/// therefore amortized constant per posting, however long the list and
+/// wherever in it the document sits. Every reader goes through `len` and
+/// `iter`, which do not see tombstones.
 ///
 /// Serializes as a `{docId: freq}` JSON map, the same shape the previous
 /// `HashMap<ShortId, u32>` produced, so `toJSON`/`loadJSON` output is
 /// unchanged.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Postings(Vec<(ShortId, u32)>);
+#[derive(Clone, Debug, Default)]
+pub struct Postings(Vec<(ShortId, u32)>, usize);
+
+impl PartialEq for Postings {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
 
 impl Postings {
     fn len(&self) -> usize {
-        self.0.len()
+        self.0.len() - self.1
     }
 
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
     }
 
     fn iter(&self) -> impl Iterator<Item = (ShortId, u32)> + '_ {
-        self.0.iter().copied()
+        self.0
+            .iter()
+            .copied()
+            .filter(|(_, frequency)| *frequency > 0)
     }
 
     fn increment(&mut self, doc_id: ShortId) {
         match self.0.binary_search_by_key(&doc_id, |(doc, _)| *doc) {
-            Ok(index) => self.0[index].1 += 1,
+            Ok(index) => {
+                if self.0[index].1 == 0 {
+                    self.1 -= 1;
+                }
+                self.0[index].1 += 1;
+            }
             Err(index) => self.0.insert(index, (doc_id, 1)),
         }
     }
 
-    /// Decrement the doc's frequency, dropping the entry at zero. Returns
-    /// `false` (changing nothing) when the doc has no entry.
+    /// Decrement the doc's frequency; at zero the entry no longer exists.
+    /// Returns `false` (changing nothing) when the doc has no entry.
     fn decrement(&mut self, doc_id: ShortId) -> bool {
-        match self.0.binary_search_by_key(&doc_id, |(doc, _)| *doc) {
-            Ok(index) => {
-                if self.0[index].1 <= 1 {
-                    self.0.remove(index);
-                } else {
-                    self.0[index].1 -= 1;
-                }
-                true
-            }
-            Err(_) => false,
+        let Ok(index) = self.0.binary_search_by_key(&doc_id, |(doc, _)| *doc) else {
+            return false;
+        };
+        let frequency = &mut self.0[index].1;
+        if *frequency == 0 {
+            return false;
         }
+        *frequency -= 1;
+        if *frequency == 0 {
+            self.1 += 1;
+            if self.1 * 2 > self.0.len() {
+                self.sweep();
+            }
+        }
+        true
+    }
+
+    /// Drop the tombstones.
+    fn sweep(&mut self) {
+        self.0.retain(|(_, frequency)| *frequency > 0);
+        self.1 = 0;
     }
 
     /// Append a posting known to have the largest doc id so far (snapshot
@@ -194,7 +226,9 @@ impl Postings {
     }
 
     fn retain(&mut self, mut keep: impl FnMut(ShortId) -> bool) {
-        self.0.retain(|(doc_id, _)| keep(*doc_id));
+        self.0
+            .retain(|(doc_id, frequency)| *frequency > 0 && keep(*doc_id));
+        self.1 = 0;
     }
 }
 
@@ -203,7 +237,7 @@ impl Serialize for Postings {
     where
         S: serde::Serializer,
     {
-        serializer.collect_map(self.0.iter().map(|(doc_id, freq)| (*doc_id, *freq)))
+        serializer.collect_map(self.iter())
     }
 }
 
@@ -214,8 +248,13 @@ impl<'de> Deserialize<'de> for Postings {
     {
         let entries = HashMap::<ShortId, u32>::deserialize(deserializer)?;
         let mut postings: Vec<(ShortId, u32)> = entries.into_iter().collect();
+        // A zero frequency is how a removed entry looks in memory; it is never
+        // serialized.
+        if postings.iter().any(|(_, frequency)| *frequency == 0) {
+            return Err(serde::de::Error::custom("posting with zero frequency"));
+        }
         postings.sort_unstable_by_key(|(doc_id, _)| *doc_id);
-        Ok(Postings(postings))
+        Ok(Postings(postings, 0))
     }
 }
 // Transient per-query accumulator keyed by doc id (full `search()` path). It
@@ -308,9 +347,11 @@ thread_local! {
 /// so no per-(doc, term) `String`s), and three counters that replace the old
 /// combinator: `spec_count` (`AND` keeps a doc iff it equals the spec count),
 /// `first_spec` (`AND_NOT` keeps a doc iff it is 0 and `spec_count` is 1), and
-/// `term_count` (matched distinct query terms — the score's quality factor —
-/// counted only by the first spec of each distinct term; duplicate query terms
-/// touch identical doc sets, so this reproduces the old string dedup exactly).
+/// `term_count` (matched distinct query terms — the score's quality factor).
+/// A query term can occur more than once and expand differently each time
+/// (per-term `prefix`/`fuzzy`, or auto-suggest's prefix on the last term only),
+/// so a document is credited once per distinct term, whichever occurrence
+/// reaches it: `term_mask` remembers which, reproducing the old string dedup.
 ///
 /// Scores stay bit-identical to the old per-spec-map + merge design: each
 /// spec accumulates into `spec_score` and is flushed into `score` as one
@@ -331,6 +372,10 @@ struct Scratch {
     spec_count: Vec<u32>,
     /// Per-doc number of distinct query terms that matched (quality factor).
     term_count: Vec<u32>,
+    /// Per-doc set of the distinct query terms already counted, by slot; slots
+    /// past the mask's width are kept in `wide_terms`.
+    term_mask: Vec<u64>,
+    wide_terms: HashSet<(ShortId, u32)>,
     /// Per-doc index of the first spec that touched the doc (for `AND_NOT`).
     first_spec: Vec<u32>,
     /// Per-doc id of the derived term most recently accumulated into the
@@ -361,6 +406,7 @@ impl Scratch {
             self.terms.resize_with(len, Vec::new);
             self.spec_count.resize(len, 0);
             self.term_count.resize(len, 0);
+            self.term_mask.resize(len, 0);
             self.first_spec.resize(len, 0);
             self.last_term.resize(len, u32::MAX);
             self.generation.resize(len, 0);
@@ -373,6 +419,7 @@ impl Scratch {
             self.query_counter = 1;
         }
         self.touched.clear();
+        self.wide_terms.clear();
         self.table.clear();
         self.table_index.clear();
         self.lookup.clear();
@@ -410,9 +457,10 @@ impl Scratch {
     }
 
     /// Reset `doc`'s slots the first time it is seen this query/spec and
-    /// record the spec-membership counters.
+    /// record the spec-membership counters. `term_slot` numbers the spec's
+    /// query term among the query's distinct terms.
     #[inline]
-    fn touch(&mut self, doc: ShortId, spec_index: u32, counts_term: bool) -> usize {
+    fn touch(&mut self, doc: ShortId, spec_index: u32, term_slot: u32) -> usize {
         let i = doc as usize;
         if self.generation[i] != self.query_counter {
             self.generation[i] = self.query_counter;
@@ -420,6 +468,7 @@ impl Scratch {
             self.terms[i].clear();
             self.spec_count[i] = 0;
             self.term_count[i] = 0;
+            self.term_mask[i] = 0;
             self.first_spec[i] = spec_index;
             self.last_term[i] = u32::MAX;
             self.touched.push(doc);
@@ -428,7 +477,15 @@ impl Scratch {
             self.spec_generation[i] = self.spec_counter;
             self.spec_score[i] = 0.0;
             self.spec_count[i] += 1;
-            self.term_count[i] += u32::from(counts_term);
+            let first_match = match 1u64.checked_shl(term_slot) {
+                Some(bit) => {
+                    let unseen = self.term_mask[i] & bit == 0;
+                    self.term_mask[i] |= bit;
+                    unseen
+                }
+                None => self.wide_terms.insert((doc, term_slot)),
+            };
+            self.term_count[i] += u32::from(first_match);
             self.spec_touched.push(doc);
         }
         i
@@ -849,6 +906,30 @@ pub struct MiniSearchOptions {
     pub auto_vacuum: Option<AutoVacuumSetting>,
 }
 
+impl MiniSearchOptions {
+    /// Options an index can be saved with: distinct field names, and numbers
+    /// that survive JSON (a nonfinite boost or weight serializes as `null`).
+    pub fn validate(&self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        if let Some(duplicate) = self
+            .fields
+            .iter()
+            .find(|field| !seen.insert(field.as_str()))
+        {
+            return Err(format!(
+                "MiniSearch: field \"{duplicate}\" is listed more than once in option \"fields\""
+            ));
+        }
+        let round_trip = serde_json::to_string(self)
+            .ok()
+            .and_then(|json| serde_json::from_str::<MiniSearchOptions>(&json).ok());
+        if round_trip.as_ref() != Some(self) {
+            return Err("MiniSearch: numeric options must be finite".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TokenizerMode {
     #[default]
@@ -1195,6 +1276,33 @@ impl PartialEq for QueryCache {
     }
 }
 
+/// Set when a query meets the posting of a discarded document. JS MiniSearch
+/// scores such a first query with a posting count that still includes the
+/// stale entries and removes them as it goes; the `&self` query paths report
+/// the encounter here so the `*_exact` entry points can redo the query through
+/// the mutating replica of that behavior. Pure per-query state, like
+/// [`QueryCache`]: clones start unset and any two flags compare equal.
+#[derive(Default)]
+struct StaleFlag(Cell<bool>);
+
+impl Clone for StaleFlag {
+    fn clone(&self) -> Self {
+        StaleFlag::default()
+    }
+}
+
+impl std::fmt::Debug for StaleFlag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StaleFlag")
+    }
+}
+
+impl PartialEq for StaleFlag {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "snapshot::JsonSnapshot")]
 pub struct MiniSearch {
@@ -1221,6 +1329,8 @@ pub struct MiniSearch {
     vacuum_state: Option<VacuumState>,
     #[serde(skip)]
     query_cache: QueryCache,
+    #[serde(skip)]
+    stale_hit: StaleFlag,
     /// Instance-local generation of the external ID table, never persisted.
     #[serde(skip)]
     id_table_version: u64,
@@ -1265,6 +1375,7 @@ impl MiniSearch {
             dirt_count: 0,
             vacuum_state: None,
             query_cache: QueryCache::default(),
+            stale_hit: StaleFlag::default(),
             id_table_version: 0,
         }
     }
@@ -1415,11 +1526,7 @@ impl MiniSearch {
     }
 
     pub fn remove_all(&mut self, documents: Vec<Value>) -> Result<(), String> {
-        for document in documents {
-            self.remove(&document)?;
-        }
-
-        Ok(())
+        self.remove_all_with_warnings(documents, &mut Vec::new())
     }
 
     pub fn remove_all_documents(&mut self) {
@@ -1543,12 +1650,9 @@ impl MiniSearch {
             return;
         }
 
-        let terms = self
-            .index
-            .sorted_entries()
-            .into_iter()
-            .map(|(term, _)| term)
-            .collect();
+        // JS vacuums in tree-iteration order. The order in which emptied
+        // terms leave the tree decides the key order of the merged nodes.
+        let terms = self.index.keys();
         self.vacuum_state = Some(VacuumState {
             terms,
             next_term: 0,
@@ -1625,10 +1729,6 @@ impl MiniSearch {
         if self.next_id as usize == self.document_count {
             return Ok(());
         }
-        // Removing an already-modified document can leave untracked stale
-        // postings (the original API warns about this). Reject that state before
-        // remapping anything, rather than panicking on an absent mapping.
-        self.validate_snapshot()?;
         self.invalidate_expansions();
         let mut ids: Vec<_> = self.document_ids.keys().copied().collect();
         ids.sort_unstable();
@@ -1645,7 +1745,7 @@ impl MiniSearch {
             lengths.extend_from_slice(&self.field_length[start..start + fields]);
             present.extend_from_slice(&self.field_present[start..start + fields]);
         }
-        for (_, value) in self.id_to_short_id.iter_mut() {
+        for value in self.id_to_short_id.values_mut() {
             *value = mapping[value];
         }
         self.document_ids = std::mem::take(&mut self.document_ids)
@@ -1657,19 +1757,31 @@ impl MiniSearch {
             .map(|(id, value)| (mapping[&id], value))
             .collect();
         // Mutate postings in place: rebuilding the radix tree would change ties.
-        let terms: Vec<_> = self
-            .index
-            .sorted_entries()
-            .into_iter()
-            .map(|(term, _)| term)
-            .collect();
-        for term in terms {
+        // Removing a document whose content changed leaves postings outside the
+        // dirt count (the original API warns about this); they have no new id,
+        // so they are dropped here, like a vacuum would drop them.
+        let mut emptied = Vec::new();
+        for term in self.index.keys() {
             let data = Rc::make_mut(self.index.get_mut(&term).expect("existing term"));
-            for (_, postings) in &mut data.0 {
-                for (id, _) in &mut postings.0 {
-                    *id = mapping[id];
-                }
+            data.retain(|_, postings| {
+                postings
+                    .0
+                    .retain_mut(|(id, frequency)| match mapping.get(id) {
+                        Some(new) if *frequency > 0 => {
+                            *id = *new;
+                            true
+                        }
+                        _ => false,
+                    });
+                postings.1 = 0;
+                !postings.is_empty()
+            });
+            if data.is_empty() {
+                emptied.push(term);
             }
+        }
+        for term in emptied {
+            self.index.delete(&term);
         }
         self.field_length = lengths;
         self.field_present = present;
@@ -1769,10 +1881,12 @@ impl MiniSearch {
     fn matches_filter(&self, doc_id: ShortId, filter: &BTreeMap<String, Value>) -> bool {
         let stored = self.stored_fields.get(&doc_id);
         filter.iter().all(|(key, expected)| {
-            if *key == self.options.id_field {
-                return self.document_ids.get(&doc_id) == Some(expected);
-            }
-            stored.and_then(|fields| fields.get(key)) == Some(expected)
+            let actual = if *key == self.options.id_field {
+                self.document_ids.get(&doc_id)
+            } else {
+                stored.and_then(|fields| fields.get(key))
+            };
+            actual.is_some_and(|actual| json_equal(actual, expected))
         })
     }
 
@@ -1812,9 +1926,19 @@ impl MiniSearch {
         per_call: &PartialSearchOptions,
         include_match: bool,
     ) -> CompatTransfer {
+        let raw_results = self.execute_query_tree(query, per_call);
+        self.transfer_from_raw(raw_results, query, per_call, include_match)
+    }
+
+    fn transfer_from_raw(
+        &self,
+        raw_results: RawResult,
+        query: &Query,
+        per_call: &PartialSearchOptions,
+        include_match: bool,
+    ) -> CompatTransfer {
         use std::fmt::Write;
 
-        let raw_results = self.execute_query_tree(query, per_call);
         let sort_by_score = !matches!(query, Query::Wildcard);
         let filter = apply_partial_options(&self.options.search_options, per_call).filter;
         let ranked = self.ranked_raw_results(raw_results, sort_by_score, filter.as_ref());
@@ -1984,6 +2108,15 @@ impl MiniSearch {
         query: &str,
         per_call: Option<&AutoSuggestOptions>,
     ) -> Vec<Suggestion> {
+        let (specs, options) = self.auto_suggest_specs(query, per_call);
+        self.group_suggestions(&specs, &options)
+    }
+
+    fn auto_suggest_specs(
+        &self,
+        query: &str,
+        per_call: Option<&AutoSuggestOptions>,
+    ) -> (Vec<QuerySpec>, SearchOptions) {
         let (options, prefix) = self.resolve_auto_suggest_options(per_call);
 
         // Like `query_specs`, but with per-term prefix expansion: `None`
@@ -2009,8 +2142,11 @@ impl MiniSearch {
                 term_boost: term_boost(&options, index),
             })
             .collect();
+        (specs, options)
+    }
 
-        self.run_fused_query(&specs, &options, |fused| {
+    fn group_suggestions(&self, specs: &[QuerySpec], options: &SearchOptions) -> Vec<Suggestion> {
+        self.run_fused_query(specs, options, |fused| {
             // Group ranked hits by matched-terms phrase — keyed by the term-id
             // sequence, which is equivalent to the joined phrase (terms cannot
             // contain spaces) without building a string per document. A doc's
@@ -2281,10 +2417,8 @@ impl MiniSearch {
     /// One scratch pass replaces the old per-spec map materialization and
     /// pairwise merge: `AND` keeps a doc iff its matched-spec count equals the
     /// spec count, `AND_NOT` iff only spec 0 touched it, and the quality
-    /// factor is the matched distinct-term count (counted by the first spec of
-    /// each distinct term — duplicate query terms touch identical doc sets, so
-    /// this equals the old merge's string dedup). Scores are bit-identical to
-    /// the old design; see `Scratch`.
+    /// factor is the matched distinct-term count, which equals the old merge's
+    /// string dedup. Scores are bit-identical to the old design; see `Scratch`.
     fn run_fused_query<R>(
         &self,
         specs: &[QuerySpec],
@@ -2294,19 +2428,23 @@ impl MiniSearch {
         let field_boosts = self.field_boosts(options);
 
         SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            let scratch = &mut *scratch;
+            // Taken out for the query, not borrowed: should the query abort
+            // (on wasm32 a panic does not unwind), the next one finds an empty
+            // scratch instead of a borrow that is never released.
+            let mut taken = cell.take();
+            let scratch = &mut taken;
             scratch.begin_query(self.next_id as usize);
 
-            let mut seen_terms: FxHashMap<&str, ()> = FxHashMap::default();
+            let mut term_slots: FxHashMap<&str, u32> = FxHashMap::default();
             for (spec_index, spec) in specs.iter().enumerate() {
-                let counts_term = seen_terms.insert(spec.term.as_str(), ()).is_none();
+                let next_slot = term_slots.len() as u32;
+                let term_slot = *term_slots.entry(spec.term.as_str()).or_insert(next_slot);
                 scratch.begin_spec();
                 self.execute_spec_fused(
                     scratch,
                     spec,
                     spec_index as u32,
-                    counts_term,
+                    term_slot,
                     options,
                     &field_boosts,
                 );
@@ -2347,13 +2485,15 @@ impl MiniSearch {
                     .unwrap_or(Ordering::Equal)
             });
 
-            finish(FusedHits {
+            let result = finish(FusedHits {
                 hits,
                 terms: &scratch.terms,
                 table: &scratch.table,
                 table_index: &scratch.table_index,
                 has_index_terms: scratch.table_index.iter().any(Option::is_some),
-            })
+            });
+            cell.replace(taken);
+            result
         })
     }
 
@@ -2376,6 +2516,10 @@ impl MiniSearch {
                     .flat_map(|fields| fields.values()),
             )
             .any(|value| matches!(value, Value::Array(_) | Value::Object(_)))
+    }
+
+    pub(crate) fn index_root(&self) -> &crate::searchable_map::RadixNode<Rc<FieldTermData>> {
+        &self.index.root
     }
 
     pub fn term_count(&self) -> usize {
@@ -2439,6 +2583,15 @@ impl MiniSearch {
             );
         }
         results
+    }
+
+    /// The processed, non-empty terms of a query string, in query order.
+    pub fn query_terms(&self, query: &str) -> Vec<String> {
+        tokenize(self.options.tokenizer, query)
+            .into_iter()
+            .map(|term| process_term(self.options.tokenizer, &term))
+            .filter(|term| !term.is_empty())
+            .collect()
     }
 
     fn query_specs(&self, query: &str, options: &SearchOptions) -> Vec<QuerySpec> {
@@ -2543,7 +2696,7 @@ impl MiniSearch {
         scratch: &mut Scratch,
         query: &QuerySpec,
         spec_index: u32,
-        counts_term: bool,
+        term_slot: u32,
         options: &SearchOptions,
         field_boosts: &[FieldBoost],
     ) {
@@ -2553,7 +2706,7 @@ impl MiniSearch {
                 scratch,
                 term_id,
                 spec_index,
-                counts_term,
+                term_slot,
                 1.0,
                 query.term_boost,
                 data,
@@ -2574,7 +2727,7 @@ impl MiniSearch {
                     scratch,
                     term_id,
                     spec_index,
-                    counts_term,
+                    term_slot,
                     weight,
                     query.term_boost,
                     &expansion.data,
@@ -2611,7 +2764,7 @@ impl MiniSearch {
                         scratch,
                         term_id,
                         spec_index,
-                        counts_term,
+                        term_slot,
                         weight,
                         query.term_boost,
                         &expansion.data,
@@ -2663,6 +2816,7 @@ impl MiniSearch {
 
             for (doc_id, term_freq) in field_term_freqs.iter() {
                 if !clean && !self.alive[doc_id as usize] {
+                    self.stale_hit.0.set(true);
                     continue;
                 }
 
@@ -2703,7 +2857,7 @@ impl MiniSearch {
     // contribution into the doc-id-indexed `Scratch` arrays instead of hashing
     // into a map. Mirrors `term_results` exactly (same loop order, so the
     // floating-point score sums are bit-identical), minus the `match` map;
-    // the matched-query-term bookkeeping is the `spec_index`/`counts_term`
+    // the matched-query-term bookkeeping is the `spec_index`/`term_slot`
     // counters and the derived term is an id into the per-query intern table.
     #[allow(clippy::too_many_arguments)]
     fn accumulate_dense(
@@ -2711,7 +2865,7 @@ impl MiniSearch {
         scratch: &mut Scratch,
         term_id: u32,
         spec_index: u32,
-        counts_term: bool,
+        term_slot: u32,
         term_weight: f64,
         term_boost: f64,
         field_term_data: &FieldTermData,
@@ -2746,6 +2900,7 @@ impl MiniSearch {
 
             for (doc_id, term_freq) in field_term_freqs.iter() {
                 if !clean && !self.alive[doc_id as usize] {
+                    self.stale_hit.0.set(true);
                     continue;
                 }
 
@@ -2768,7 +2923,7 @@ impl MiniSearch {
                     );
                 let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
 
-                let i = scratch.touch(doc_id, spec_index, counts_term);
+                let i = scratch.touch(doc_id, spec_index, term_slot);
                 scratch.spec_score[i] += weighted_score;
                 if scratch.last_term[i] != term_id {
                     scratch.last_term[i] = term_id;
@@ -2866,7 +3021,13 @@ impl MiniSearch {
                 self.field_ids.get(field).map(|field_id| FieldBoost {
                     field_id: *field_id,
                     field_name: field.clone(),
-                    boost: options.boost.get(field).copied().unwrap_or(1.0),
+                    // JS `boost[field] || 1`: a zero (or NaN) boost means none.
+                    boost: options
+                        .boost
+                        .get(field)
+                        .copied()
+                        .filter(|boost| *boost != 0.0 && !boost.is_nan())
+                        .unwrap_or(1.0),
                 })
             })
             .collect()
@@ -3114,6 +3275,31 @@ fn term_boost(options: &SearchOptions, index: usize) -> f64 {
 /// `combineResults`, including its `Map` ordering: `OR` keeps the
 /// accumulator's order and appends new documents, `AND` rebuilds the map in
 /// the right operand's order, `AND_NOT` deletes from the accumulator.
+/// Equality of JSON values the way JavaScript sees them: a number is its
+/// value, however it was written (`4`, `4.0` and `4e0` are the same number,
+/// while `serde_json` keeps integers and floats apart).
+fn json_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            left == right || ((left.is_f64() || right.is_f64()) && left.as_f64() == right.as_f64())
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| json_equal(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, left)| right.get(key).is_some_and(|right| json_equal(left, right)))
+        }
+        _ => left == right,
+    }
+}
+
 fn combine_results(results: Vec<RawResult>, combine_with: CombineWith) -> RawResult {
     let mut iter = results.into_iter();
     let Some(first) = iter.next() else {
@@ -3163,7 +3349,7 @@ fn combine_results(results: Vec<RawResult>, combine_with: CombineWith) -> RawRes
 /// whole posting list, so callers hoist it out of the per-posting loop.
 #[inline]
 fn bm25_idf(matching_count: f64, total_count: f64) -> f64 {
-    (1.0 + (total_count - matching_count + 0.5) / (matching_count + 0.5)).ln()
+    crate::js_math::log(1.0 + (total_count - matching_count + 0.5) / (matching_count + 0.5))
 }
 
 /// The term-frequency / field-length-normalization half of the BM25 score (the

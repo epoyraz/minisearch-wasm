@@ -217,7 +217,7 @@ fn json_rejects_inconsistent_state_including_direct_serde_deserialization() {
         ("/field_length", json!([])),
         ("/field_present", json!([])),
         ("/average_field_length", json!([])),
-        ("/average_field_length/0", json!(-1)),
+        ("/average_field_length/0", Value::Null),
         ("/field_present/0", json!(false)),
         ("/id_to_short_id/s:first", json!(7)),
         ("/document_ids/0", Value::Null),
@@ -250,8 +250,10 @@ fn json_rejects_inconsistent_state_including_direct_serde_deserialization() {
     assert!(MiniSearch::from_json(&unversioned.to_string()).is_err());
 }
 
+// Postings of absent documents are legal with or without dirt: `discard`
+// leaves them, and so does removing a document whose content changed.
 #[test]
-fn stale_postings_require_dirt_but_valid_dirty_indexes_load() {
+fn stale_postings_load_with_and_without_dirt() {
     let mut search = engine();
     search
         .add_all(vec![
@@ -261,9 +263,12 @@ fn stale_postings_require_dirt_but_valid_dirty_indexes_load() {
         .unwrap();
     search.discard(&json!(1)).unwrap();
     assert_eq!(reloaded(&search).len(), 2);
-    let mut corrupt = snapshot(&search);
-    corrupt["dirt_count"] = json!(0);
-    assert!(MiniSearch::from_json(&corrupt.to_string()).is_err());
+    let mut untracked = snapshot(&search);
+    untracked["dirt_count"] = json!(0);
+    let loaded = MiniSearch::from_json(&untracked.to_string()).unwrap();
+    assert!(loaded.search("apple", SearchOptions::default()).is_empty());
+    assert_eq!(loaded.search("pear", SearchOptions::default()).len(), 1);
+    MiniSearch::from_bytes(&loaded.to_bytes().unwrap()).unwrap();
 }
 
 #[test]

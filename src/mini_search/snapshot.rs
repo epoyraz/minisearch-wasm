@@ -16,6 +16,11 @@ const MAX_SHORT_IDS: usize = 2_000_000;
 const MAX_FIELD_SLOTS: usize = 16_000_000;
 const MAX_TREE_DEPTH: usize = 128;
 const MAX_VALUE_DEPTH: usize = 64;
+/// Bracket nesting of a JSON snapshot: three levels per radix node (the node,
+/// its `children` array and the `[edge, child]` pair), a stored value, and the
+/// enclosing objects. Checked on the text before deserializing, because the
+/// deserializer's own recursion limit is lifted to reach `MAX_TREE_DEPTH`.
+const MAX_JSON_NESTING: usize = 3 * MAX_TREE_DEPTH + MAX_VALUE_DEPTH + 16;
 
 // Tags of the binary JSON-value encoding used for external IDs and stored
 // fields. Numbers keep their serde_json variant (unsigned, negative integer,
@@ -79,6 +84,7 @@ impl TryFrom<JsonSnapshot> for MiniSearch {
             dirt_count: s.dirt_count,
             vacuum_state: None,
             query_cache: QueryCache::default(),
+            stale_hit: StaleFlag::default(),
             id_table_version: 0,
         };
         index.validate_snapshot()?;
@@ -98,6 +104,33 @@ pub(super) fn table_slots(next_id: ShortId, fields: usize) -> Result<usize, Stri
         return Err(invalid("field dimensions exceed snapshot limits"));
     }
     Ok(slots)
+}
+
+/// Deepest bracket nesting of a JSON text, ignoring brackets inside strings.
+fn json_nesting(text: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for byte in text.bytes() {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'[' | b'{' => {
+                    depth += 1;
+                    deepest = deepest.max(depth);
+                }
+                b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    deepest
 }
 
 fn validate_value(value: &Value, depth: usize) -> Result<(), String> {
@@ -125,7 +158,48 @@ impl MiniSearch {
         if serialized.len() > MAX_INPUT_BYTES {
             return Err(invalid("input exceeds snapshot byte limit"));
         }
-        serde_json::from_str(serialized).map_err(|err| err.to_string())
+        if json_nesting(serialized) > MAX_JSON_NESTING {
+            return Err(invalid("JSON nesting exceeds depth limit"));
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(serialized);
+        deserializer.disable_recursion_limit();
+        let index = Self::deserialize(&mut deserializer).map_err(|err| err.to_string())?;
+        deserializer.end().map_err(|err| err.to_string())?;
+        Ok(index)
+    }
+
+    /// Native JSON snapshot text, refused when [`Self::from_json`] could not
+    /// read it back.
+    pub fn to_json(&self) -> Result<String, String> {
+        self.check_persistable()?;
+        serde_json::to_string(self).map_err(|err| err.to_string())
+    }
+
+    /// The limits every reader enforces, checked when saving so that an index
+    /// that cannot be loaded again fails here, with a way out, and not at the
+    /// next startup. Costs one walk over the radix nodes.
+    pub fn check_persistable(&self) -> Result<(), String> {
+        let fields = self.options.fields.len();
+        if fields > MAX_FIELDS
+            || self.next_id as usize > MAX_SHORT_IDS
+            || (self.next_id as usize).saturating_mul(fields) > MAX_FIELD_SLOTS
+        {
+            return Err(format!(
+                "MiniSearch: the index holds {} internal document slots for {} live documents, more than a snapshot can store; vacuum it and call compact() before saving",
+                self.next_id, self.document_count
+            ));
+        }
+        self.options.validate()?;
+        let mut pending = vec![(&self.index.root, 0usize)];
+        while let Some((node, depth)) = pending.pop() {
+            if depth > MAX_TREE_DEPTH {
+                return Err(format!(
+                    "MiniSearch: the index nests terms more than {MAX_TREE_DEPTH} prefixes deep, more than a snapshot can store"
+                ));
+            }
+            pending.extend(node.children.iter().map(|(_, child)| (child, depth + 1)));
+        }
+        Ok(())
     }
 
     /// Full structural check of an in-memory index. The JSON reader runs it
@@ -159,9 +233,11 @@ impl MiniSearch {
         if self
             .average_field_length
             .iter()
-            .any(|n| !n.is_finite() || *n < 0.0)
+            .any(|average| !average.is_finite())
         {
-            return Err(invalid("field averages must be finite and nonnegative"));
+            // A running average goes negative when documents that lack the
+            // field are removed, in JS MiniSearch as well.
+            return Err(invalid("field averages must be finite"));
         }
         // JSON serialization rejects nonfinite option values through the round
         // trip below (serde_json otherwise serializes a nonfinite float as null).
@@ -219,7 +295,6 @@ impl MiniSearch {
             }
         }
         let mut pending = vec![(&self.index.root, 0usize)];
-        let mut stale_ids = HashSet::new();
         while let Some((node, depth)) = pending.pop() {
             if depth > MAX_TREE_DEPTH {
                 return Err(invalid("radix tree exceeds depth limit"));
@@ -237,15 +312,14 @@ impl MiniSearch {
                         if id >= self.next_id || freq == 0 || previous.is_some_and(|p| p >= id) {
                             return Err(invalid("invalid or unordered postings"));
                         }
+                        // A posting of an absent document is stale, which is
+                        // legal: `discard` leaves them, and so does removing
+                        // a document whose content changed (outside the
+                        // dirt count).
                         if self.document_ids.contains_key(&id) {
                             let slot = id as usize * fields + field;
                             if !self.field_present[slot] || self.field_length[slot] == 0 {
                                 return Err(invalid("posting refers to an absent or empty field"));
-                            }
-                        } else {
-                            stale_ids.insert(id);
-                            if stale_ids.len() > self.dirt_count {
-                                return Err(invalid("stale postings exceed dirt count"));
                             }
                         }
                         previous = Some(id);
@@ -272,8 +346,9 @@ impl MiniSearch {
     /// must be rebuilt from documents.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         // In-memory state was built by this engine or validated when loaded,
-        // so release builds skip the full structural pass here; debug builds
-        // keep it as a consistency check for the test suite.
+        // so release builds check only the limits an engine can outgrow; debug
+        // builds keep the full structural pass as a consistency check.
+        self.check_persistable()?;
         if cfg!(debug_assertions) {
             self.validate_snapshot()?;
         }
@@ -350,8 +425,8 @@ impl MiniSearch {
         index.dirt_count = dirt_count;
         for average in &mut index.average_field_length {
             let value = reader.f64()?;
-            if !value.is_finite() || value < 0.0 {
-                return Err(invalid("field averages must be finite and nonnegative"));
+            if !value.is_finite() {
+                return Err(invalid("field averages must be finite"));
             }
             *average = value;
         }
@@ -438,9 +513,6 @@ impl MiniSearch {
                 field_length: &index.field_length,
                 field_present: &index.field_present,
                 alive: &index.alive,
-                dirt_count,
-                stale_seen: Vec::new(),
-                stale_count: 0,
             };
             reader.node(&mut tree, 0)?
         };
@@ -555,10 +627,6 @@ struct TreeContext<'a> {
     field_length: &'a [u32],
     field_present: &'a [bool],
     alive: &'a [bool],
-    dirt_count: usize,
-    /// Stale (non-live) doc ids seen so far, allocated on the first one.
-    stale_seen: Vec<bool>,
-    stale_count: usize,
 }
 
 struct Reader<'a> {
@@ -684,6 +752,13 @@ impl<'a> Reader<'a> {
             TAG_STRING => Value::String(self.string()?),
             TAG_ARRAY => {
                 let count = self.count(1)?;
+                // The reservation is the allocation: charge it before making
+                // it, or nested counts reserve far more than they ever fill.
+                self.claim(
+                    count
+                        .checked_mul(std::mem::size_of::<Value>())
+                        .ok_or_else(|| invalid("value allocation overflow"))?,
+                )?;
                 let mut values = Vec::new();
                 values
                     .try_reserve_exact(count)
@@ -750,27 +825,11 @@ impl<'a> Reader<'a> {
                 if id >= tree.next_id || freq == 0 || (row > 0 && delta == 0) {
                     return Err(invalid("invalid or unordered posting"));
                 }
+                // Postings of absent documents are stale, which is legal.
                 if tree.alive[id as usize] {
                     let slot = id as usize * tree.fields + field;
                     if !tree.field_present[slot] || tree.field_length[slot] == 0 {
                         return Err(invalid("posting refers to an absent or empty field"));
-                    }
-                } else {
-                    // Stale postings are legal on a dirty index, but there can
-                    // be no more distinct stale ids than discarded documents.
-                    if tree.dirt_count == 0 {
-                        return Err(invalid("stale postings exceed dirt count"));
-                    }
-                    if tree.stale_seen.is_empty() {
-                        self.claim(tree.next_id as usize)?;
-                        tree.stale_seen = vec![false; tree.next_id as usize];
-                    }
-                    if !tree.stale_seen[id as usize] {
-                        tree.stale_seen[id as usize] = true;
-                        tree.stale_count += 1;
-                        if tree.stale_count > tree.dirt_count {
-                            return Err(invalid("stale postings exceed dirt count"));
-                        }
                     }
                 }
                 postings.push_sorted(id, freq);
