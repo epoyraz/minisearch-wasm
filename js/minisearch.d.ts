@@ -42,7 +42,7 @@ export class MiniSearchWasm<T = any> {
   static loadJSONAsync<T = any>(json: string, options: Options<T>): Promise<MiniSearchWasm<T>>;
   static loadMiniSearchJSON<T = any>(json: string, options: Options<T>): MiniSearchWasm<T>;
   static loadNativeJSON<T = any>(json: string, options?: Options<T>): MiniSearchWasm<T>;
-  static loadBytes<T = any>(bytes: Uint8Array, options?: Options<T>): MiniSearchWasm<T>;
+  static loadBytes<T = any>(bytes: Uint8Array | ArrayBuffer, options?: Options<T>): MiniSearchWasm<T>;
   readonly executionMode: 'wasm' | 'javascript';
   readonly documentCount: number;
   readonly termCount: number;
@@ -80,10 +80,14 @@ export class MiniSearchWasm<T = any> {
   toBytes(): Uint8Array;
   free(): void;
 }
-export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
-export interface InitOutput { readonly memory: WebAssembly.Memory; readonly [name: string]: WebAssembly.ExportValue }
+// Typed structurally, so that these declarations need neither the DOM nor the
+// WebAssembly library: the URL of the .wasm file (a string, URL or Request), a
+// fetch Response, the file's bytes, or a compiled WebAssembly.Module.
+export type WasmBytes = ArrayBuffer | ArrayBufferView;
+export type InitInput = string | WasmBytes | object;
+export interface InitOutput { readonly memory: { readonly buffer: ArrayBuffer }; readonly [name: string]: unknown }
 export function init(input?: InitInput | Promise<InitInput> | { module_or_path: InitInput | Promise<InitInput> }): Promise<InitOutput>;
-export function initSync(input: BufferSource | WebAssembly.Module | { module: BufferSource | WebAssembly.Module }): InitOutput;
+export function initSync(input: WasmBytes | object | { module: WasmBytes | object }): InitOutput;
 export interface MiniSearchConstructor {
   new<T = any>(options: Options<T>): MiniSearchWasm<T>;
   (input?: Parameters<typeof init>[0]): Promise<InitOutput>;
