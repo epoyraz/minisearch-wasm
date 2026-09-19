@@ -138,7 +138,7 @@ idEngine.removeAll()
 assert.notEqual(idEngine.idTableVersion, generation)
 equal(JSON.parse(idEngine.docIdTable()), [], 'reset empty table')
 equal(JSON.parse(idEngine.searchJoined('apple', false).ids), [], 'empty joined IDs')
-assert.throws(() => idEngine.add({ id: null, text: 'apple' }))
+assert.throws(() => idEngine.add({ id: null, text: 'apple' }), /does not have ID field|ID/)
 idEngine.free()
 console.log('ok lossless compact IDs, null rejection and mutation generations')
 
@@ -154,6 +154,8 @@ const valid = [...header(1, 1, 0, 1), ...document, 0, 0, 1, ...str('apple'), ...
 const probe = MiniSearchWasm.loadBytes(new Uint8Array(valid)); probe.free()
 let deep = leaf
 for (let i = 0; i < 130; i++) deep = [0, 0, 1, ...str('a'), ...deep]
+// A trap is an Error too: every rejection below has to be a thrown MiniSearch error.
+const rejected = error => error instanceof Error && !(error instanceof WebAssembly.RuntimeError)
 const malformed = [
   [3], [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f], [0x84, 0],
   [4, ...v(0xffffffff)], [...header(0, 0xffffffff), 0, 0, 0],
@@ -164,21 +166,21 @@ const malformed = [
   [...header(1, 1, 0, 1), ...document, 0, 0, 1, ...str('a'), 99, ...leaf.slice(1)]
 ]
 for (const bytes of malformed) {
-  assert.throws(() => MiniSearchWasm.loadBytes(new Uint8Array(bytes)), error => error instanceof Error && !(error instanceof WebAssembly.RuntimeError))
+  assert.throws(() => MiniSearchWasm.loadBytes(new Uint8Array(bytes)), rejected)
   assertions++
 }
 for (let length = 0; length < valid.length; length++) {
-  assert.throws(() => MiniSearchWasm.loadBytes(new Uint8Array(valid.slice(0, length))), error => error instanceof Error)
+  assert.throws(() => MiniSearchWasm.loadBytes(new Uint8Array(valid.slice(0, length))), rejected)
 }
 const validEngine = MiniSearchWasm.loadBytes(new Uint8Array(valid))
-for (const [field, value] of [['document_count', 900], ['next_id', 0], ['field_present', [false]], ['average_field_length', [-1]], ['snapshot_version', 3]]) {
+for (const [field, value] of [['document_count', 900], ['next_id', 0], ['field_present', [false]], ['average_field_length', []], ['snapshot_version', 3]]) {
   const state = validEngine.toNativeJSON(); state[field] = value
-  assert.throws(() => MiniSearchWasm.loadNativeJSON(JSON.stringify(state)), error => error instanceof Error)
+  assert.throws(() => MiniSearchWasm.loadNativeJSON(JSON.stringify(state)), rejected)
 }
 for (let i = 0; i < valid.length; i++) {
   const bytes = new Uint8Array(valid); bytes[i] ^= 0x80
   let copy
-  try { copy = MiniSearchWasm.loadBytes(bytes) } catch (error) { assert.ok(error instanceof Error); continue }
+  try { copy = MiniSearchWasm.loadBytes(bytes) } catch (error) { assert.ok(rejected(error)); continue }
   copy.searchJoined('apple', false); copy.free()
 }
 equal(validEngine.search('apple')[0].id, 1, 'valid index remains usable after invalid loads')

@@ -1,4 +1,6 @@
-// End-to-end Wasm benchmark vs JS MiniSearch through the built pkg/.
+// End-to-end benchmark vs JS MiniSearch through the public facade of the built
+// pkg/. Every "wasm" row is checked to have run on the Wasm engine, and rows
+// that do the same work must produce the same checksum.
 // Usage: node bench_wasm.mjs corpus.json [rounds]
 import { readFileSync } from 'fs'
 import MiniSearch from 'minisearch'
@@ -14,6 +16,7 @@ const searchOptions = { prefix: true, fuzzy: 0.2, combineWith: 'AND' }
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] }
 
+const checksums = new Map()
 const bench = (name, run) => {
   let checksum = run() // warmup
   const samples = []
@@ -24,6 +27,7 @@ const bench = (name, run) => {
   }
   const ms = median(samples)
   console.log(`${name.padEnd(40)} median ${ms.toFixed(3).padStart(9)} ms  (checksum ${checksum})`)
+  checksums.set(name, checksum)
   return ms
 }
 
@@ -38,15 +42,17 @@ const jsBuild = bench('js  addAll', () => {
 const wasmBuild = bench('wasm addAllJSON', () => {
   const ms = new MiniSearchWasm({ fields: ['title', 'text'], searchOptions })
   ms.addAllJSON(docsJson)
+  const terms = ms.termCount
   ms.free()
-  return 1
+  return terms
 })
 
 const wasmBuildObjects = bench('wasm addAll (JS objects)', () => {
   const ms = new MiniSearchWasm({ fields: ['title', 'text'], searchOptions })
   ms.addAll(docs)
+  const terms = ms.termCount
   ms.free()
-  return 1
+  return terms
 })
 
 const js = new MiniSearch({ fields: ['title', 'text'], searchOptions, autoVacuum: false })
@@ -114,7 +120,7 @@ console.log(`js JSON: ${jsSerialized.length} chars, wasm bytes: ${wasmBytes.leng
 const jsSave = bench('js  JSON.stringify', () => JSON.stringify(js).length)
 const wasmSave = bench('wasm toBytes', () => wasm.toBytes().length)
 const jsLoad = bench('js  loadJSON', () => MiniSearch.loadJSON(jsSerialized, { fields: ['title', 'text'], searchOptions }).termCount)
-const wasmLoad = bench('wasm loadBytes', () => { const m = MiniSearchWasm.loadBytes(wasmBytes); m.free(); return 1 })
+const wasmLoad = bench('wasm loadBytes', () => { const m = MiniSearchWasm.loadBytes(wasmBytes); const terms = m.termCount; m.free(); return terms })
 
 console.log('--- ratios (js/wasm, >1 means wasm faster) ---')
 console.log(`build:        ${(jsBuild / wasmBuild).toFixed(2)}x`)
@@ -124,3 +130,15 @@ console.log(`build objects: ${(jsBuild / wasmBuildObjects).toFixed(2)}x   (addAl
 console.log(`autoSuggest:  ${(jsSuggest / wasmSuggest).toFixed(2)}x   (joined: ${(jsSuggest / wasmSuggestJoined).toFixed(2)}x)`)
 console.log(`serialize:    ${(jsSave / wasmSave).toFixed(2)}x`)
 console.log(`load:         ${(jsLoad / wasmLoad).toFixed(2)}x`)
+
+for (const [reference, ...others] of [
+  ['js  addAll', 'wasm addAllJSON', 'wasm addAll (JS objects)', 'js  loadJSON', 'wasm loadBytes'],
+  ['js  search AND prefix+fuzzy (app)', 'wasm searchJoined AND prefix+fuzzy', 'wasm search (compat objects)'],
+  ['js  autoSuggest', 'wasm autoSuggest', 'wasm autoSuggestJoined'],
+]) {
+  for (const other of others) {
+    if (checksums.get(other) !== checksums.get(reference)) throw new Error(`"${other}" did different work than "${reference}": checksum ${checksums.get(other)} vs ${checksums.get(reference)}`)
+  }
+}
+if (wasm.executionMode !== 'wasm') throw new Error('the index left the Wasm engine: the "wasm" rows measured JavaScript')
+console.log('checksums agree; every wasm row ran on the Wasm engine')

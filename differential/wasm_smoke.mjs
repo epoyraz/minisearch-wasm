@@ -168,7 +168,8 @@ wasmAutoVacuum.addAll(documents)
 jsAutoVacuum.discard(1)
 wasmAutoVacuum.discard(1)
 check('autoVacuum starts at threshold', jsAutoVacuum.isVacuuming, wasmAutoVacuum.isVacuuming)
-while (jsAutoVacuum.isVacuuming || wasmAutoVacuum.isVacuuming) {
+for (let waited = 0; jsAutoVacuum.isVacuuming || wasmAutoVacuum.isVacuuming; waited++) {
+  if (waited >= 5000) throw new Error('an auto-vacuum did not finish within five seconds')
   await new Promise(resolve => setTimeout(resolve, 1))
 }
 check('autoVacuum dirtCount', jsAutoVacuum.dirtCount, wasmAutoVacuum.dirtCount)

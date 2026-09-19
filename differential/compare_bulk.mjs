@@ -1,7 +1,9 @@
-// Tie-tolerant differential comparison of JS vs Rust bulk dumps.
-// - id sets must match; per-id score (rel 1e-12) and terms (exact order) must match
-// - result ORDER must match except inside near-tie score bands (rel 1e-9),
-//   where the band's members must match as a set
+// Differential comparison of JS vs native Rust bulk dumps.
+// - id sets must match; per-id score (rel 1e-12: the native `ln` is the
+//   platform's, not V8's) and terms (exact order) must match
+// - result ORDER must match. Inside a near-tie score band (rel 1e-9) a
+//   different order is reported, and fails unless --allow-tie-reorders is
+//   given for a platform whose `ln` rounds the other way.
 import { readFileSync } from 'fs'
 
 const js = JSON.parse(readFileSync(process.argv[2], 'utf8'))
@@ -15,7 +17,8 @@ let tieReorders = 0
 
 const rel = (a, b) => Math.abs(a - b) / Math.max(Math.abs(a), Math.abs(b), 1e-12)
 
-const keyOf = (row) => 'suggestion' in row ? row.suggestion : String(row.id)
+// Type-aware: the ids 1 and "1" are different documents.
+const keyOf = (row) => 'suggestion' in row ? `s:${row.suggestion}` : `i:${JSON.stringify(row.id)}`
 
 const compareLabel = (label, a, b) => {
   labels++
@@ -27,11 +30,18 @@ const compareLabel = (label, a, b) => {
 
   // per-key lookups
   const bByKey = new Map(b.map(r => [keyOf(r), r]))
-  if (bByKey.size !== b.length) { /* duplicate keys impossible for ids/phrases */ }
+  if (bByKey.size !== b.length || new Set(a.map(keyOf)).size !== a.length) {
+    console.log(`FAIL ${label}: duplicate ids or suggestions`)
+    return false
+  }
   for (const ra of a) {
     const rb = bByKey.get(keyOf(ra))
     if (!rb) {
       console.log(`FAIL ${label}: key ${keyOf(ra)} missing in rust`)
+      return false
+    }
+    if (!Number.isFinite(ra.score) || !Number.isFinite(rb.score)) {
+      console.log(`FAIL ${label}: nonfinite score for ${keyOf(ra)}: ${ra.score} vs ${rb.score}`)
       return false
     }
     const delta = rel(ra.score, rb.score)
@@ -82,5 +92,9 @@ for (const phase of ['fresh', 'afterMutation', 'afterBatchMutation', 'afterVacuu
 }
 
 console.log(`labels: ${labels}, rows: ${rows}, max score rel delta: ${maxScoreDelta}, tie-band reorders: ${tieReorders}`)
+if (tieReorders > 0 && !process.argv.includes('--allow-tie-reorders')) {
+  console.log(`FAIL: ${tieReorders} near-tie bands in a different order`)
+  failures++
+}
 console.log(failures === 0 ? 'BULK DIFFERENTIAL: ALL MATCH' : `${failures} FAILURES`)
 process.exit(failures === 0 ? 0 : 1)

@@ -45,14 +45,12 @@ const dump = (ms) => {
     out[`a:fuzzy:${query}`] = dumpSuggest(ms, query, { fuzzy: 0.2 })
     out[`a:or:${query}`] = dumpSuggest(ms, query, { combineWith: 'OR' })
   }
-  // Query trees: terms are dumped SORTED — JS match keys are insertion-ordered
-  // while the port's full-path match map is sorted, a documented divergence;
-  // the comparison checks set equality plus exact ids/scores.
+  // Query trees: ids, scores and the matched terms in order.
   for (const { name, tree } of treeQueries) {
     out[`t:${name}`] = ms.search(toQuery(tree)).map(r =>
-      ({ id: r.id, score: r.score, terms: [...r.terms].sort() }))
+      ({ id: r.id, score: r.score, terms: r.terms }))
     out[`tand:${name}`] = ms.search(toQuery(tree), { combineWith: 'AND' }).map(r =>
-      ({ id: r.id, score: r.score, terms: [...r.terms].sort() }))
+      ({ id: r.id, score: r.score, terms: r.terms }))
   }
   return out
 }

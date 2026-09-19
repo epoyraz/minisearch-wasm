@@ -24,6 +24,9 @@ const docsJSON = JSON.stringify(docs);
 const options = { fields: ['title', 'text'], autoVacuum: false,
   searchOptions: { prefix: true, fuzzy: 0.2, combineWith: 'AND' } };
 const filter = () => true;
+// A callback that runs inside scoring: the one kind of search that still moves
+// an index to the JavaScript engine.
+const boostDocument = () => 1;
 const discarded = docs.filter((_, i) => i % 4 === 0).map(doc => doc.id);
 const firstQuery = queries[0];
 const sha256 = value => createHash('sha256').update(value).digest('hex');
@@ -36,7 +39,7 @@ const stats = samples => ({ medianMs: quantile(samples, 0.5), p25Ms: quantile(sa
 const report = {
   createdAt: new Date().toISOString(), originalVersion: JSON.parse(readFileSync(resolve(root, 'node_modules/minisearch/package.json'))).version,
   publicVersion: JSON.parse(readFileSync(resolve(root, 'pkg/package.json'))).version,
-  publicRevision: 'unreleased working tree with JavaScript compatibility facade',
+  publicRevision: execFileSync('git', ['status', '--porcelain'], { cwd: fileURLToPath(new URL('../', import.meta.url)), encoding: 'utf8' }).trim() ? 'working tree with uncommitted changes' : 'committed tree',
   gitHead: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
   environment: { node: process.version, v8: process.versions.v8, platform: process.platform, arch: process.arch,
     cpu: cpus()[0].model.trim(), logicalCPUs: cpus().length, ramGiB: totalmem() / 2 ** 30 },
@@ -60,7 +63,7 @@ const report = {
 mkdirSync(dirname(outputPath), { recursive: true });
 const checkpoint = () => writeFileSync(outputPath, JSON.stringify(report, null, 2) + '\n');
 function build(kind, mode = 'wasm') {
-  const index = kind === 'original' ? new Original(options) : new Public(mode === 'javascript' ? { ...options, logger: () => {} } : options);
+  const index = kind === 'original' ? new Original(options) : new Public(mode === 'javascript' ? { ...options, processTerm: Original.getDefault('processTerm') } : options);
   if (kind === 'public' && mode === 'wasm') index.addAllJSON(docsJSON); else index.addAll(docs);
   if (kind === 'public') assert.equal(index.executionMode, mode);
   return index;
@@ -170,6 +173,8 @@ for (const dirty of [false, true]) {
   if (dirty) { a.discardAll(discarded); b.discardAll(discarded); }
   const perCall = dirty ? undefined : { filter };
   compare(b.search(firstQuery, perCall), a.search(firstQuery, perCall));
+  assert.equal(b.executionMode, 'wasm');
+  compare(b.search(firstQuery, { boostDocument }), a.search(firstQuery, { boostDocument }));
   assert.equal(b.executionMode, 'javascript'); free(b);
 }
 console.log(`Verified ${report.validation.comparedRows} result rows, max relative score delta ${report.validation.maxRelativeScoreDelta}`);
@@ -211,26 +216,44 @@ for (const api of ['loadJSON', 'loadJSONAsync']) {
   await paired(`${api}: same JSON input`, {
     original: { run: () => Original[api](originalJSON, options), value: countValue },
     public: { run: () => Public[api](originalJSON, options), value: countValue, cleanup: free },
-  }, { mode: 'javascript', samples: api === 'loadJSONAsync' ? Math.min(rounds, 5) : rounds });
+  }, { samples: api === 'loadJSONAsync' ? Math.min(rounds, 5) : rounds });
 }
-for (const dirty of [false, true]) {
-  await paired(dirty ? 'first query after 25% discard' : 'first callback query + transfer', Object.fromEntries(['original', 'public'].map(kind => [kind, {
+for (const [name, perCall, dirty, mode] of [
+  ['first query after 25% discard', undefined, true, 'wasm'],
+  ['first filter-callback query', { filter }, false, 'wasm'],
+  ['first boostDocument query + transfer', { boostDocument }, false, 'javascript'],
+]) {
+  await paired(name, Object.fromEntries(['original', 'public'].map(kind => [kind, {
     setup: () => { const index = build(kind); if (dirty) index.discardAll(discarded); return index; },
-    run: index => consume(index, 'full', [firstQuery], dirty ? undefined : { filter }),
-    verify: (_, index) => { if (kind === 'public') assert.equal(index.executionMode, 'javascript'); },
+    run: index => consume(index, 'full', [firstQuery], perCall),
+    verify: (_, index) => { if (kind === 'public') assert.equal(index.executionMode, mode); },
     cleanup: (_, index) => free(index),
-  }])), { mode: 'javascript', unit: `one query: ${firstQuery}` });
+  }])), { mode, unit: `one query: ${firstQuery}` });
 }
-const fallback = build('public', 'javascript');
-await paired('warm callback search (JS fallback)', {
+// Steady state on an index that has discarded a quarter of its documents.
+const dirtyOriginal = build('original'), dirtyPublic = build('public');
+dirtyOriginal.discardAll(discarded); dirtyPublic.discardAll(discarded);
+const dirtyIds = () => JSON.parse(dirtyPublic.docIdTable());
+for (const [api, label] of [['full', 'full objects'], ['joined', 'joined decoded'], ['raw', 'raw decoded']]) {
+  await paired(`dirty index, warm search: ${label}`, { original: { run: () => consume(dirtyOriginal) },
+    public: { setup: dirtyIds, run: ids => consume(dirtyPublic, api, queries, undefined, ids) } }, { unit: `${queries.length} queries` });
+}
+await paired('dirty index, warm autoSuggest', { original: { run: () => consumeSuggestions(dirtyOriginal) }, public: { run: () => consumeSuggestions(dirtyPublic) } }, { unit: `${queries.length} queries` });
+assert.equal(dirtyPublic.executionMode, 'wasm'); free(dirtyPublic);
+await paired('warm filter-callback search', {
   original: { run: () => consume(original, 'full', queries, { filter }) },
-  public: { run: () => consume(fallback, 'full', queries, { filter }) },
+  public: { run: () => consume(current, 'full', queries, { filter }) },
+}, { unit: `${queries.length} queries` });
+const fallback = build('public', 'javascript');
+await paired('warm boostDocument search (JS engine)', {
+  original: { run: () => consume(original, 'full', queries, { boostDocument }) },
+  public: { run: () => consume(fallback, 'full', queries, { boostDocument }) },
 }, { mode: 'javascript', unit: `${queries.length} queries` });
 await paired('vacuum after 25% discard', Object.fromEntries(['original', 'public'].map(kind => [kind, {
   setup: () => { const index = build(kind); index.discardAll(discarded); return index; },
   run: async index => { await index.vacuum({ batchSize: 1000, batchWait: 1 }); return index; },
   value: countValue, verify: index => assert.equal(index.dirtCount, 0), cleanup: free,
-}])), { mode: 'javascript', unit: `${discarded.length} discarded documents`, samples: Math.min(rounds, 5) });
+}])), { unit: `${discarded.length} discarded documents`, samples: Math.min(rounds, 5) });
 
 const size = value => ({ rawBytes: Buffer.byteLength(value), gzipBytes: gzipSync(value, { level: 9 }).length,
   brotliQuality6Bytes: brotliCompressSync(value, { params: { [constants.BROTLI_PARAM_QUALITY]: 6 } }).length });

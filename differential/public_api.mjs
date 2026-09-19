@@ -3,11 +3,13 @@
 // in the existing suites, using the generated core glue explicitly.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import Original from 'minisearch';
 import MiniSearch, { MiniSearchWasm as Wasm } from '../pkg/minisearch_wasm_node.js';
 import { MiniSearchWasm as Core } from '../pkg/minisearch_wasm_core.js';
 
-const rows = result => result.map(row => ({ ...row, score: Math.round(row.score * 1e10) / 1e10 }));
+// Scores are compared exactly: the Wasm build computes the same bits as V8.
+const rows = result => result;
 const pair = (options, documents) => {
   const js = new Original(options), wasm = new Wasm(options);
   js.addAll(documents); wasm.addAll(documents); return { js, wasm };
@@ -48,16 +50,19 @@ eq(defaultInstance.executionMode, 'wasm'); defaultInstance.free();
   wasm.free();
 }
 
-// Each search callback can trigger a one-time transfer from a populated Wasm
-// index. Nested query callbacks, default callbacks and suggestions are covered.
-for (const search of [
-  { filter: result => result.category === 'fruit' },
-  { boostDocument: (id, term, stored) => stored.category === 'fruit' && term.startsWith('app') ? 4 : 0.5 },
-  { boostTerm: (term, i, terms) => terms.length + i + term.length },
-  { prefix: (term, i, terms) => i === terms.length - 1 },
-  { fuzzy: (term, i) => i === 0 ? 0.4 : false },
-  { tokenize: text => text.split('|') },
-  { processTerm: term => [term, term + 'le'] },
+// Search callbacks over query terms and finished rows are evaluated on this
+// side of the boundary and keep a Wasm index in Wasm. Callbacks that run inside
+// scoring or tokenization trigger a one-time transfer from a populated index.
+// Nested query callbacks, default callbacks and suggestions are covered.
+for (const [mode, search] of [
+  ['wasm', { filter: result => result.category === 'fruit' }],
+  ['javascript', { boostDocument: (id, term, stored) => stored.category === 'fruit' && term.startsWith('app') ? 4 : 0.5 }],
+  ['wasm', { boostTerm: (term, i, terms) => terms.length + i + term.length }],
+  ['wasm', { prefix: (term, i, terms) => i === terms.length - 1 }],
+  ['wasm', { fuzzy: (term, i) => i === 0 ? 0.4 : false }],
+  ['wasm', { fuzzy: term => term.length > 3, prefix: term => term.length < 4 ? 'yes' : 0, boostTerm: (_term, i) => 1 / (i + 1), filter: result => result.terms.length > 0 }],
+  ['javascript', { tokenize: text => text.split('|') }],
+  ['javascript', { processTerm: term => [term, term + 'le'] }],
 ]) {
   const { js, wasm } = pair(options, documents);
   eq(wasm.executionMode, 'wasm');
@@ -65,12 +70,15 @@ for (const search of [
     eq(rows(wasm.search(query, search)), rows(js.search(query, search)));
     eq(rows(wasm.autoSuggest(query, search)), rows(js.autoSuggest(query, search)));
   }
-  eq(wasm.executionMode, 'javascript');
+  eq(wasm.executionMode, mode);
   const tree = { combineWith: 'OR', queries: ['pear', { queries: ['app'], ...search }] };
   eq(rows(wasm.search(tree)), rows(js.search(tree)));
+  eq(wasm.executionMode, mode);
   wasm.free();
   const configured = pair({ ...options, searchOptions: search }, documents);
   eq(rows(configured.wasm.search('app pear')), rows(configured.js.search('app pear')));
+  eq(rows(configured.wasm.autoSuggest('app pe')), rows(configured.js.autoSuggest('app pe')));
+  eq(configured.wasm.executionMode, mode);
   configured.wasm.free();
 }
 
@@ -87,11 +95,11 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   const { js, wasm } = pair(options, [{ id: 1, text: 'apple' }, { id: 2, text: 'apple apple' }, { id: 3, text: 'apply' }]);
   js.discard(2); wasm.discard(2);
   for (let i = 0; i < 4; i++) eq(rows(wasm.search(query, { prefix: true })), rows(js.search(query, { prefix: true })));
-  eq(wasm.termCount, js.termCount); wasm.free();
+  eq(wasm.termCount, js.termCount); eq(wasm.executionMode, 'wasm'); wasm.free();
 }
 {
   const { js, wasm } = pair(options, [{ id: 1, text: 'apple' }, { id: 2, text: 'pear' }]);
-  js.discard(1); wasm.discard(1); js.search('apple'); wasm.search('apple'); eq(wasm.termCount, js.termCount); wasm.free();
+  js.discard(1); wasm.discard(1); js.search('apple'); wasm.search('apple'); eq(wasm.termCount, js.termCount); eq(wasm.executionMode, 'wasm'); wasm.free();
 }
 
 // Object identity, primitive special values and live stored-field references.
@@ -111,10 +119,15 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   const { js, wasm } = pair(options, documents);
   for (const id of [NaN, Infinity, -Infinity, Symbol('missing'), 1n, {}, null, undefined]) eq(wasm.has(id), js.has(id));
   eq(wasm.executionMode, 'wasm');
+  // Reading stored fields keeps the index in Wasm and returns one object per
+  // document; an edit to it is honored by moving to the JavaScript engine.
   const stored = wasm.getStoredFields(1);
   assert.equal(stored, wasm.getStoredFields(1));
+  eq(stored, js.getStoredFields(1)); eq(wasm.getStoredFields(99), js.getStoredFields(99));
+  eq(rows(wasm.search('apple')), rows(js.search('apple'))); eq(wasm.executionMode, 'wasm');
   stored.category = 'changed'; js.getStoredFields(1).category = 'changed';
-  eq(rows(wasm.search('apple')), rows(js.search('apple'))); wasm.free();
+  eq(rows(wasm.search('apple')), rows(js.search('apple'))); eq(wasm.executionMode, 'javascript');
+  assert.equal(stored, wasm.getStoredFields(1)); wasm.free();
   assert.throws(() => Wasm.loadJSON('{}'), /same options/);
   await assert.rejects(Wasm.loadJSONAsync('{}'), /same options/);
 }
@@ -134,7 +147,7 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
     }
     if (i % 10 === 9) { await js.vacuum(); await wasm.vacuum(); }
   }
-  wasm.free();
+  eq(wasm.executionMode, 'wasm'); wasm.free();
 }
 
 // The optional jobboard tokenizer keeps its behavior after a callback transfer.
@@ -143,7 +156,8 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   index.addAll(documents);
   const search = { prefix: true, fuzzy: 0.3, weights: { prefix: 0.2 }, bm25: { b: 0.4 } };
   const before = rows(index.search('app', search));
-  eq(rows(index.search('app', { ...search, filter: () => true })), before);
+  eq(rows(index.search('app', { ...search, filter: () => true })), before); eq(index.executionMode, 'wasm');
+  eq(rows(index.search('app', { ...search, boostDocument: () => 1 })), before); eq(index.executionMode, 'javascript');
   index.free();
 }
 
@@ -152,7 +166,10 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   index.addAll([' C++ foo. ', 'a\u0301 \u0345 apple', 'C# ¼ dotted.name'].map((text, id) => ({ id, text })));
   const queries = ['C++', 'a\u0301', '\u0345', '¼', 'foo', 'dotted.name'];
   const before = queries.map(query => rows(index.search(query)));
-  queries.forEach((query, i) => eq(rows(index.search(query, { filter: () => true })), before[i]));
+  queries.forEach((query, i) => eq(rows(index.search(query, { filter: () => true, prefix: () => false })), before[i]));
+  eq(index.executionMode, 'wasm');
+  queries.forEach((query, i) => eq(rows(index.search(query, { boostDocument: () => 1 })), before[i]));
+  eq(index.executionMode, 'javascript');
   index.free();
 }
 
@@ -161,7 +178,8 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   const docs = ['abcde', 'abc', 'ab', 'abcd', 'abcf', 'abce', '2024', '2023'].map((text, id) => ({ id, text }));
   const { js, wasm } = pair(options, docs);
   const query = 'ab';
-  eq(rows(wasm.search(query, { prefix: true, filter: () => true })), rows(js.search(query, { prefix: true })));
+  eq(rows(wasm.search(query, { prefix: true, boostDocument: () => 1 })), rows(js.search(query, { prefix: true })));
+  eq(wasm.executionMode, 'javascript');
   for (const load of [() => Wasm.loadBytes(wasm.toBytes()), () => Wasm.loadNativeJSON(wasm.toNativeJSONString())]) {
     const copy = load(); eq(rows(copy.search(query, { prefix: true })), rows(wasm.search(query, { prefix: true }))); copy.free();
   }
@@ -205,15 +223,18 @@ for (const C of [Wasm, Core]) {
   assert.notEqual(index.idTableVersion, generation); eq(JSON.parse(index.docIdTable()), []); index.free();
 }
 
-// Normal JSON documents stay in Wasm; persisted auto-vacuum settings survive.
-// A mismatched remove can leave untracked stale postings. Compaction must
-// reject it before changing mappings (never a native trap or undefined JS IDs).
+// A mismatched remove leaves postings the dirt count does not know about.
+// Compaction drops them in either engine (never a native trap, never
+// undefined JS ids), and snapshots of that state load again.
 for (const javascript of [false, true]) {
   const index = new Wasm(options);
-  index.add({ id: 1, text: 'apple' });
-  if (javascript) index.search('apple', { filter: () => true });
-  index.remove({ id: 1, text: '' });
-  assert.throws(() => index.compact(), /stale postings/);
+  index.addAll([{ id: 1, text: 'apple pear' }, { id: 2, text: 'pear' }]);
+  if (javascript) index.search('apple', { boostDocument: () => 1 });
+  eq(index.executionMode, javascript ? 'javascript' : 'wasm');
+  index.remove({ id: 1, text: 'apple' });
+  const copy = Wasm.loadBytes(index.toBytes()); eq(copy.search('pear').map(row => row.id), [2]); copy.free();
+  index.compact();
+  eq(index.search('pear').map(row => row.id), [2]); eq(index.termCount, 1); eq(JSON.parse(index.docIdTable()), [2]);
   index.free();
 }
 
@@ -243,6 +264,6 @@ for (const javascript of [false, true]) {
 
 // Restrict code generation in a separate process, including the actual Wasm
 // path and getDefault's native helper. The test does not rely on a JS fallback.
-const csp = spawnSync(process.execPath, ['--disallow-code-generation-from-strings', new URL('./csp_regression.mjs', import.meta.url).pathname.replace(/^\/(\w:)/, '$1')], { encoding: 'utf8' });
+const csp = spawnSync(process.execPath, ['--disallow-code-generation-from-strings', fileURLToPath(new URL('./csp_regression.mjs', import.meta.url))], { encoding: 'utf8' });
 assert.equal(csp.status, 0, csp.stdout + csp.stderr);
 console.log(`PUBLIC API: ALL PASS (${checks} equality checks plus callback, identity, timing and CSP assertions)`);

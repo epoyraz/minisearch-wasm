@@ -1,5 +1,8 @@
-// Maintenance-path benchmark against JS MiniSearch: addAllAsync overhead and
-// vacuum cleanup latency/space reclamation through the built Wasm package.
+// Maintenance-path benchmark against JS MiniSearch: addAllAsync overhead,
+// vacuum cleanup latency/space reclamation and bulk removal, through the
+// public facade of the built package. The rows labelled "Wasm" are only
+// meaningful while the facade keeps the index on the Wasm engine, which is
+// asserted at the end.
 //
 // Run after `npm run build`:
 //   node differential/bench_maintenance.mjs
@@ -96,6 +99,14 @@ console.log(`  JS snapshot:   ${megabytes(jsDirtyBytes)} -> ${megabytes(jsCleanB
 console.log(`  Wasm snapshot: ${megabytes(wasmDirtyBytes)} -> ${megabytes(wasmCleanBytes)} (${((1 - wasmCleanBytes / wasmDirtyBytes) * 100).toFixed(1)}% reclaimed)`)
 console.log(`  vacuum latency ratio JS/Wasm: ${(jsVacuum.duration / wasmVacuum.duration).toFixed(2)}x`)
 
+console.log('\nRemoval (the oldest half, one removeAll)')
+const oldest = documents.filter(document => !discardedIds.includes(document.id)).slice(0, documentCount / 4)
+measure('JS removeAll', () => jsSync.value.removeAll(oldest))
+measure('Wasm removeAll', () => wasmSync.value.removeAll(oldest))
+if (jsSync.value.documentCount !== wasmSync.value.documentCount || jsSync.value.termCount !== wasmSync.value.termCount) {
+  throw new Error('removeAll left different indexes')
+}
+
 const jsIds = jsSync.value.search('token42').map(result => result.id)
 const wasmIds = wasmSync.value.search('token42').map(result => result.id)
 if (JSON.stringify(jsIds) !== JSON.stringify(wasmIds)) {
@@ -106,6 +117,10 @@ if (jsSync.value.dirtCount !== 0 || wasmSync.value.dirtCount !== 0) {
 }
 if (jsAsync.value.documentCount !== documentCount || wasmAsync.value.documentCount !== documentCount) {
   throw new Error('addAllAsync did not index every document')
+}
+
+for (const [label, index] of [['sync', wasmSync.value], ['async', wasmAsync.value]]) {
+  if (index.executionMode !== 'wasm') throw new Error(`the ${label} index left the Wasm engine: the "Wasm" rows measured JavaScript`)
 }
 
 console.log('\nMAINTENANCE BENCHMARK: VERIFIED')

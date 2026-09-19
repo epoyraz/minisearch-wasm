@@ -31,7 +31,7 @@ const sameResults = (label, js, wasm, query, jsOptions, wasmOptions) => {
     equal(wasm.autoSuggest(query, wasmOptions).map(s => s.suggestion), js.autoSuggest(query, jsOptions).map(s => s.suggestion), label + ' suggestions')
   }
 }
-const indexTerms = engine => (engine instanceof MiniSearch ? engine.toJSON() : engine.toJSON()).index.map(([term]) => term).sort()
+const indexTerms = engine => engine.toJSON().index.map(([term]) => term).sort()
 
 const options = { fields: ['title', 'text'], storeFields: ['category', 'title'] }
 const documents = [
