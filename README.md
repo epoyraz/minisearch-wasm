@@ -2,11 +2,16 @@
 
 A Rust + WebAssembly full-text search engine with a compatibility facade for
 [MiniSearch](https://github.com/lucaong/minisearch) 7.2.0. Ordinary JSON
-documents and declarative searches use Wasm. JavaScript callbacks, object
-identity and dirty-index queries use a bundled, pinned MiniSearch implementation.
-Check `index.executionMode` to see which engine owns the index.
+documents, searches (including `filter`, `prefix`, `fuzzy` and `boostTerm`
+callbacks), updates and vacuuming use Wasm, with results that are MiniSearch's
+down to the last bit of the score. Callbacks that run inside tokenization or
+scoring, and JavaScript values such as object ids, use a bundled, pinned
+MiniSearch implementation. Check `index.executionMode` to see which engine owns
+the index.
 
-Version **0.10.0** adds the public compatibility facade.
+Version **0.10.0** added the public compatibility facade. This repository is
+ahead of it: see [Unreleased changes](#unreleased-changes-after-0100) and
+[CHANGELOG.md](CHANGELOG.md).
 See [COMPATIBILITY.md](COMPATIBILITY.md) for the API, import formats, engine
 selection and persistence limitations.
 
@@ -36,25 +41,27 @@ startup. Without it every index runs on the bundled JavaScript engine, which is
 fully compatible but no faster. Node loads the Wasm module on import.
 
 **Whether it gets faster depends on how you use it.** An index runs in Wasm
-while its options are declarative and its documents hold plain values (string,
-number and boolean fields and ids). It moves to the JavaScript engine, once and
-permanently, when it meets something only JavaScript can do:
+while the native engine can reproduce MiniSearch exactly: plain documents
+(string, number and boolean fields and ids), every mutation, searches on a
+clean or a dirty index, vacuuming, `getStoredFields`, `loadJSON`, and the
+callbacks `filter`, `prefix`, `fuzzy`, `boostTerm`, `extractField`,
+`stringifyField` and `logger`, which the facade evaluates on the JavaScript
+side. It moves to the JavaScript engine, once and permanently, when it meets
+something only JavaScript can do:
 
-- a callback option: `processTerm`, `tokenize`, `extractField`,
-  `stringifyField`, `filter`, `boostDocument`, `boostTerm`, or `prefix` / `fuzzy`
-  given as functions (the declarative per-term arrays and the `filter` object
-  stay in Wasm);
-- `Date`, array or object field values, or object ids;
-- `getStoredFields(id)`;
-- `loadJSON` / `loadJSONAsync` (load prebuilt indexes with `loadBytes` to stay
-  in Wasm);
-- a vacuum, or the first search or suggestion after a `discard` or `replace`
-  while discarded postings remain.
+- `tokenize` or `processTerm` (constructor or search option) and
+  `boostDocument`, which run inside tokenization and scoring;
+- `Date`, array or object field values, object ids, `-0`, strings with lone
+  surrogates;
+- an edit to an object returned by `getStoredFields(id)` (MiniSearch hands out
+  its live stored fields; reading them is free);
+- options with no native form: `fields` that repeats a name, stored fields
+  named like result properties (`score`, `terms`, …), `Infinity` in search
+  options.
 
-The last point matters most in practice: an application that updates documents
-regularly will run mostly on the JavaScript engine, at about the original
-speed. `index.executionMode` reports `"wasm"` or `"javascript"`; after a
-`discard` it changes at the first query, not at the `discard` itself.
+`index.executionMode` reports `"wasm"` or `"javascript"`. In 0.10.0 on npm the
+list is longer: there a `discard` or `replace` followed by a search, any vacuum,
+any search callback, `getStoredFields` and `loadJSON` also transfer.
 
 ### Measured speedups
 
@@ -83,18 +90,34 @@ about 8× faster on an eligible index. The larger gains need code changes:
 `searchJoined` and `searchRaw` return compact result shapes (see the API
 section), and `loadBytes` replaces `loadJSON`.
 
-After one `discard`, before a vacuum, this build answers from the JavaScript
-engine, so the advantage disappears for the lifetime of that instance. 0.9.0,
-which has no fallback, keeps its speed:
+The table above is 0.10.0, measured on Windows with Node 24. After a `discard`
+0.10.0 answers from the JavaScript engine for the lifetime of the instance.
+This repository keeps a dirty index in Wasm, reproducing MiniSearch's lazy
+cleanup query by query. The same 20,000 documents and queries with a quarter of
+the documents discarded and not yet vacuumed, on the unreleased tree (macOS,
+Intel i7-9750H, Node 26, medians of 5 paired rounds, `npm run bench:public`;
+[full report](differential/results/2026-09-19-unreleased-vs-original.md)):
 
-| Operation, dirty index | MiniSearch 7.2.0 | 0.9.0 | 0.10.0 |
+| Operation, dirty index | MiniSearch 7.2.0 | 0.10.0 (Windows) | unreleased (macOS) |
 | --- | --- | --- | --- |
-| `search()` | 1.0× (430 ms) | 1.5× | 1.2× |
-| `searchJoined`, vs `search()` | 1.0× (430 ms) | 8.2× | 1.05× |
-| `autoSuggest` | 1.0× (319 ms) | 8.4× | 1.2× |
+| `search()` | 1.0× (750 ms) | 1.2× | 1.6× |
+| `searchJoined`, decoded, vs `search()` | 1.0× (714 ms) | 1.05× | 5.2× |
+| `searchRaw`, decoded, vs `search()` | 1.0× (711 ms) | – | 10× |
+| `autoSuggest` | 1.0× (526 ms) | 1.2× | 9.2× |
+| First query after discarding 25% | 17 ms | 1.3–1.6 s (transfer) | 18 ms |
+| First query with a `filter` callback | 20 ms | 1.3–1.6 s (transfer) | 19 ms |
+| Vacuum of 5,000 discarded documents | 81 ms | JavaScript | 25 ms |
 
-The facade also costs size: the package is 1.3 MB unpacked (0.9.0: 820 KB,
-0.8.0: 631 KB), because it ships the Wasm engine, the pinned JavaScript engine
+On the same run a clean index measured `search()` 1.5×, decoded `searchJoined`
+5.8×, decoded `searchRaw` 13×, `autoSuggest` 10×, `toBytes` 71×, `loadBytes`
+13× and `loadJSON` 0.9× (the native importer keeps the index in Wasm but is
+not faster than MiniSearch's loader). The columns come from different machines:
+compare within a column's ratios, not across columns. A query with a
+`boostDocument`, `tokenize` or `processTerm` callback still transfers the index
+once (1.3 s here) and then runs at MiniSearch's speed.
+
+The facade also costs size: the package is 1.4 MB unpacked, 437 KB as a tarball
+(0.10.0: 1.3 MB unpacked; 0.9.0: 820 KB; 0.8.0: 631 KB), because it ships the Wasm engine, the pinned JavaScript engine
 and ESM, CommonJS and browser-global builds. These numbers are workload- and
 machine-dependent; measure your own corpus before relying on a ratio.
 
@@ -205,7 +228,7 @@ MiniSearchWasm.getDefault("idField");    // "id"; callback defaults come back as
 
 // MiniSearch's callback search options have declarative forms here: one entry
 // per query term for prefix / fuzzy / boostTerm, and a stored-field filter.
-// Functions are also accepted; they switch this index to JavaScript mode.
+// Functions are accepted too; the facade evaluates them, and the index stays in Wasm.
 mini.search("softw eng", {
   prefix: [false, true], fuzzy: [0.2, false], boostTerm: [2, 1],
   filter: { company: "ACME" },
@@ -232,6 +255,36 @@ const later  = await MiniSearchWasm.loadJSONAsync(JSON.stringify(jsMiniSearch), 
 const native = mini.toNativeJSONString();
 const reloaded = MiniSearchWasm.loadNativeJSON(native);
 ```
+
+## Unreleased changes (after 0.10.0)
+
+Not on npm yet; [CHANGELOG.md](CHANGELOG.md) has the full list.
+
+- **Indexes stay in Wasm.** Discards and replaces, queries on a dirty index
+  (the engine reproduces MiniSearch's lazy cleanup, first query included),
+  vacuuming, `getStoredFields`, `loadJSON`/`loadJSONAsync`, and the callbacks
+  `filter`, `prefix`, `fuzzy`, `boostTerm`, `extractField`, `stringifyField` and
+  `logger` no longer move an index to the JavaScript engine.
+- **Scores are MiniSearch's, bit for bit.** The inverse document frequency uses
+  the logarithm algorithm V8 uses; about 4% of scores on small indexes used to
+  differ in the last bit.
+- **Snapshots.** Everything the engine can save loads again (negative field
+  averages, postings left by a changed document); what no reader accepts is
+  refused when saving, with a way out. A rejected snapshot can no longer grow
+  Wasm memory past the 256 MiB decode budget. `loadBytes` takes an
+  `ArrayBuffer` too.
+- **Robustness.** No query aborts the module (an absurd `fuzzy` distance used
+  to), and string parameters of the core are type-checked instead of trapping.
+- **Removal is linear.** Removing the oldest 50,000 of 100,000 documents took
+  48.7 s and takes 0.6 s.
+- **Fixes:** vacuum empties terms in MiniSearch's order (the radix key order
+  could differ afterwards), compact results score a repeated query term
+  correctly, the declarative `filter` compares numbers by value, a zero `boost`
+  means none, a mismatched `remove` no longer blocks `compact()`.
+- **Package:** ships this README and `LICENSE.txt`; named types for TypeScript
+  CommonJS consumers; declarations without the DOM library; MiniSearch is
+  bundled, not a dependency; the Node entry survives bundlers; the global
+  script is minified and defines only `MiniSearch`.
 
 ## Upgrading to 0.10.0
 
@@ -309,8 +362,7 @@ callbacks and copied stored object values. The 0.10.0 facade accepts
 callbacks and preserves live stored-field references, including Dates and
 objects, through its JavaScript engine.
 
-Verify the changes with `cargo test --locked`, `npm run build`, then
-`npm run test:wasm` (install `differential/` dependencies first).
+Verify the changes with `npm run build` and `npm test`.
 
 ## Compatibility and extensions
 
@@ -319,10 +371,11 @@ query trees, wildcard, default constructor, generic TypeScript types and
 `SearchableMap` subpath. [COMPATIBILITY.md](COMPATIBILITY.md) lists the execution
 modes and remaining limitations.
 
-- **JavaScript semantics:** callback configuration, non-scalar indexed/stored
-  values, object IDs, `getStoredFields()`, dirty searches and vacuum select the
-  pinned JavaScript engine. A transfer preserves radix traversal order. Its
-  first dirty query performs the same lazy cleanup as MiniSearch.
+- **JavaScript semantics:** `tokenize`, `processTerm` and `boostDocument`
+  callbacks, non-scalar indexed/stored values, object IDs and an edited
+  `getStoredFields()` object select the pinned JavaScript engine. A transfer
+  preserves radix traversal order. Dirty searches and vacuum stay native and
+  perform the same lazy cleanup as MiniSearch, query by query.
 - **Asynchronous work:** `addAllAsync` converts documents within each chunk;
   `loadJSONAsync` uses MiniSearch's yielding loader. Parsing the JSON string
   itself is synchronous, as in MiniSearch.
@@ -341,18 +394,20 @@ modes and remaining limitations.
 
 ## Benchmark results
 
-Current measurements of this build against MiniSearch, 0.8.0 and 0.9.0,
-including JavaScript execution mode on a dirty index, are in
-[Migrating from MiniSearch](#migrating-from-minisearch) above.
+Measurements of the public package against MiniSearch, 0.8.0 and 0.9.0, and
+of the unreleased tree on a dirty index, are in
+[Migrating from MiniSearch](#migrating-from-minisearch) above. There are two
+ways of timing the compact APIs in this document: the first table times the
+calls alone, the paired runs (`npm run bench:public`) include decoding the
+result (`JSON.parse` of the ids, splitting the terms), which is why
+`searchJoined` reads 8.2× in one and 4.5–5.8× in the other.
 
-The [paired public-package report](https://github.com/epoyraz/minisearch-wasm/blob/v0.10.0/differential/results/2026-09-18-public-vs-original.md)
-also measures the first query batch, compact-result decoding, and the one-time
-transfer to JavaScript. Median steady-state query timings do not represent that
-transfer cost. On that paired run, full `search()` was 1.42x faster, decoded
-`searchJoined` 4.48x and decoded `searchRaw` 13.18x. The first callback or dirty
-query took 1.28-1.59 seconds including transfer on 20,000 documents. Subsequent
-queries use the JavaScript engine, at roughly upstream speed. Reproduce this
-comparison with `npm run bench:public`.
+The [paired public-package report](https://github.com/epoyraz/minisearch-wasm/blob/main/differential/results/2026-09-18-public-vs-original.md)
+for 0.10.0 also measures the first query batch and that version's one-time
+transfer to JavaScript: full `search()` 1.42x faster, decoded `searchJoined`
+4.48x, decoded `searchRaw` 13.18x, and 1.28-1.59 seconds for the first callback
+or dirty query on 20,000 documents, after which 0.10.0 runs at MiniSearch's
+speed. The unreleased tree no longer transfers in those cases (see above).
 
 **Historical native measurements:** the numbers below predate the compatibility
 facade. They do not measure its transfer cost, bundled JavaScript size, JSON
@@ -440,6 +495,22 @@ The browser-global bundle exposes `MiniSearch` and `MiniSearch.init()`.
 `SearchableMap` is exported at `minisearch-wasm/SearchableMap` for both ESM and
 CommonJS. See [COMPATIBILITY.md](COMPATIBILITY.md) for direct asset imports and CSP.
 
+### Bundlers
+
+Browser bundles resolve to the fetch-based entry (also for `require`), which
+loads `minisearch_wasm_bg.wasm` from a URL next to the module. A bundler that
+does not copy that file has to be given it; pass the URL it produces to `init`:
+
+```js
+import MiniSearch, { init } from "minisearch-wasm";
+import wasmUrl from "minisearch-wasm/minisearch_wasm_bg.wasm?url"; // Vite; webpack: new URL("…", import.meta.url)
+await init(wasmUrl);
+```
+
+With esbuild use `--loader:.wasm=file`. A Node bundle that leaves the `.wasm`
+file behind still imports: the entry warns once and runs on the JavaScript
+engine until `initSync({ module: bytes })` is called.
+
 The package ships typed declarations for its whole surface
 (`MiniSearchWasmOptions`, `SearchOptions`, `Query`, `SearchResult`,
 `Suggestion`, `JoinedResults`, `RawResults`, `MiniSearchJSON`, …) with optional
@@ -448,33 +519,45 @@ under `strict` with TypeScript 7 as part of the checks below.
 
 ## Build
 
-```powershell
-cargo fmt -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-rustup target add wasm32-unknown-unknown
-npm install               # pinned compatibility engine, esbuild and TypeScript
-npm run build             # native glue + compatibility facade + ESM/CJS/global entries
-npm run test:wasm         # smoke, regression, JS-parity and API-parity suites against pkg/
-npm run test:types        # strict ES2022 TypeScript fixtures
-npm run test:package      # install tarball; check ESM/CJS/types/SearchableMap/global bundle
-npm run check:separators  # tokenizer table still matches this Node's Unicode data
+```sh
+npm install        # esbuild, TypeScript, Vitest and the pinned MiniSearch
+npm run build      # wasm-pack -> target/wasm-glue, then scripts/finalize-pkg.mjs -> pkg/
+npm test           # everything below
 ```
 
-Install `wasm-pack` with `cargo install wasm-pack` if needed. `npm run
-test:wasm` compares against the JavaScript engine, so run `npm install` in
-`differential/` once. After a Node upgrade, regenerate the tokenizer's separator
-table with `node scripts/gen-separators.mjs` (it writes `src/separators.rs`).
+`rust-toolchain.toml` pins Rust (with the `wasm32-unknown-unknown` target);
+`wasm-pack` 0.15.0 is needed on the `PATH` (`cargo install wasm-pack --version
+0.15.0`, or a release binary). `npm test` runs:
+
+```sh
+npm run test:native        # cargo fmt --check, clippy -D warnings, cargo test (+ release-mode snapshot tests)
+npm run test:differential  # native engine vs MiniSearch on a generated corpus (765,678 rows)
+npm run test:wasm          # smoke, regression, parity, facade and core-robustness suites against pkg/
+npm run test:types         # strict ES2022 TypeScript fixtures
+npm run test:package       # installs the tarball: ESM/CJS/types/global script/bundlers, README, determinism
+npm run test:upstream      # MiniSearch's own test suite against the facade
+npm run check:separators   # tokenizer table still matches this Node's Unicode data
+npm run check:size         # published files against scripts/size-budget.json
+```
+
+`npm run build:pkg` reassembles `pkg/` from the last Wasm build after a change
+to `js/`, the README or the scripts. After a Node upgrade that brings a new
+Unicode version, regenerate the tokenizer's separator table with `node
+scripts/gen-separators.mjs` (it writes `src/separators.rs`). CI
+(`.github/workflows/ci.yml`) builds and runs `npm test` on every push and pull
+request.
 
 ### Publishing
 
-```powershell
-npm run publish:pkg   # rebuilds, then `npm publish ./pkg`
+```sh
+npm run publish:pkg   # build, npm test, then `npm publish ./pkg`
 ```
 
 You must `npm login` first. The publishable artifact is the generated `pkg/`
-directory; its `package.json` metadata is injected by `scripts/finalize-pkg.mjs`
-on every build.
+directory, assembled from scratch by `scripts/finalize-pkg.mjs` on every build
+(manifest, entries, declarations, this README and the licenses). Tag the
+release (`vX.Y.Z`) when publishing: the documents link to files by tag.
 
-See `PORTING.md` for the porting history and conformance status, and
-`IMPROVEMENTS.md` for the open review items.
+See `PORTING.md` for the porting history and conformance status,
+`CHANGELOG.md` for what changed, and `TODO.md` / `IMPROVEMENTS-3.md` for the
+open review items.

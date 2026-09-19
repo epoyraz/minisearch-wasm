@@ -1,3 +1,7 @@
+> Historical: the agent prompt used for the 0.7.0 `removeAll` / `discardAll` work, kept as a record.
+> It describes the repository as it was then (no vacuum, `Vec<u16>` field lengths, a sibling
+> `../minisearch` checkout) and is not a guide to the current code; see `PORTING.md` and `README.md`.
+
 # Task: Implement `removeAll` / `discardAll` in minisearch-wasm
 
 ## Context

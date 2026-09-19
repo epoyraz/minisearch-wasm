@@ -6,7 +6,46 @@ back to one or more behaviors from those files. The 0.10.0 section is current;
 the 0.9.0 sections describe the published native-only API;
 the sections after them are the porting history in chronological order, each
 describing its own release, and a later section supersedes an earlier one where
-they disagree. Open native work is tracked in `IMPROVEMENTS.md`.
+they disagree. Open work is tracked in `TODO.md` and `IMPROVEMENTS-3.md`.
+
+## After 0.10.0 (unreleased): the native engine keeps the index
+
+The third review (`IMPROVEMENTS-3.md`) found that the 0.10.0 facade gave up on
+the native engine far more often than it had to. This supersedes the 0.10.0
+section's "dirty queries transfer" and "vacuum runs in JavaScript" bullets.
+
+- `src/mini_search/lazy_cleanup.rs` replicates JS `termResults` + `removeTerm`
+  on a dirty index: a posting list's document frequency starts at its full size
+  and drops by one per stale posting met, stale postings lose one frequency
+  step per query, emptied terms leave the radix tree at the moment JS deletes
+  them. The `&self` query paths raise a flag when they meet a stale posting;
+  only then is the query redone through the mutating replica, so a dirty index
+  whose queried terms are clean keeps the fused, cached fast path. The boundary
+  enables this with `setExactDirtyQueries`; a bare core's queries do not mutate.
+  `tests/lazy_cleanup_conformance.rs` pins MiniSearch's own output for a
+  history whose stale postings need three queries to disappear.
+- Vacuum removes emptied terms in tree order, like JS. The order decides the
+  key order of merged radix nodes; the earlier sorted order differed from JS in
+  27 of 300 random histories. The facade drives `vacuumStep` from a port of
+  JS `conditionalVacuum`/`performVacuuming`.
+- `src/js_math.rs` is fdlibm's `__ieee754_log`, which V8 uses for `Math.log`.
+  With it, scores through Wasm are MiniSearch's bit for bit
+  (`tests/js_math.rs`, reference bits from Node); the native differential keeps
+  its 1e-12 tolerance only for historical reasons.
+- Posting lists keep emptied entries as tombstones and sweep them when they
+  outnumber the live ones, so removal is amortized constant per posting.
+- Snapshot writers check the limits readers enforce (`check_persistable`);
+  readers accept every state the engine reaches (`tests/snapshot_robustness.rs`,
+  also run in release mode, where writers skip the full validation).
+- The facade evaluates `filter`, `prefix`, `fuzzy`, `boostTerm`, `extractField`
+  and `stringifyField` itself and keeps `getStoredFields` and `loadJSON` native;
+  `differential/wasm_residency.mjs` asserts the execution mode next to every
+  comparison with MiniSearch, and `differential/core_robustness.mjs` drives the
+  core through its generated glue with hostile input.
+
+Gate: `npm run build`, then `npm test` (see README, "Build"). It includes
+MiniSearch's own test files from `reference-tests/`, run against the facade by
+`upstream-suite/` with an enforced list of the 14 tests that read private state.
 
 ## 0.10.0: public JavaScript compatibility
 

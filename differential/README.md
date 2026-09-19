@@ -28,31 +28,31 @@ public first-query parity; `public_api.mjs` covers that separately.
 
 ## Run
 
-```powershell
-npm install
-node gen_corpus.mjs corpus.json
-node js_bulk.mjs corpus.json js_bulk.json
-cargo run --release --example dump_bulk corpus.json rust_bulk.json   # from repo root, paths relative to it
-node compare_bulk.mjs js_bulk.json rust_bulk.json
+From the repository root (the dependencies are the root's; nothing is installed
+in this directory):
+
+```sh
+npm run test:differential   # both native comparisons below; dumps go to target/differential/
 ```
 
-Small fixed-fixture autoSuggest comparison (mirrors `examples/dump_autosuggest.rs`):
+which runs the bulk comparison (`gen_corpus.mjs` → `js_bulk.mjs` and
+`cargo run --release --example dump_bulk` → `compare_bulk.mjs`) and the small
+fixed-fixture autoSuggest comparison (`js_autosuggest.mjs` and `cargo run
+--example dump_autosuggest` → `compare.mjs`). `compare_bulk.mjs` fails on
+duplicate or type-confused ids, nonfinite scores, and on near-tie bands in a
+different order (`--allow-tie-reorders` for a platform whose native `ln` rounds
+the other way; through Wasm, scores are MiniSearch's bit for bit).
 
-```powershell
-node js_autosuggest.mjs > js_out.json
-cargo run --example dump_autosuggest > rust_out.json   # from repo root
-node compare.mjs js_out.json rust_out.json
-```
+The Wasm suites require `npm run build` first:
 
-End-to-end Wasm boundary smoke test (requires `npm run build` at the repo root
-first):
-
-```powershell
-node wasm_smoke.mjs
-node high_priority_regressions.mjs
-node compat_parity.mjs
-node api_parity.mjs
-node public_api.mjs
+```sh
+node differential/wasm_smoke.mjs
+node differential/high_priority_regressions.mjs
+node differential/compat_parity.mjs
+node differential/api_parity.mjs
+node differential/public_api.mjs
+node differential/wasm_residency.mjs
+node differential/core_robustness.mjs
 ```
 
 Or run `npm run test:wasm` from the repository root. The high-priority suite
@@ -68,6 +68,15 @@ in both directions against the JS engine on fresh, dirty and vacuumed indexes.
 rejection of callback options and the declarative forms that replace them,
 `Date`/`toString` field values, the tokenizer's Unicode tables, `getDefault`,
 `logger`, `loadJSONAsync` and MiniSearch-format `toJSON`/`loadJSON`.
+
+`wasm_residency.mjs` asserts that an index stays on the Wasm engine through a
+seeded 900-step history of mutations, unwarmed dirty queries, vacuums, search
+callbacks, compact forms and suggestions, comparing every step with MiniSearch
+(scores exactly), and covers extracted fields, `getStoredFields`, native
+`loadJSON`, options set to `undefined` and inputs that select the JavaScript
+engine. `core_robustness.mjs` drives the raw core with hostile arguments,
+absurd fuzzy distances, snapshots of every state the engine reaches and a
+crafted snapshot that must not outgrow the decode budget.
 
 The public suite verifies all supported callbacks, JS object identity and stored
 references, first dirty-query scores and lazy cleanup, mixed mutation histories,
@@ -91,7 +100,7 @@ bundle, module Worker, callback and async JSON checks in the page and in
 
 The public compatibility package has a separate paired benchmark:
 
-```powershell
+```sh
 npm run bench:public -- differential/bench_corpus.json differential/results/public-benchmark.json 9
 ```
 
@@ -111,7 +120,7 @@ replace a browser or production-workload benchmark.
 corpus. Native engine benchmark and end-to-end Wasm-vs-JS benchmark (the
 latter needs `npm run build` first):
 
-```powershell
+```sh
 node gen_corpus.mjs bench_corpus.json 20000
 cargo run --release --example bench_search differential/bench_corpus.json   # from repo root
 node bench_wasm.mjs bench_corpus.json
@@ -120,7 +129,7 @@ node bench_wasm.mjs bench_corpus.json
 Maintenance-path benchmark for `addAllAsync` overhead and vacuum
 latency/snapshot reclamation (uses 5,000 documents by default):
 
-```powershell
+```sh
 npm run bench:maintenance
 # Optional: BENCH_DOCS=10000 BENCH_CHUNK=500 BENCH_VACUUM_BATCH=1000 npm run bench:maintenance
 ```
