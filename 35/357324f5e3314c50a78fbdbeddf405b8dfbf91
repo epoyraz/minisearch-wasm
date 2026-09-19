@@ -1,0 +1,49 @@
+IMPROVEMENTS-3.md
+  s_d5e94ebe2c49f9::t_dd6cab41b5b544 1-15,17,20-24,27-33,36-42,45-58,61-65,68-77,80-85,88-92,95-101,104-108,111-128,131-136,139-143,146-155,158-164,167-173,176-184,187-193,196-202,204-211
+  s_d5e94ebe2c49f9::t_3ab4992c4b226f 16
+  s_d5e94ebe2c49f9::t_fe3e072e809911 19,25,34-35,43-44,59-60,66-67,78-79,86-87,93-94,102-103,109-110,129-130,137-138,144-145,156-157,165-166,174-175,185-186,194-195,203
+  s_d5e94ebe2c49f9::t_726b89fd1cfc7d 18,26
+CHANGELOG.md
+  s_d5e94ebe2c49f9::t_43e665f670c62a 1-100
+README.md
+  s_d5e94ebe2c49f9::t_7101510b199769 93-97,101,103-117
+  s_d5e94ebe2c49f9::t_61691d11748e1d 259-288,365,374-378,405,498-513,522-540,543-548,552-553,557-559,561-563
+  s_d5e94ebe2c49f9::t_796a9ef4bf8078 5-14,44-64,231
+  s_d5e94ebe2c49f9::t_1c6b6ecca2501a 119-120,397-403,406-410
+  s_d5e94ebe2c49f9::t_66defba1a6a830 98-99
+  s_d5e94ebe2c49f9::t_58479ec4882906 118,404
+TODO.md
+  s_d5e94ebe2c49f9::t_f52ed0be5c5eb1 1-2,4,6,8,10,12,19,21,27-29,35,37
+  s_d5e94ebe2c49f9::t_726b89fd1cfc7d 5
+  s_d5e94ebe2c49f9::t_2dfb7013f0240a 3,7,9,11,13-18,20,22-26,30-34,36,38-40
+codex.md
+  s_d5e94ebe2c49f9::t_43e665f670c62a 1-4
+differential/README.md
+  s_d5e94ebe2c49f9::t_180aed32178309 31-32,34-35,38-55,72-79
+  s_d5e94ebe2c49f9::t_dfac51f3cdf40a 103,123,132
+  s_d5e94ebe2c49f9::t_c0b883ede10e0b 80
+PORTING.md
+  s_d5e94ebe2c49f9::t_525a13dacdb659 9-48
+COMPATIBILITY.md
+  s_d5e94ebe2c49f9::t_cce2cb3f364be3 1,4-7,15,18-24,26-29,34-57,67-70,77-82
+LICENSE.txt
+  s_d5e94ebe2c49f9::t_43e665f670c62a 1-2
+differential/results/2026-09-19-unreleased-vs-original.md
+  s_d5e94ebe2c49f9::t_726b89fd1cfc7d 1-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "35357324f5e3314c50a78fbdbeddf405b8dfbf91",
+  "prompts": {},
+  "sessions": {
+    "s_d5e94ebe2c49f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2ec96d6b-a913-482b-bd80-1bef5edaca2b",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
