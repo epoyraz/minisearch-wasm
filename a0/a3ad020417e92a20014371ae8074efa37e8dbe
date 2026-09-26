@@ -1,0 +1,19 @@
+TODO.md
+  s_298311d2958204::t_7a01c10a33cf8f 7,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a0a3ad020417e92a20014371ae8074efa37e8dbe",
+  "prompts": {},
+  "sessions": {
+    "s_298311d2958204": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c5a8b43-dec2-4ca9-9c9d-3c085b589fb9",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
