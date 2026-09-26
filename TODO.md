@@ -2,6 +2,12 @@
 
 What is left after the third review. Item numbers refer to [IMPROVEMENTS-3.md](IMPROVEMENTS-3.md), whose status notes say what was done for each item; [CHANGELOG.md](CHANGELOG.md) lists the changes.
 
+## State (27 September 2026): 0.12.0 on branch `next`
+
+0.11.0 is published. The 0.12.0 work is committed on branch `next` and pushed to `origin/next`; it is not merged into `main`, tagged or published yet: ids and stored fields on the JavaScript side, `tokenize`/`processTerm` and `boostDocument` in Wasm, faster `search()`/`addAll`/`loadJSON`, snapshot version 5, `toJSON()` byte-identical to MiniSearch's, the `core-api` build split. [CHANGELOG.md](CHANGELOG.md) has the list, [PORTING.md](PORTING.md) the design, [differential/results/2026-09-27-0.12.0-vs-original.md](differential/results/2026-09-27-0.12.0-vs-original.md) the benchmark. `npm run build` now builds `pkg/` and the engine test package `target/pkg-core`; `npm test` passed on Windows (Node 24.21, Rust 1.96.0, wasm-pack 0.15.0).
+
+To release: merge `next` into `main`, tag `v0.12.0`, and publish the tested `pkg/` with `npm publish ./pkg` from a real terminal (npm needs the maintainer's second factor; from Claude Code it fails with EOTP). Snapshots written by 0.12.0 cannot be read by 0.11.0: consumers that ship prebuilt snapshots (jobboard-web) rebuild them with 0.12.0.
+
 ## State (19 September 2026)
 
 Everything in sections A, B and C of the review is implemented and on `main`, in five commits on top of the 0.10.0 release commit `888b991`:
@@ -23,9 +29,9 @@ What was verified, and what was not:
 Deliberately left alone:
 
 - `fuzzy: 1.5` and other fractional distances of 1 or more: MiniSearch indexes a typed array with the fraction and finds nothing; here it is an edit distance.
-- The raw core stores `String(value)` for a field that is both indexed and stored. The facade never sends it such a value.
-- `tokenize`, `processTerm` and `boostDocument` still select the JavaScript engine.
-- The Wasm file grew to 786 KB.
+- The raw core stores `String(value)` for a field that is both indexed and stored. The facade never sends it such a value (0.12.0: the facade stores values itself).
+- `tokenize`, `processTerm` and `boostDocument` still select the JavaScript engine (0.12.0: they stay in Wasm).
+- The Wasm file grew to 786 KB (0.12.0: 826 KB, with the `core-api` bindings left out).
 
 ## Continuing on another machine
 
@@ -58,17 +64,19 @@ On the Mac there is no global `rustup`: the Wasm build used an isolated toolchai
 
 ## Engine
 
-- [ ] **Item 13, remainder** – keep indexes with `tokenize` / `processTerm` in Wasm: a pre-tokenized `add` path, or declarative `stopWords`, `minTermLength` and diacritic folding for the common cases. `boostDocument` needs a callback inside scoring and will stay JavaScript.
-- [ ] **Item 17, size** – the Wasm file is 786 KB (0.8.0: 581 KB). Try `opt-level = "s"` with the benchmark as a guard, and put the MiniSearch-JSON interop behind a feature.
-- [ ] The raw core stores `String(value)` for a field that is both indexed and stored (item 10). The facade never sends such a value; fixing it needs the engine to take the indexed text and the stored value separately.
+- [x] **Item 13, remainder** – `tokenize` / `processTerm` stay in Wasm (0.12.0: pre-tokenized terms), and so does `boostDocument` (called back from inside scoring).
+- [ ] **Item 17, size** – the Wasm file is 826 KB (0.11.0: 796 KB, 0.8.0: 581 KB). 0.12.0 leaves the `core-api` bindings out; `opt-level = "s"` measured -14% but is untried against the benchmark.
+- [x] The raw core stores `String(value)` for a field that is both indexed and stored (item 10). 0.12.0: the facade stores values itself and sends the engine texts.
 - [ ] A long-lived index that never vacuums cannot be saved past 2,000,000 internal id slots; the writer says so and `compact()` cures it. Saving could renumber on the fly instead.
-- [ ] The native importer (`loadJSON`) is about 10% slower than MiniSearch's loader on 20,000 documents and refuses a few inputs MiniSearch accepts (the facade falls back to MiniSearch's loader for those).
+- [x] The native importer (`loadJSON`) was about 10% slower than MiniSearch's loader. 0.12.0 reads postings directly and is about 1.8× faster; it still refuses a few inputs MiniSearch accepts (non-canonical keys, entries for unknown documents), which MiniSearch's loader then loads.
+- [ ] Per-node `boostDocument` (a query-tree node with its own) still transfers: the engine calls one hook per query.
+- [ ] Inside `boostDocument` the index cannot be searched or changed (the engine holds its borrow while it calls back); MiniSearch allows it.
 
 ## Facade
 
 - [ ] `searchRaw`'s `termTable` differs by engine (the native one lists expansion terms no hit refers to); ids and offsets are consistent in each.
 - [ ] Truthy and falsy coercions that MiniSearch tolerates (`prefix: 1`, `fuzzy: '0.2'`) throw in Wasm mode.
-- [ ] A field named like an `Object.prototype` member (`constructor`, `toString`) indexes the inherited function's text in MiniSearch and nothing here.
+- [x] A field named like an `Object.prototype` member (`constructor`, `toString`) indexes the inherited function's text in MiniSearch and nothing here. 0.12.0: extraction runs in JavaScript.
 - [ ] MiniSearch's own `wildcard` symbol (from a separately installed `minisearch`) is not recognized; `MiniSearch.wildcard` from this package is.
 - [ ] Read-only `_currentVacuum` / `_dirtCount` getters would let code written against MiniSearch's private fields keep working (item 15).
 

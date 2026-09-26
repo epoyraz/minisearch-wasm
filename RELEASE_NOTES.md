@@ -1,55 +1,59 @@
-# minisearch-wasm 0.11.0
+# minisearch-wasm 0.12.0
 
-This release keeps more MiniSearch-compatible operations on the Rust/Wasm
-engine, fixes callback and asynchronous scheduling differences, and strengthens
-snapshot safety and release validation. The compatibility target is MiniSearch
-7.2.0; `index.executionMode` reports the engine in use.
+This release keeps indexes on the Rust/Wasm engine in almost every case and
+makes the drop-in paths fast. The compatibility target is MiniSearch 7.2.0;
+`index.executionMode` reports the engine in use.
 
 ## Changes
 
-- Dirty queries reproduce MiniSearch's first-query scores and lazy cleanup in
-  Wasm. Vacuum, stored-field reads, JSON loading and supported search/extraction
-  callbacks also stay native instead of transferring the whole index.
-- Scores use V8's logarithm algorithm for exact parity with MiniSearch on V8.
-- Filters observe traversal order before sorting, including stateful callbacks
-  and score edits. Compact searches evaluate each query and callback once.
-- Native `loadJSONAsync` yields between document-map and posting batches.
-  `addAllAsync` uses MiniSearch's scheduler, including deferred short batches.
-- Removal uses posting tombstones instead of repeatedly shifting large lists.
-- Snapshot writers reject states they cannot reload; readers charge allocations
-  before reserving memory. Fuzzy-query limits avoid trapping the Wasm module.
-- Native vacuum preserves radix order and supports searches and mutations while
-  maintenance is running. Compact results handle repeated query terms correctly.
-- Deterministic packaging ships the current README and licenses, improves
-  CommonJS types and browser bundling, and gates publication on `npm test`.
+- Document ids and stored fields live on the JavaScript side, kept as
+  MiniSearch keeps them: ids of any type, stored fields as live objects. Object
+  ids, Dates and other JavaScript values stay in Wasm, and `getStoredFields`
+  returns the live object, edits included.
+- `tokenize` and `processTerm` callbacks run on the JavaScript side exactly as
+  MiniSearch calls them, and the engine indexes and searches their terms.
+  `boostDocument` runs in Wasm: the engine calls it back while it scores, in
+  MiniSearch's order. Custom tokenizers, stop words, stemmers and document
+  boosts no longer move an index to the JavaScript engine.
+- `search()` builds its results in one JavaScript loop from short ids: about
+  2.4× faster than 0.11.0 (2.2× MiniSearch). `addAll` batches documents and
+  indexes with fewer allocations (about 2× faster, 3.3× MiniSearch), and
+  `loadJSON` reads postings straight into the engine (about 2.5× faster, 1.8×
+  MiniSearch's loader). `loadJSONAsync` yields where MiniSearch's does.
+- Binary snapshots (version 5) are about 40% smaller; ids and stored fields
+  travel as JSON next to the engine snapshot.
+- `toJSON()` matches MiniSearch's byte for byte in ordinary use: key order,
+  field averages, short ids (renumbered only after heavy churn), and
+  `removeAll()` keeps the dirt count.
+- The published Wasm module leaves out engine bindings the facade no longer
+  uses.
 
 ## Compatibility and migration
 
-Existing default/named imports, initialization, MiniSearch JSON versions 1 and
-2, and native version-4 snapshots remain supported. No reindexing is required
-solely to upgrade from 0.10.0. Internal ID tables must still be refreshed after
-mutations or compaction when `idTableVersion` changes.
+Imports, initialization and the MiniSearch API are unchanged. MiniSearch JSON
+(versions 1 and 2) and native snapshots from 0.9.0 to 0.11.0 still load; new
+snapshots cannot be read by 0.11.0 or earlier. An index built with `tokenize`
+or `processTerm` callbacks needs them again when its snapshot is loaded, and
+says so otherwise.
 
-`tokenize`, `processTerm`, `boostDocument`, reference-valued documents and edits
-to returned stored-field objects still select the bundled JavaScript engine.
-Native async JSON loading batches reconstruction; parsing, initial allocation,
-per-list sorting and final validation remain synchronous.
+What still selects the JavaScript engine: a query-tree node with a
+`boostDocument` of its own, text or terms the engine cannot hold (not strings,
+lone surrogates), `fields` that is not an array or repeats a name, and
+`Infinity` in search options. Inside `boostDocument` the index can be read
+(`has`, `getStoredFields`, counts) but not searched or changed.
 
-Read the [compatibility guide](https://github.com/epoyraz/minisearch-wasm/blob/v0.11.0/COMPATIBILITY.md)
-for remaining differences, engine selection and persistence limitations.
-Historical benchmark reports retain their original versions and environments;
-their timings are not new measurements of this final release artifact.
+Read the [compatibility guide](https://github.com/epoyraz/minisearch-wasm/blob/v0.12.0/COMPATIBILITY.md)
+for the details, and the [benchmark report](https://github.com/epoyraz/minisearch-wasm/blob/v0.12.0/differential/results/2026-09-27-0.12.0-vs-original.md)
+for the measurements.
 
 ## Validation
 
-The release gate includes formatting, strict Clippy, native and release-mode
-snapshot tests, differential comparisons with MiniSearch, Wasm and facade
-regressions, TypeScript, packed-package checks, upstream tests, Unicode tables
-and package-size budgets. The upstream runner explicitly records expected
-failures for private implementation details and unsupported internals.
+The release gate includes formatting, strict Clippy for both builds, native and
+release-mode snapshot tests, differential comparisons with MiniSearch, the
+engine suites (built with `core-api`), the facade suites (callback call
+sequences, `boostDocument` calls on clean and dirty indexes, the serialized
+index byte for byte after a random mutation history), TypeScript,
+packed-package checks, MiniSearch's own test suite, Unicode tables and
+package-size budgets.
 
-The browser contract separately checks ESM, SearchableMap, the global bundle,
-module Workers, native callbacks and incremental JSON loading under CSP that
-allows Wasm compilation without JavaScript string evaluation.
-
-Install with `npm install minisearch-wasm@0.11.0`.
+Install with `npm install minisearch-wasm@0.12.0`.

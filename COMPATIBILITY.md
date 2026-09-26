@@ -1,10 +1,12 @@
 # Public API compatibility
 
-The public facade targets the documented MiniSearch **7.2.0** API. It uses the
-Rust/Wasm engine for everything that engine can reproduce exactly, and the
-bundled, exact-version JavaScript implementation for behavior that depends on
-JavaScript callbacks inside indexing or scoring, or on JavaScript values.
-Changes marked *since 0.11.0* distinguish this release from 0.10.0.
+The public facade targets the documented MiniSearch **7.2.0** API. The
+Rust/Wasm engine indexes and scores; the facade keeps what MiniSearch keeps in
+JavaScript (document ids and stored fields) the way MiniSearch keeps it, and
+runs the JavaScript callbacks, calling them as MiniSearch calls them. The
+bundled, exact-version JavaScript implementation takes over only for the few
+inputs listed below. Changes marked *since 0.12.0* distinguish this release
+from 0.11.0, *since 0.11.0* from 0.10.0.
 
 ## Choosing an engine
 
@@ -14,18 +16,21 @@ Changes marked *since 0.11.0* distinguish this release from 0.10.0.
 | --- | --- |
 | Constructor after Wasm initialization | Wasm |
 | Constructor before browser initialization | JavaScript |
-| Plain documents with scalar, finite indexed/stored values and IDs | Remain in Wasm |
+| Documents, whatever their ids and stored values: objects, Dates, arrays, getters, `-0`, `NaN`, strings with lone surrogates | Remain in Wasm; ids and stored fields live in JavaScript `Map`s and objects, as in MiniSearch (*since 0.12.0*; 0.11.0 transfers) |
 | `add`, `remove`, `removeAll`, `discard`, `discardAll`, `replace` | Remain in Wasm |
 | Search or suggestions with discarded postings | Remain in Wasm; the engine reproduces MiniSearch's lazy cleanup, first query included (*since 0.11.0*; 0.10.0 transfers) |
 | Manual or automatic vacuum, `compact()` | Remain in Wasm; the facade runs MiniSearch's scheduler over native vacuum steps (*since 0.11.0*; 0.10.0 transfers) |
 | Search callbacks `filter`, `prefix`, `fuzzy`, `boostTerm`, in options, query-tree nodes or constructor defaults | Remain in Wasm; evaluated by the facade (*since 0.11.0*; 0.10.0 transfers) |
-| Constructor callbacks `extractField`, `stringifyField`, `logger` | Remain in Wasm; evaluated by the facade, or called by the engine (*since 0.11.0*) |
-| `getStoredFields(id)` | Remain in Wasm; one object per document. Editing a returned object transfers, keeping the edit (*since 0.11.0*) |
+| Callbacks `tokenize` and `processTerm`, in the constructor, search options or query-tree nodes, term arrays included | Remain in Wasm; the facade calls them as MiniSearch does and the engine indexes and searches their terms (*since 0.12.0*; 0.11.0 transfers) |
+| `boostDocument` in the constructor's or a search's options | Remain in Wasm; the engine calls it back while it scores, for the same documents and terms in the same order as MiniSearch (*since 0.12.0*; 0.11.0 transfers) |
+| Constructor callbacks `extractField`, `stringifyField`, `logger` | Remain in Wasm; evaluated by the facade (*since 0.11.0*) |
+| `getStoredFields(id)` | Remain in Wasm; the live stored-fields object, as upstream: edits show up in results (*since 0.12.0*; 0.11.0 transfers on an edit) |
 | `loadJSON` / `loadJSONAsync` | Wasm, through the native importer; the async loader reconstructs document maps and postings in batches with timer yields. What it refuses is loaded by MiniSearch's loader (*since 0.11.0*) |
-| Load a native version-4 snapshot | Wasm; legacy object IDs/stored values trigger a transfer |
-| Callbacks `tokenize`, `processTerm` (constructor or search) and `boostDocument` | JavaScript: they run inside tokenization or scoring |
-| Object IDs, Dates, arrays, getters, custom objects, nonfinite values, `-0`, strings with lone surrogates | Transfer before indexing, preserving JS values |
-| Options with no native form: `fields` that is not an array or repeats a name, a stored field named `score`, `terms`, `queryTerms` or `match` (or `id` under another `idField`), `Infinity` in search options | JavaScript from construction |
+| Load a native snapshot of 0.9.0 or later | Wasm |
+| A query-tree node with a `boostDocument` of its own | Transfer: the engine calls one `boostDocument` per query |
+| A field text (what `stringifyField` returns) that is not a string, or has lone surrogates; a term from `processTerm` that is `''` or not a string | Transfer at that document, without calling any callback twice |
+| A query term containing U+0000 or a lone surrogate | Transfer |
+| Options with no native form: `fields` that is not an array or repeats a name, `Infinity` in search options | JavaScript from construction |
 | A per-term callback returning something other than a boolean or a finite number; `boost` or `bm25` explicitly `undefined` | Transfer, so that MiniSearch's own behavior (or error) applies |
 
 A transfer converts the existing index once, preserves compressed radix-tree
@@ -36,11 +41,21 @@ bundle size.
 
 Differences that remain, all in Wasm mode:
 
-- `removeAll()` also resets `dirtCount`; MiniSearch keeps it.
-- After a vacuum that leaves no dirt the facade renumbers internal ids
-  (`idTableVersion` changes); `toJSON()` then shows the new numbers.
 - `fuzzy` values of 1 or more that are not whole numbers are edit distances
-  here; MiniSearch indexes a typed array with them and finds nothing.
+  here; MiniSearch indexes its Levenshtein matrix with the fraction, which
+  gives arbitrary results.
+- Inside `boostDocument` the index cannot be searched or changed (it throws);
+  `has`, `getStoredFields` and the count getters work. MiniSearch allows both.
+- Once most short ids are free (removed documents outnumber live ones), a
+  vacuum that leaves no dirt renumbers them (`idTableVersion` changes);
+  `toJSON()` then shows the new numbers. MiniSearch never renumbers.
+- `remove` logs its `version_conflict` warnings after reading the whole
+  document, not interleaved with the callbacks that read it.
+
+Before 0.12.0, `removeAll()` also reset `dirtCount`, every clean vacuum
+renumbered short ids, `toJSON()` had its own key order and a zero for every
+field average, and a field repeated in the search option `fields` was scored
+twice.
 
 Scores are the same bits as MiniSearch's, not approximations: the engine
 computes the inverse document frequency with the logarithm algorithm V8 uses
@@ -65,7 +80,9 @@ Every MiniSearch callback is supported: `extractField`, `stringifyField`,
 `boostDocument`, `boostTerm`, `prefix`, and `fuzzy`; the table above says which
 engine each one leaves an index on. Default functions
 returned by `getDefault` can be passed back as options. Object IDs use identity;
-stored objects and Dates retain their references. Native `filter` callbacks see
+stored objects and Dates retain their references. A subclass that overrides
+`add`, `discard` or `search` sees `addAll`, `discardAll` and `autoSuggest` call
+its methods, and the static loaders return instances of the subclass. Native `filter` callbacks see
 rows in traversal order, before sorting, so stateful predicates and score edits
 behave like MiniSearch. `loadJSONAsync` yields while rebuilding document maps
 and postings, including within a common term's posting list. JSON parsing,
@@ -126,8 +143,15 @@ Browser CSP must still allow Wasm compilation, for example
 Like upstream, serialization cannot preserve prototypes, object identity,
 functions, Symbols, BigInts or cyclic objects. Re-supply constructor callbacks.
 
-In Wasm mode, `toBytes` and `toNativeJSON` retain the validated native version-4
-formats. In JavaScript mode they use a separate compatibility snapshot:
+In Wasm mode, `toBytes` writes the engine's validated binary snapshot (version
+5 *since 0.12.0*: frequency-1 postings take one byte less) followed by the ids
+and stored fields as JSON, in a byte envelope that starts with `MSWID01\n`;
+`toNativeJSON` writes `format: "minisearch-wasm/identity", version: 1` with the
+engine's JSON snapshot and the same identity. Ids and stored values therefore
+follow JSON's rules, like MiniSearch's own serialization. An index built with
+`tokenize` or `processTerm` callbacks records their names, and loading requires
+them again. Snapshots written by 0.9.0 to 0.11.0 (version 4) still load. In
+JavaScript mode `toBytes` and `toNativeJSON` use a separate compatibility snapshot:
 `format: "minisearch-wasm/compat", version: 1`. Byte envelopes start with
 `MSWJS01\n` and contain UTF-8 JSON. These are not native compact binaries and do
 not have the native binary reader's validation/resource limits. Use trusted
@@ -156,7 +180,8 @@ those JavaScript values.
 
 The active vacuum and queued vacuum have distinct promises; repeated requests
 reuse the queued promise, matching upstream. ID compaction runs after maintenance
-finishes with no remaining dirt. Explicit `compact()` also works on a clean
+finishes with no remaining dirt, once most short ids are free (*since 0.12.0*;
+before, after every such vacuum). Explicit `compact()` also works on a clean
 native index and rejects dirty or currently vacuuming indexes. It preserves
 search/radix order while reclaiming removed ID slots and native scratch buffers.
 Refresh cached raw ID tables whenever `idTableVersion` changes. Resolve raw
@@ -169,9 +194,11 @@ cache still has an entry-count limit, not a retained-byte budget.
 ## Verification
 
 - `cargo test --locked` and strict Clippy check native behavior and compaction.
-- `npm run test:wasm` checks the core subset plus `public_api.mjs`, which compares
-  first dirty queries, callbacks, identities, mutations, async yields, snapshots,
-  vacuum promise boundaries, compaction and CSP against pinned MiniSearch.
+- `npm run test:wasm` checks the engine's own API (built with the `core-api`
+  feature into `target/pkg-core`) plus the facade suites, which compare first
+  dirty queries, callbacks and their call sequences, identities, mutations,
+  async yields, snapshots, vacuum promise boundaries, compaction, the
+  serialized index byte for byte, and CSP against pinned MiniSearch.
 - `npm run test:types` checks the declared API with strict ES2022 TypeScript.
 - `npm run test:package` installs the actual npm tarball and checks ESM, CommonJS,
   SearchableMap, generics and the global bundle with string codegen disabled.

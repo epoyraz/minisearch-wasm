@@ -2,13 +2,68 @@
 
 The original MiniSearch Jest tests live in `reference-tests/` and are the
 behavior contract for this port. Each Rust test added under `tests/` should link
-back to one or more behaviors from those files. The 0.10.0 section is current;
+back to one or more behaviors from those files. The 0.12.0 section is current;
 the 0.9.0 sections describe the published native-only API;
 the sections after them are the porting history in chronological order, each
 describing its own release, and a later section supersedes an earlier one where
 they disagree. Open work is tracked in `TODO.md` and `IMPROVEMENTS-3.md`.
 
-## After 0.10.0 (unreleased): the native engine keeps the index
+## 0.12.0: what MiniSearch keeps in JavaScript stays in JavaScript
+
+The facade used to hand the engine whole documents, and moved an index to the
+JavaScript engine whenever a value or callback did not fit the engine. 0.12.0
+divides the work the way MiniSearch's own data divides it.
+
+- **External identity** (`src/mini_search/external.rs`). A facade index is an
+  engine index whose id field is `EXTERNAL_ID_FIELD` (U+0000) and which stores
+  nothing: its documents are known by short id. The facade keeps MiniSearch's
+  `_documentIds`, `_idToShortId` and `_storedFields` as `_ids`, `_shortIds`
+  (a `Map`) and `_stored`, with the same semantics (SameValueZero, live
+  objects). `add` runs MiniSearch's `add` up to indexing (id, stored fields,
+  then each field's `extractField`/`stringifyField`), queues the texts and
+  sends a batch as JSON to `addTextBatch`; `remove` sends the texts to
+  `removeTexts` and logs the `version_conflict` warnings it returns with the
+  real id. A callback that throws leaves what came before it indexed, as
+  upstream. Loading keeps the ids and stored fields out of the engine too: the
+  MiniSearch JSON importer hands `documentIds`, `storedFields` and
+  `averageFieldLength` over as raw JSON text (`takeIdentity`), which the facade
+  reads with `JSON.parse`; older snapshots are converted with `externalize`.
+- **Rows by short id.** `searchRows` returns typed arrays (short ids, scores,
+  interned term, query-term and field offsets) and one JSON term table; the
+  facade builds `{ id, score, terms, queryTerms, match }`, assigns the stored
+  fields over it and runs the filter, in one loop. A stored `score` that
+  replaces a result's own is detected there and answered from traversal order,
+  as MiniSearch sorts.
+- **Terms made in JavaScript.** With `tokenize` or `processTerm` callbacks the
+  facade runs MiniSearch's own loop over the tokens and sends `[uniqueTokens,
+  terms]` per field to `addTermBatch`/`removeTerms`. At the first term the
+  engine cannot hold ('' or not a string) it transfers and hands that term, and
+  each later one, to the JavaScript engine as upstream would. A query text that
+  starts with U+0000 carries terms the facade made (`GIVEN_TERMS`); every query
+  path reads its terms through `MiniSearch::query_terms`.
+- **`boostDocument` from inside scoring.** The engine's three scoring loops
+  (fused, raw and lazy) ask a thread-local hook for the boosts of each posting
+  list's live documents before scoring it, the order in which MiniSearch calls
+  the callback; the product is MiniSearch's
+  `termWeight * termBoost * fieldBoost * docBoost * rawScore`, and a boost of 1
+  is exact, so unboosted scores keep their bits. A dirty index goes straight to
+  the lazy pass, so every call happens once. The facade keeps the index from
+  being entered again while the hook runs.
+- **Snapshot version 5.** A posting's delta is shifted left by one and the low
+  bit marks a frequency other than 1, which then follows. An externally
+  identified index writes no id values. The facade appends its identity as
+  JSON (`MSWID01\n` envelope). Version 4 still loads.
+- **Indexing speed.** The tokenizer returns slices, field lengths use an
+  `FxHashSet`, lowercase ASCII terms are not copied, radix edges are compared
+  byte-wise after a first-byte check, and `Postings::increment` appends without
+  a binary search. `loadJSON` deserializes postings directly (`TermEntry`,
+  `FieldEntry`, `Frequency`) instead of building `serde_json::Value` trees.
+- **The `core-api` feature** gates the engine's own document, search and
+  serialization bindings, which the facade no longer calls. The published
+  build leaves them out; `scripts/build-core.mjs` builds `target/pkg-core`
+  with them for the engine suites.
+
+## After 0.10.0 (released as 0.11.0): the native engine keeps the index
 
 The third review (`IMPROVEMENTS-3.md`) found that the 0.10.0 facade gave up on
 the native engine far more often than it had to. This supersedes the 0.10.0

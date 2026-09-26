@@ -4,6 +4,81 @@ Notable changes to `minisearch-wasm`. Versions before 0.7.0 are summarized in
 `PORTING.md`. Release notes of the latest published version are in
 `RELEASE_NOTES.md`.
 
+## 0.12.0 - unreleased
+
+### Changed
+
+- Document ids and stored fields live on the JavaScript side, kept the way
+  MiniSearch keeps them: ids of any type in a `Map` (SameValueZero), stored
+  fields as live objects. The engine indexes each document by its short id.
+  Object ids, `-0`, `NaN`, Dates, arrays, getters and other values no longer
+  move an index to the JavaScript engine; `getStoredFields` returns the live
+  object and an edit to it shows up in results, still in Wasm; stored fields
+  named like result properties (`score`, `terms`, `match`, …) are assigned over
+  the result and decide the order, as upstream.
+- `tokenize` and `processTerm` callbacks (constructor, search options, query
+  nodes) run on this side, called exactly as MiniSearch calls them; the engine
+  indexes and searches the terms they make. Indexes with custom tokenizers or
+  term processors, the most common MiniSearch customization, stay in Wasm.
+- `boostDocument` runs in Wasm: the engine calls it back while it scores, once
+  per posting list, for the same documents and terms in the same order as
+  MiniSearch, and on a dirty index in the pass that cleans up. An exception
+  ends the search, as upstream. Only a query-tree node with a `boostDocument`
+  of its own still transfers the index.
+- `search()` builds its result objects in one JavaScript loop from short ids,
+  scores and interned terms: about 2.4× faster than 0.11.0, and 3.2× with
+  stored fields (0.11.0 was slower than MiniSearch there).
+- `addAll` sends documents to the engine in batches, and indexing allocates
+  far less (token slices, a faster hash for field lengths, no copy of terms
+  that are already lowercase, byte-wise radix edges, appended postings): about
+  2× faster than 0.11.0, 3.3× faster than MiniSearch.
+- `loadJSON` and `loadJSONAsync` read postings straight into the engine's
+  lists instead of a JSON value tree: `loadJSON` is about 2.5× faster than
+  0.11.0 and 1.8× faster than MiniSearch's. Ids and stored fields are read with
+  `JSON.parse`, as upstream, so object ids and duplicate ids load natively.
+  `loadJSONAsync` waits for a timer where MiniSearch's does (after every
+  1,000th entry of each map and posting list, and every 1,000th term), not
+  after every 1,000 steps: where a timer wait is long (about 15 ms on
+  Windows) it took 1.7× MiniSearch's time and now takes the same.
+- Native snapshots: binary version 5 marks a frequency of 1 in the low bit of
+  the posting delta (the benchmark index is 40% smaller) and leaves out the
+  engine's placeholder ids. The facade saves the ids and stored fields next to
+  the engine snapshot, as JSON (`MSWID01\n` byte envelope; `format:
+  "minisearch-wasm/identity"` for `toNativeJSON`), and loading requires the
+  `tokenize`/`processTerm` callbacks an index was built with. Snapshots of
+  0.9.0 to 0.11.0 still load.
+- Short ids are renumbered after a vacuum only once most of them are free, so
+  `toJSON()` shows MiniSearch's short ids in ordinary use.
+- `searchJoined` maps short ids to ids on the JavaScript side: about 1.3×
+  faster than 0.11.0. `toBytes` and `loadBytes` take 1–2 ms longer on 20,000
+  documents than in 0.11.0, the ids now travelling as JSON; they remain 65×
+  and 10× faster than MiniSearch's JSON.
+- The published Wasm module leaves out the engine's own document and search
+  bindings, which the facade no longer calls (Cargo feature `core-api`, built
+  into `target/pkg-core` for the engine test suites). Sizes, gzipped: Wasm
+  313 KB (0.11.0: 302 KB), ESM facade 33 KB (28 KB); the tarball is 469 KB
+  (446 KB). `scripts/size-budget.json` records the new sizes.
+
+### Fixed
+
+- `removeAll()` keeps `dirtCount`, as MiniSearch does.
+- `toJSON()` follows MiniSearch's key order, and `averageFieldLength` has
+  MiniSearch's length and holes (`null` in JSON) for fields no document had.
+  After a mutation history, `JSON.stringify(index)` is MiniSearch's, byte for
+  byte.
+- A field listed twice in the search option `fields` was scored twice; fields
+  are now scored once each, in JavaScript object key order.
+- A `processTerm` that throws leaves the field it throws in, and the terms
+  before, indexed (or removed), as upstream.
+- Subclasses: `addAll` calls an overridden `add`, `discardAll` an overridden
+  `discard`, `autoSuggest` an overridden `search`, and `loadJSON`/`loadBytes`
+  return an instance of the class they are called on.
+- A field named like an `Object.prototype` member (`constructor`, `toString`)
+  indexes what MiniSearch indexes: extraction and stringification run in
+  JavaScript.
+- Options explicitly `undefined` for `filter`, `tokenize`, `processTerm` or
+  `boostDocument` replace the constructor's default with nothing, as upstream.
+
 ## 0.11.0 - 2026-09-19
 
 ### Changed
