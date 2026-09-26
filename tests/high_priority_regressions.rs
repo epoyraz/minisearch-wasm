@@ -212,7 +212,6 @@ fn json_rejects_inconsistent_state_including_direct_serde_deserialization() {
         ("/document_count", json!(900)),
         ("/next_id", json!(0)),
         ("/next_id", json!(u32::MAX)),
-        ("/dirt_count", json!(2)),
         ("/field_ids/text", json!(100)),
         ("/field_length", json!([])),
         ("/field_present", json!([])),
@@ -239,6 +238,11 @@ fn json_rejects_inconsistent_state_including_direct_serde_deserialization() {
             "serde accepted {path}"
         );
     }
+    // MiniSearch's removeAll() keeps the dirt count while the short ids start
+    // again at 0: a dirt count above the next id is a state it saves.
+    let mut dirty = valid_snapshot();
+    dirty["dirt_count"] = json!(2);
+    assert!(MiniSearch::from_json(&dirty.to_string()).is_ok());
     let mut unknown = valid_snapshot();
     unknown["stored_fields"]["99"] = json!({"payload":1});
     assert!(MiniSearch::from_json(&unknown.to_string()).is_err());

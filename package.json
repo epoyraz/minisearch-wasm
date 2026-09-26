@@ -1,11 +1,12 @@
 {
   "name": "minisearch-wasm-build",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "private": true,
   "description": "Build orchestration for the minisearch-wasm npm package (not published; the publishable artifact is pkg/).",
   "type": "module",
   "scripts": {
-    "build": "wasm-pack build --target web --release --no-pack --out-dir target/wasm-glue && node scripts/finalize-pkg.mjs",
+    "build": "wasm-pack build --target web --release --no-pack --out-dir target/wasm-glue && node scripts/finalize-pkg.mjs && npm run build:core",
+    "build:core": "node scripts/build-core.mjs",
     "test:wasm": "node differential/wasm_smoke.mjs && node differential/high_priority_regressions.mjs && node differential/compat_parity.mjs && node differential/api_parity.mjs && node differential/public_api.mjs && node differential/wasm_residency.mjs && node differential/core_robustness.mjs && node differential/facade_regressions.mjs",
     "bench:maintenance": "npm run build && node differential/bench_maintenance.mjs",
     "bench:public": "npm run build && node differential/gen_corpus.mjs differential/bench_corpus.json 20000 && node --expose-gc differential/bench_public.mjs",
@@ -16,7 +17,7 @@
     "build:pkg": "node scripts/finalize-pkg.mjs",
     "test:upstream": "vitest run --config upstream-suite/vitest.config.mjs",
     "test:differential": "node scripts/differential.mjs",
-    "test:native": "cargo fmt -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo test --locked --release --test snapshot_robustness",
+    "test:native": "cargo fmt -- --check && cargo clippy --locked --all-targets -- -D warnings && cargo clippy --locked --all-targets --features core-api -- -D warnings && cargo test --locked && cargo test --locked --release --test snapshot_robustness",
     "test:js": "npm run test:wasm && npm run test:types && npm run test:package && npm run test:upstream && npm run check:separators && npm run check:size",
     "test": "npm run test:native && npm run test:differential && npm run test:js",
     "check:size": "node scripts/check-size.mjs"

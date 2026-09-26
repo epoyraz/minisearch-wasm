@@ -307,17 +307,17 @@ impl<T: Clone> SearchableMap<T> {
     }
 }
 
+/// Length in bytes of the longest common prefix of whole characters.
 fn common_prefix_len(left: &str, right: &str) -> usize {
-    let mut len = 0;
-
-    for (a, b) in left.chars().zip(right.chars()) {
-        if a != b {
-            break;
-        }
-
-        len += a.len_utf8();
+    let mut len = left
+        .bytes()
+        .zip(right.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Equal bytes up to a character's middle mean the characters differ.
+    while !left.is_char_boundary(len) {
+        len -= 1;
     }
-
     len
 }
 
@@ -326,8 +326,13 @@ fn create_path<'a, T>(node: &'a mut RadixNode<T>, key: &str) -> &'a mut RadixNod
         return node;
     }
 
+    let first = key.as_bytes()[0];
     for index in 0..node.children.len() {
         let child_key = &node.children[index].0;
+        // Edges are never empty, and no two start with the same character.
+        if child_key.as_bytes()[0] != first {
+            continue;
+        }
         let offset = common_prefix_len(key, child_key);
 
         if offset == 0 {

@@ -24,9 +24,14 @@ const docsJSON = JSON.stringify(docs);
 const options = { fields: ['title', 'text'], autoVacuum: false,
   searchOptions: { prefix: true, fuzzy: 0.2, combineWith: 'AND' } };
 const filter = () => true;
-// A callback that runs inside scoring: the one kind of search that still moves
-// an index to the JavaScript engine.
-const boostDocument = () => 1;
+// A callback that runs inside scoring: the engine calls it back.
+const boostDocument = id => 1 + (Number(id) % 5) / 10;
+// The most common index callback: a term processor with stop words.
+const stopWords = new Set(['the', 'a', 'an', 'and', 'of', 'to', 'in', 'for']);
+const processTerm = term => stopWords.has(term.toLowerCase()) ? null : term.toLowerCase();
+// A query node with a boostDocument of its own: what still moves an index to
+// the JavaScript engine, for the fallback rows.
+const toJavaScript = index => { index.search({ queries: [firstQuery], boostDocument: () => 1 }); assert.equal(index.executionMode, 'javascript'); return index; };
 const discarded = docs.filter((_, i) => i % 4 === 0).map(doc => doc.id);
 const firstQuery = queries[0];
 const sha256 = value => createHash('sha256').update(value).digest('hex');
@@ -62,9 +67,10 @@ const report = {
 };
 mkdirSync(dirname(outputPath), { recursive: true });
 const checkpoint = () => writeFileSync(outputPath, JSON.stringify(report, null, 2) + '\n');
-function build(kind, mode = 'wasm') {
-  const index = kind === 'original' ? new Original(options) : new Public(mode === 'javascript' ? { ...options, processTerm: Original.getDefault('processTerm') } : options);
-  if (kind === 'public' && mode === 'wasm') index.addAllJSON(docsJSON); else index.addAll(docs);
+function build(kind, mode = 'wasm', settings = options) {
+  const index = kind === 'original' ? new Original(settings) : new Public(settings);
+  index.addAll(docs);
+  if (kind === 'public' && mode === 'javascript') toJavaScript(index);
   if (kind === 'public') assert.equal(index.executionMode, mode);
   return index;
 }
@@ -175,7 +181,12 @@ for (const dirty of [false, true]) {
   compare(b.search(firstQuery, perCall), a.search(firstQuery, perCall));
   assert.equal(b.executionMode, 'wasm');
   compare(b.search(firstQuery, { boostDocument }), a.search(firstQuery, { boostDocument }));
-  assert.equal(b.executionMode, 'javascript'); free(b);
+  assert.equal(b.executionMode, 'wasm'); free(b);
+}
+{
+  const a = build('original', 'wasm', { ...options, processTerm }), b = build('public', 'wasm', { ...options, processTerm });
+  for (const query of queries) compare(b.search(query), a.search(query));
+  free(b);
 }
 console.log(`Verified ${report.validation.comparedRows} result rows, max relative score delta ${report.validation.maxRelativeScoreDelta}`);
 const warmVariants = kind => ({ original: { run: () => consume(original) }, public: { run: () => consume(current, kind, queries, undefined, idTable) } });
@@ -221,7 +232,7 @@ for (const api of ['loadJSON', 'loadJSONAsync']) {
 for (const [name, perCall, dirty, mode] of [
   ['first query after 25% discard', undefined, true, 'wasm'],
   ['first filter-callback query', { filter }, false, 'wasm'],
-  ['first boostDocument query + transfer', { boostDocument }, false, 'javascript'],
+  ['first boostDocument query', { boostDocument }, false, 'wasm'],
 ]) {
   await paired(name, Object.fromEntries(['original', 'public'].map(kind => [kind, {
     setup: () => { const index = build(kind); if (dirty) index.discardAll(discarded); return index; },
@@ -244,10 +255,24 @@ await paired('warm filter-callback search', {
   original: { run: () => consume(original, 'full', queries, { filter }) },
   public: { run: () => consume(current, 'full', queries, { filter }) },
 }, { unit: `${queries.length} queries` });
-const fallback = build('public', 'javascript');
-await paired('warm boostDocument search (JS engine)', {
+await paired('warm boostDocument search', {
   original: { run: () => consume(original, 'full', queries, { boostDocument }) },
-  public: { run: () => consume(fallback, 'full', queries, { boostDocument }) },
+  public: { run: () => consume(current, 'full', queries, { boostDocument }) },
+}, { unit: `${queries.length} queries` });
+const withProcessTerm = { ...options, processTerm };
+await paired('build: addAll, processTerm callback', Object.fromEntries(['original', 'public'].map(kind => [kind, {
+  setup: () => kind === 'original' ? new Original(withProcessTerm) : new Public(withProcessTerm),
+  run: index => { index.addAll(docs); return index; }, value: countValue, cleanup: index => free(index),
+}])), { unit: `${docs.length} documents` });
+const originalProcessed = build('original', 'wasm', withProcessTerm), publicProcessed = build('public', 'wasm', withProcessTerm);
+await paired('warm search, processTerm callback', {
+  original: { run: () => consume(originalProcessed) }, public: { run: () => consume(publicProcessed) },
+}, { unit: `${queries.length} queries` });
+free(publicProcessed);
+const fallback = build('public', 'javascript');
+await paired('warm search on the JS engine (fallback)', {
+  original: { run: () => consume(original) },
+  public: { run: () => consume(fallback) },
 }, { mode: 'javascript', unit: `${queries.length} queries` });
 await paired('vacuum after 25% discard', Object.fromEntries(['original', 'public'].map(kind => [kind, {
   setup: () => { const index = build(kind); index.discardAll(discarded); return index; },

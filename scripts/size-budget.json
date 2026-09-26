@@ -1,22 +1,22 @@
 {
   "minisearch_wasm_bg.wasm": {
-    "bytes": 825936,
-    "gzip": 311178
+    "bytes": 867287,
+    "gzip": 328557
   },
   "minisearch_wasm.js": {
-    "bytes": 121061,
-    "gzip": 29314
+    "bytes": 145500,
+    "gzip": 34537
   },
   "minisearch_wasm_core.js": {
-    "bytes": 55024,
-    "gzip": 11104
+    "bytes": 51763,
+    "gzip": 10923
   },
   "minisearch_wasm.cjs": {
-    "bytes": 173280,
-    "gzip": 40862
+    "bytes": 193279,
+    "gzip": 45289
   },
   "minisearch_wasm.umd.js": {
-    "bytes": 66751,
-    "gzip": 19878
+    "bytes": 76015,
+    "gzip": 22642
   }
 }

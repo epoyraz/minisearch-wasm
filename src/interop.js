@@ -10,7 +10,7 @@ export function callbackDefault(name) { return defaults[name]; }
 export function buildResults(args) {
   const [ids, scores, table, termIds, termOffsets, queryIds, queryOffsets, fieldIds, fieldOffsets, fieldNames, stored, includeMatch] = args;
   const parsedIds = JSON.parse(ids);
-  const terms = table ? table.split('\n') : [];
+  const terms = JSON.parse(table);
   const fields = fieldNames ? fieldNames.split('\n') : [];
   const storedRows = stored ? JSON.parse(stored) : null;
   const count = scores.length;

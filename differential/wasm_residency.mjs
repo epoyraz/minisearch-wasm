@@ -104,15 +104,9 @@ const text = () => Array.from({ length: 1 + Math.floor(random() * 6) }, word).jo
       [js.documentCount, js.termCount, js.dirtCount, js.dirtFactor, js.isVacuuming], `counts at step ${step}`);
   }
   wasmMode(wasm, 'after the mutation history');
-  // The facade renumbers internal ids after a clean vacuum; everything else in
-  // the serialized index is the original's, radix term order included.
-  const canonical = index => {
-    const { documentIds, fieldLength, storedFields, index: terms, nextId: _nextId, ...rest } = JSON.parse(JSON.stringify(index));
-    const external = table => Object.fromEntries(Object.entries(table).map(([id, value]) => [JSON.stringify(documentIds[id]), value]));
-    return { ...rest, fieldLength: external(fieldLength), storedFields: external(storedFields),
-      terms: terms.map(([term, fields]) => [term, Object.fromEntries(Object.entries(fields).map(([field, postings]) => [field, external(postings)]))]) };
-  };
-  same(canonical(wasm), canonical(js), 'serialized index after the history');
+  // The serialized index is the original's, byte for byte: short ids, radix
+  // term order, key order and averages included.
+  same(JSON.stringify(wasm), JSON.stringify(js), 'serialized index after the history');
   wasm.free();
 }
 
@@ -202,9 +196,9 @@ const text = () => Array.from({ length: 1 + Math.floor(random() * 6) }, word).jo
   fresh.addAll(docs); oracle.addAll(docs);
   const boostDocument = (_id, _term, stored) => stored.category === 'poetry' ? 2 : 1;
   sameRows(fresh.search('divina vita', { boostDocument }), oracle.search('divina vita', { boostDocument }), 'boostDocument stored fields');
-  // An edit made through the returned object survives the transfer it causes.
+  // The returned object is the live one: an edit to it shows up in results.
   wasm.getStoredFields(2).category = 'edited'; js.getStoredFields(2).category = 'edited';
-  sameRows(wasm.search('vita'), js.search('vita'), 'edited stored fields'); same(wasm.executionMode, 'javascript');
+  sameRows(wasm.search('vita'), js.search('vita'), 'edited stored fields'); wasmMode(wasm, 'after editing stored fields');
   wasm.free(); fresh.free();
   function both(fn) { fn(js); fn(wasm); }
 }
@@ -236,7 +230,7 @@ const text = () => Array.from({ length: 1 + Math.floor(random() * 6) }, word).jo
 }
 
 // 7. Native snapshots do not carry functions: search callbacks given when
-// loading apply again, and engine callbacks select the JavaScript engine.
+// loading apply again.
 {
   const settings = { fields: ['text'], storeFields: ['category'], searchOptions: { prefix: true } };
   const index = new MiniSearch({ ...settings, searchOptions: { prefix: true, filter: row => row.category === 'fruit' } });
@@ -247,7 +241,7 @@ const text = () => Array.from({ length: 1 + Math.floor(random() * 6) }, word).jo
   const reloaded = MiniSearch.loadBytes(bytes, { searchOptions: { filter: row => row.category === 'jobs' } });
   same(reloaded.search('app').map(row => row.id), [2], 'saved prefix option plus the given filter'); wasmMode(reloaded, 'reloaded with a filter');
   const boosted = MiniSearch.loadBytes(bytes, { searchOptions: { boostDocument: id => id } });
-  same(boosted.executionMode, 'javascript'); same(boosted.search('app').map(row => row.id), [2, 1]);
+  same(boosted.search('app').map(row => row.id), [2, 1]); wasmMode(boosted, 'reloaded with boostDocument');
   index.free(); reloaded.free(); boosted.free();
 }
 
@@ -296,29 +290,33 @@ const text = () => Array.from({ length: 1 + Math.floor(random() * 6) }, word).jo
   const copy = MiniSearch.loadBytes(wasm.toBytes(), settings);
   copy.add(book('d', 'Il Canzoniere', 'Francesco Petrarca', 1374)); js.add(book('d', 'Il Canzoniere', 'Francesco Petrarca', 1374));
   sameRows(copy.search('petrarca 1374 dante'), js.search('petrarca 1374 dante'), 'extracted, reloaded'); wasmMode(copy, 'reloaded with extractField'); copy.free();
-  // One name that needs two values (indexed text and a different stored value) has no native form.
+  // One name with two values: the indexed text, and a different stored value.
   const dated = { ...settings, fields: ['title', 'published'], storeFields: ['published'] };
   const datedJs = new Original(dated), datedWasm = new MiniSearch(dated);
   datedJs.addAll(docs.slice(0, 2)); datedWasm.addAll(docs.slice(0, 2));
-  sameRows(datedWasm.search('1320'), datedJs.search('1320'), 'indexed text differs from the stored value'); same(datedWasm.executionMode, 'javascript');
+  sameRows(datedWasm.search('1320'), datedJs.search('1320'), 'indexed text differs from the stored value'); wasmMode(datedWasm, 'indexed text differs from the stored value');
+  assert.equal(datedWasm.search('1320')[0].published, docs[0].published);
   wasm.free(); datedWasm.free();
 }
 
-// 10. What the native engine cannot represent exactly selects the JavaScript engine.
+// 10. Values the engine never sees (ids, stored fields) stay native whatever
+// they are; text it cannot represent exactly selects the JavaScript engine.
 {
   const probes = [
-    [{ fields: ['t'], storeFields: ['t'] }, [{ id: 1, t: 'ab\ud800cd ef' }], 'ef'],
-    [{ fields: ['t'] }, [{ id: 'x\ud800', t: 'hello' }], 'hello'],
-    [{ fields: ['t'], storeFields: ['t'] }, [{ id: -0, t: -0 }], '0'],
-    [{ fields: 't' }, [{ id: 1, t: 'apple' }], 'apple'],
-    [{ fields: ['t', 't'] }, [{ id: 1, t: 'apple' }], 'apple'],
-    [{ fields: ['t'], storeFields: ['score', 'terms'] }, [{ id: 1, t: 'x y', score: 99, terms: 'zz' }, { id: 2, t: 'x', score: 5, terms: 'q' }], 'x'],
-    [{ fields: ['t', 'u'], searchOptions: { boost: { t: Infinity } } }, [{ id: 1, t: 'apple', u: 'pear' }, { id: 2, t: 'pear', u: 'apple' }], 'apple'],
+    [{ fields: ['t'], storeFields: ['t'] }, [{ id: 1, t: 'ab\ud800cd ef' }], 'ef', 'javascript'],
+    [{ fields: ['t'] }, [{ id: 'x\ud800', t: 'hello' }], 'hello', 'wasm'],
+    [{ fields: ['t'], storeFields: ['t'] }, [{ id: -0, t: -0 }], '0', 'wasm'],
+    [{ fields: 't' }, [{ id: 1, t: 'apple' }], 'apple', 'javascript'],
+    [{ fields: ['t', 't'] }, [{ id: 1, t: 'apple' }], 'apple', 'javascript'],
+    [{ fields: ['t'], storeFields: ['score', 'terms'] }, [{ id: 1, t: 'x y', score: 99, terms: 'zz' }, { id: 2, t: 'x', score: 5, terms: 'q' }], 'x', 'wasm'],
+    [{ fields: ['t'], storeFields: ['score'] }, [{ id: 1, t: 'x y', score: 1 }, { id: 2, t: 'x', score: 1 }, { id: 3, t: 'x', score: 7 }], 'x', 'wasm'],
+    [{ fields: ['t'], storeFields: ['id', 'match', 'queryTerms'], idField: 'key' }, [{ key: 1, id: 'a', t: 'x', match: 'm', queryTerms: 3 }], 'x', 'wasm'],
+    [{ fields: ['t', 'u'], searchOptions: { boost: { t: Infinity } } }, [{ id: 1, t: 'apple', u: 'pear' }, { id: 2, t: 'pear', u: 'apple' }], 'apple', 'javascript'],
   ];
-  for (const [settings, docs, query] of probes) {
+  for (const [settings, docs, query, mode] of probes) {
     const js = new Original(settings), wasm = new MiniSearch(settings);
     js.addAll(docs); wasm.addAll(docs);
-    same(wasm.executionMode, 'javascript', JSON.stringify(settings));
+    same(wasm.executionMode, mode, JSON.stringify(settings));
     const outcome = index => { try { return index.search(query); } catch (error) { return error.message; } };
     same(outcome(wasm), outcome(js), `exact values: ${JSON.stringify(settings)}`);
     same(docs.map(doc => wasm.has(doc.id)), docs.map(doc => js.has(doc.id)));
@@ -367,6 +365,114 @@ const text = () => Array.from({ length: 1 + Math.floor(random() * 6) }, word).jo
   const bytes = wasm.toBytes();
   const fromBuffer = MiniSearch.loadBytes(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   same(fromBuffer.search('apple').map(row => row.id), [1]); fromBuffer.free(); wasm.free();
+}
+
+// 13. tokenize and processTerm callbacks run on this side, called like upstream
+// calls them; the engine indexes and searches the terms they make.
+{
+  const stop = new Set(['the', 'and', 'of']);
+  const calls = { js: [], wasm: [] };
+  const settings = log => ({ fields: ['title', 'text'], storeFields: ['title'], autoVacuum: false,
+    tokenize: (text, field) => { log.push(['tokenize', field]); return field === 'title' ? text.split(/\s+/) : text.split(/[\s,.]+/); },
+    processTerm: (term, field) => {
+      log.push(['processTerm', term, field]);
+      const lower = term.toLowerCase();
+      if (stop.has(lower)) return null;
+      // Array outputs index every element; `ing` words also index their stem.
+      return lower.endsWith('ing') && lower.length > 5 ? [lower, lower.slice(0, -3)] : lower;
+    } });
+  const docs = Array.from({ length: 120 }, (_, id) => ({ id, title: `${pick(['The', 'Running', 'Walking'])} ${text()}`, text: `${text()}, and ${text()}. Of ${word()}` }));
+  const js = new Original(settings(calls.js)), wasm = new MiniSearch(settings(calls.wasm));
+  js.addAll(docs); wasm.addAll(docs);
+  wasmMode(wasm, 'tokenize and processTerm callbacks');
+  same(calls.wasm, calls.js, 'callback order and arguments while indexing');
+  same(JSON.parse(JSON.stringify(wasm)), JSON.parse(JSON.stringify(js)), 'the index the callbacks make');
+  for (const query of ['running ab', 'walk', 'the ap', 'Walking pear', 'and of']) {
+    for (const options of [{}, { prefix: true }, { fuzzy: 0.2, combineWith: 'AND' }, { processTerm: term => term.toUpperCase() }]) {
+      calls.js.length = calls.wasm.length = 0;
+      sameRows(wasm.search(query, options), js.search(query, options), `callbacks: ${query} ${Object.keys(options)}`);
+      same(calls.wasm, calls.js, `query callbacks: ${query}`);
+      sameRows(wasm.autoSuggest(query, options), js.autoSuggest(query, options), `callbacks suggest: ${query}`);
+    }
+    const joined = wasm.searchJoined(query), expected = js.search(query);
+    same(JSON.parse(joined.ids), expected.map(row => row.id), `callbacks joined: ${query}`);
+  }
+  // Removal runs the callbacks again, version conflicts included.
+  const warnings = { js: [], wasm: [] };
+  js._options.logger = (...args) => warnings.js.push(args);
+  const logged = new MiniSearch({ ...settings([]), logger: (...args) => warnings.wasm.push(args) });
+  logged.addAll(docs);
+  for (const index of [js, logged]) { index.remove(docs[3]); index.remove({ ...docs[4], text: 'changed text' }); index.discard(5); }
+  same(warnings.wasm, warnings.js, 'version conflicts from the callbacks');
+  same(JSON.parse(JSON.stringify(logged)), JSON.parse(JSON.stringify(js)), 'the index after removals');
+  // A snapshot keeps the terms; loading it needs the callbacks again.
+  const bytes = logged.toBytes();
+  assert.throws(() => MiniSearch.loadBytes(bytes), /requires callback option "tokenize"/); checks++;
+  const copy = MiniSearch.loadBytes(bytes, settings([]));
+  sameRows(copy.search('running ab'), js.search('running ab'), 'callbacks, reloaded'); wasmMode(copy, 'reloaded with callbacks');
+  copy.free(); logged.free(); wasm.free();
+  // Terms the engine cannot hold ('' from an array, a number) go to JavaScript,
+  // mid-document, without calling any callback twice.
+  for (const odd of ['', 42]) {
+    const log = { js: [], wasm: [] };
+    const make = (C, calls) => new C({ fields: ['a', 'b'], processTerm: (term, field) => { calls.push([term, field]); return term === 'x' ? [odd, 'x'] : term; } });
+    const a = make(Original, log.js), b = make(MiniSearch, log.wasm);
+    const outcome = index => { try { index.addAll([{ id: 1, a: 'p q', b: 'r' }, { id: 2, a: 'x y', b: 's x' }, { id: 3, a: 'z', b: 'x' }]); return 'added'; } catch (error) { return error.message; } };
+    same(outcome(b), outcome(a), `adding with term ${JSON.stringify(odd)}`);
+    same(b.executionMode, 'javascript', `term ${JSON.stringify(odd)}`);
+    same(log.wasm, log.js, `callbacks before and after the transfer: ${JSON.stringify(odd)}`);
+    same(JSON.parse(JSON.stringify(b)), JSON.parse(JSON.stringify(a)), `index after the transfer: ${JSON.stringify(odd)}`);
+    b.free();
+  }
+}
+
+// 14. The engine calls boostDocument back while it scores: the same calls, with
+// the same arguments, in the same order as upstream, clean or dirty (the first
+// query after a discard cleans up as it goes), and the same scores and order.
+{
+  const settings = { fields: ['title', 'text'], storeFields: ['rank'], autoVacuum: false, searchOptions: { boost: { title: 2 } } };
+  const docs = Array.from({ length: 80 }, (_, id) => ({ id, title: text(), text: text(), rank: id % 7 }));
+  const boosts = [
+    (_id, _term, stored) => stored.rank / 3,
+    (id, term) => (id + term.length) % 4,
+    (id, _term, stored) => [0, null, '', '2', true, 1.5, { valueOf: () => 3 }][(id + stored.rank) % 7],
+    (id, term) => term.startsWith('a') ? -1 : Infinity,
+    () => NaN,
+  ];
+  for (const [b, boostDocument] of boosts.entries()) for (const dirty of [false, true]) {
+    const js = new Original(settings), wasm = new MiniSearch(settings);
+    js.addAll(docs); wasm.addAll(docs);
+    if (dirty) for (const id of [3, 9, 27, 40]) { js.discard(id); wasm.discard(id); }
+    const log = { js: [], wasm: [] };
+    const recorded = key => (id, term, stored) => { log[key].push([id, term, stored]); return boostDocument(id, term, stored); };
+    for (const query of ['ab', 'pear tart', 'apple', [Original.wildcard, MiniSearch.wildcard], { combineWith: 'AND', queries: ['ab', 'ple'] }]) {
+      for (const options of [{}, { prefix: true }, { fuzzy: 0.3, combineWith: 'AND' }, { combineWith: 'AND_NOT', prefix: true }]) {
+        const [jsQuery, wasmQuery] = Array.isArray(query) ? query : [query, query];
+        log.js.length = log.wasm.length = 0;
+        const label = `boost ${b}, dirty=${dirty}, ${String(jsQuery.toString?.() ?? jsQuery)} ${JSON.stringify(options)}`;
+        sameRows(wasm.search(wasmQuery, { ...options, boostDocument: recorded('wasm') }), js.search(jsQuery, { ...options, boostDocument: recorded('js') }), label);
+        same(log.wasm, log.js, `calls: ${label}`);
+      }
+    }
+    sameRows(wasm.autoSuggest('ap pe', { boostDocument }), js.autoSuggest('ap pe', { boostDocument }), `boost ${b} suggest`);
+    const joined = wasm.searchJoinedOpts('ab', { prefix: true, boostDocument }), expected = js.search('ab', { prefix: true, boostDocument });
+    same(JSON.parse(joined.ids), expected.map(row => row.id), `boost ${b} joined`);
+    same([wasm.termCount, wasm.dirtCount], [js.termCount, js.dirtCount], `boost ${b} counts, dirty=${dirty}`);
+    wasmMode(wasm, `boostDocument ${b}, dirty=${dirty}`); wasm.free();
+  }
+  // Inside the callback the index answers what upstream answers; an exception
+  // ends the search, as upstream.
+  const js = new Original(settings), wasm = new MiniSearch(settings);
+  js.addAll(docs); wasm.addAll(docs);
+  const reads = index => (id, term) => index.has(id) && index.getStoredFields(id).rank + index.documentCount + term.length;
+  sameRows(wasm.search('ab', { prefix: true, boostDocument: reads(wasm) }), js.search('ab', { prefix: true, boostDocument: reads(js) }), 'reads inside boostDocument');
+  const thrower = log => (id, term) => { log.push(id); if (log.length === 5) throw new Error(`stop at ${id} ${term}`); return 1; };
+  const failures = { js: [], wasm: [] };
+  const failure = (index, log) => { try { index.search('ab', { prefix: true, boostDocument: thrower(log) }); return 'no error'; } catch (error) { return error.message; } };
+  same(failure(wasm, failures.wasm), failure(js, failures.js), 'an exception in boostDocument');
+  same(failures.wasm, failures.js, 'calls up to the exception');
+  sameRows(wasm.search('ab'), js.search('ab'), 'searches after the exception');
+  wasmMode(wasm, 'after reads and an exception in boostDocument'); wasm.free();
 }
 
 console.log(`WASM RESIDENCY: ALL PASS (${checks} checks against MiniSearch, unwarmed dirty queries included)`);

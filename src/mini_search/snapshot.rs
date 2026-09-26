@@ -88,7 +88,10 @@ impl TryFrom<JsonSnapshot> for MiniSearch {
             id_table_version: 0,
         };
         index.validate_snapshot()?;
-        Ok(index)
+        Ok(Self {
+            snapshot_version: SNAPSHOT_VERSION,
+            ..index
+        })
     }
 }
 
@@ -206,7 +209,7 @@ impl MiniSearch {
     /// after deserialization; the binary reader enforces the same invariants
     /// inline and only runs this in debug builds as a cross-check.
     pub(super) fn validate_snapshot(&self) -> Result<(), String> {
-        if self.snapshot_version != SNAPSHOT_VERSION {
+        if !(4..=SNAPSHOT_VERSION).contains(&self.snapshot_version) {
             return Err(invalid(
                 "unsupported JSON snapshot version; rebuild from documents",
             ));
@@ -247,12 +250,11 @@ impl MiniSearch {
         if round_trip != self.options {
             return Err(invalid("nonfinite options"));
         }
+        // The dirt count has no bound: MiniSearch's `removeAll()` keeps it
+        // while the short ids start again at 0.
         if self.document_count != self.document_ids.len()
             || self.id_to_short_id.len() != self.document_count
-            || self
-                .document_count
-                .checked_add(self.dirt_count)
-                .is_none_or(|count| count > self.next_id as usize)
+            || self.document_count > self.next_id as usize
         {
             return Err(invalid("inconsistent document or dirt counts"));
         }
@@ -341,9 +343,12 @@ impl MiniSearch {
         Ok(())
     }
 
-    /// Version 4: exact field presence/lengths, ordered radix nodes,
-    /// delta-varint postings and tagged binary ID/stored values. Older formats
-    /// must be rebuilt from documents.
+    /// Version 5: exact field presence/lengths, ordered radix nodes, postings
+    /// as delta varints whose low bit flags a frequency other than 1 (which
+    /// follows), and tagged binary ID/stored values, which an externally
+    /// identified index (see [`EXTERNAL_ID_FIELD`]) leaves out: its ids are
+    /// the short ids. Version 4 wrote every frequency and always the values.
+    /// Older formats must be rebuilt from documents.
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         // In-memory state was built by this engine or validated when loaded,
         // so release builds check only the limits an engine can outgrow; debug
@@ -365,10 +370,13 @@ impl MiniSearch {
         documents.sort_by_key(|(id, _)| **id);
         let mut previous = 0;
         let fields = self.options.fields.len();
+        let external = self.is_externally_identified();
         for (&id, value) in documents {
             write_varint(&mut out, (id - previous) as u64);
             previous = id;
-            write_value(&mut out, value, 0)?;
+            if !external {
+                write_value(&mut out, value, 0)?;
+            }
             for field in 0..fields {
                 let slot = id as usize * fields + field;
                 write_varint(
@@ -379,6 +387,9 @@ impl MiniSearch {
                         0
                     },
                 );
+            }
+            if external {
+                continue;
             }
             let stored = self.stored_fields.get(&id);
             write_varint(&mut out, stored.map_or(0, |v| v.len()) as u64);
@@ -399,7 +410,7 @@ impl MiniSearch {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut reader = Reader::new(bytes)?;
         let version = reader.varint()?;
-        if version != SNAPSHOT_VERSION {
+        if !(4..=SNAPSHOT_VERSION).contains(&version) {
             return Err(format!(
                 "unsupported minisearch-wasm binary snapshot version {version}"
             ));
@@ -410,10 +421,7 @@ impl MiniSearch {
         let dirt_count = reader.usize()?;
         let fields = options.fields.len();
         let slots = table_slots(next_id, fields)?;
-        if document_count
-            .checked_add(dirt_count)
-            .is_none_or(|n| n > next_id as usize)
-        {
+        if document_count > next_id as usize {
             return Err(invalid("inconsistent document or dirt counts"));
         }
         let mut index = Self::new(options);
@@ -461,6 +469,7 @@ impl MiniSearch {
             .try_reserve(document_count)
             .map_err(|_| invalid("document allocation failed"))?;
         let mut previous: u32 = 0;
+        let external = version >= 5 && index.is_externally_identified();
         for row in 0..document_count {
             let delta = reader.u32()?;
             let id = previous
@@ -470,7 +479,11 @@ impl MiniSearch {
                 return Err(invalid("invalid or repeated document ID"));
             }
             previous = id;
-            let value = reader.value(0)?;
+            let value = if external {
+                Value::from(id)
+            } else {
+                reader.value(0)?
+            };
             if value.is_null() || index.id_to_short_id.insert(id_key(&value)?, id).is_some() {
                 return Err(invalid("null or duplicate external ID"));
             }
@@ -484,6 +497,9 @@ impl MiniSearch {
                     index.field_length[slot] =
                         u32::try_from(encoded - 1).map_err(|_| invalid("field length overflow"))?;
                 }
+            }
+            if external {
+                continue;
             }
             let count = reader.count(2)?;
             if count > index.options.store_fields.len() {
@@ -508,6 +524,7 @@ impl MiniSearch {
         }
         let root = {
             let mut tree = TreeContext {
+                version,
                 fields,
                 next_id,
                 field_length: &index.field_length,
@@ -607,8 +624,13 @@ fn write_node(out: &mut Vec<u8>, node: &RadixNode<Rc<FieldTermData>>) {
             write_varint(out, postings.len() as u64);
             let mut previous = 0;
             for (id, freq) in postings.iter() {
-                write_varint(out, (id - previous) as u64);
-                write_varint(out, freq as u64);
+                let delta = u64::from(id - previous) << 1;
+                if freq == 1 {
+                    write_varint(out, delta);
+                } else {
+                    write_varint(out, delta | 1);
+                    write_varint(out, freq as u64);
+                }
                 previous = id;
             }
         }
@@ -622,6 +644,7 @@ fn write_node(out: &mut Vec<u8>, node: &RadixNode<Rc<FieldTermData>>) {
 
 /// Index state the tree reader checks postings against while decoding.
 struct TreeContext<'a> {
+    version: u64,
     fields: usize,
     next_id: u32,
     field_length: &'a [u32],
@@ -798,9 +821,11 @@ impl<'a> Reader<'a> {
             return Err(invalid("invalid radix leaf"));
         }
         let mut data = FieldTermData::default();
+        // A version 5 posting of frequency 1 is one byte.
+        let posting_bytes = if tree.version >= 5 { 1 } else { 2 };
         for _ in 0..field_count {
             let field = self.usize()?;
-            let count = self.count(2)?;
+            let count = self.count(posting_bytes)?;
             if field >= tree.fields || count == 0 || count > tree.next_id as usize {
                 return Err(invalid("invalid or duplicate posting field"));
             }
@@ -817,11 +842,26 @@ impl<'a> Reader<'a> {
                 .map_err(|_| invalid("posting allocation failed"))?;
             let mut previous: u32 = 0;
             for row in 0..count {
-                let delta = self.u32()?;
+                let (delta, freq) = if tree.version >= 5 {
+                    let word = self.varint()?;
+                    let delta =
+                        u32::try_from(word >> 1).map_err(|_| invalid("posting ID overflow"))?;
+                    if word & 1 == 0 {
+                        (delta, 1)
+                    } else {
+                        // One encoding per posting: a flagged frequency is not 1.
+                        let freq = self.u32()?;
+                        if freq == 1 {
+                            return Err(invalid("invalid or unordered posting"));
+                        }
+                        (delta, freq)
+                    }
+                } else {
+                    (self.u32()?, self.u32()?)
+                };
                 let id = previous
                     .checked_add(delta)
                     .ok_or_else(|| invalid("posting ID overflow"))?;
-                let freq = self.u32()?;
                 if id >= tree.next_id || freq == 0 || (row > 0 && delta == 0) {
                     return Err(invalid("invalid or unordered posting"));
                 }

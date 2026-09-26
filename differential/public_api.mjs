@@ -3,10 +3,13 @@
 // in the existing suites, using the generated core glue explicitly.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import Original from 'minisearch';
 import MiniSearch, { MiniSearchWasm as Wasm } from '../pkg/minisearch_wasm_node.js';
-import { MiniSearchWasm as Core } from '../pkg/minisearch_wasm_core.js';
+// The engine's own API, from the test build that has it (see scripts/build-core.mjs).
+import { initSync as initCore, MiniSearchWasm as Core } from '../target/pkg-core/minisearch_wasm_core.js';
+initCore({ module: readFileSync(new URL('../target/pkg-core/minisearch_wasm_bg.wasm', import.meta.url)) });
 
 // Scores are compared exactly: the Wasm build computes the same bits as V8.
 const rows = result => result;
@@ -18,6 +21,9 @@ const options = { fields: ['text'], storeFields: ['category'], autoVacuum: false
 const documents = [{ id: 1, text: 'apple pear', category: 'fruit' }, { id: 2, text: 'apple pie', category: 'dessert' }, { id: 3, text: 'apply here', category: 'jobs' }];
 let checks = 0;
 const eq = (actual, expected) => { assert.deepEqual(actual, expected); checks++; };
+// A query node with a boostDocument of its own: what the engine leaves to the
+// JavaScript engine, used here to cause a transfer. It scores like `query`.
+const transferQuery = query => ({ queries: [query], boostDocument: () => 1 });
 
 // Both old initializer syntax and the original default constructor are usable.
 await MiniSearch();
@@ -37,7 +43,8 @@ eq(defaultInstance.executionMode, 'wasm'); defaultInstance.free();
   };
   const docs = [{ id: 1, nested: { title: 'APPLE|stop' }, date, metadata }];
   const { js, wasm } = pair(settings, docs);
-  eq(wasm.executionMode, 'javascript');
+  // The callbacks run on this side; the engine indexes the terms they make.
+  eq(wasm.executionMode, 'wasm');
   eq(rows(wasm.search('apple')), rows(js.search('apple')));
   assert.equal(wasm.getStoredFields(1).date, date);
   assert.equal(wasm.getStoredFields(1).metadata, metadata);
@@ -50,19 +57,21 @@ eq(defaultInstance.executionMode, 'wasm'); defaultInstance.free();
   wasm.free();
 }
 
-// Search callbacks over query terms and finished rows are evaluated on this
-// side of the boundary and keep a Wasm index in Wasm. Callbacks that run inside
-// scoring or tokenization trigger a one-time transfer from a populated index.
-// Nested query callbacks, default callbacks and suggestions are covered.
+// Search callbacks over query terms and finished rows, and the tokenizer and
+// term processor of a query, are evaluated on this side of the boundary, and
+// the engine calls boostDocument back while it scores: all keep a Wasm index
+// in Wasm. A boostDocument of a query node of its own triggers a one-time
+// transfer from a populated index. Nested query callbacks, default callbacks
+// and suggestions are covered.
 for (const [mode, search] of [
   ['wasm', { filter: result => result.category === 'fruit' }],
-  ['javascript', { boostDocument: (id, term, stored) => stored.category === 'fruit' && term.startsWith('app') ? 4 : 0.5 }],
+  ['wasm', { boostDocument: (id, term, stored) => stored.category === 'fruit' && term.startsWith('app') ? 4 : 0.5 }],
   ['wasm', { boostTerm: (term, i, terms) => terms.length + i + term.length }],
   ['wasm', { prefix: (term, i, terms) => i === terms.length - 1 }],
   ['wasm', { fuzzy: (term, i) => i === 0 ? 0.4 : false }],
   ['wasm', { fuzzy: term => term.length > 3, prefix: term => term.length < 4 ? 'yes' : 0, boostTerm: (_term, i) => 1 / (i + 1), filter: result => result.terms.length > 0 }],
-  ['javascript', { tokenize: text => text.split('|') }],
-  ['javascript', { processTerm: term => [term, term + 'le'] }],
+  ['wasm', { tokenize: text => text.split('|') }],
+  ['wasm', { processTerm: term => [term, term + 'le'] }],
 ]) {
   const { js, wasm } = pair(options, documents);
   eq(wasm.executionMode, 'wasm');
@@ -73,7 +82,7 @@ for (const [mode, search] of [
   eq(wasm.executionMode, mode);
   const tree = { combineWith: 'OR', queries: ['pear', { queries: ['app'], ...search }] };
   eq(rows(wasm.search(tree)), rows(js.search(tree)));
-  eq(wasm.executionMode, mode);
+  eq(wasm.executionMode, 'boostDocument' in search ? 'javascript' : mode);
   wasm.free();
   const configured = pair({ ...options, searchOptions: search }, documents);
   eq(rows(configured.wasm.search('app pear')), rows(configured.js.search('app pear')));
@@ -119,14 +128,14 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   const { js, wasm } = pair(options, documents);
   for (const id of [NaN, Infinity, -Infinity, Symbol('missing'), 1n, {}, null, undefined]) eq(wasm.has(id), js.has(id));
   eq(wasm.executionMode, 'wasm');
-  // Reading stored fields keeps the index in Wasm and returns one object per
-  // document; an edit to it is honored by moving to the JavaScript engine.
+  // getStoredFields returns the live stored-fields object, as upstream: an
+  // edit to it shows up in later results, and the index stays in Wasm.
   const stored = wasm.getStoredFields(1);
   assert.equal(stored, wasm.getStoredFields(1));
   eq(stored, js.getStoredFields(1)); eq(wasm.getStoredFields(99), js.getStoredFields(99));
   eq(rows(wasm.search('apple')), rows(js.search('apple'))); eq(wasm.executionMode, 'wasm');
   stored.category = 'changed'; js.getStoredFields(1).category = 'changed';
-  eq(rows(wasm.search('apple')), rows(js.search('apple'))); eq(wasm.executionMode, 'javascript');
+  eq(rows(wasm.search('apple')), rows(js.search('apple'))); eq(wasm.executionMode, 'wasm');
   assert.equal(stored, wasm.getStoredFields(1)); wasm.free();
   assert.throws(() => Wasm.loadJSON('{}'), /same options/);
   await assert.rejects(Wasm.loadJSONAsync('{}'), /same options/);
@@ -157,7 +166,8 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   const search = { prefix: true, fuzzy: 0.3, weights: { prefix: 0.2 }, bm25: { b: 0.4 } };
   const before = rows(index.search('app', search));
   eq(rows(index.search('app', { ...search, filter: () => true })), before); eq(index.executionMode, 'wasm');
-  eq(rows(index.search('app', { ...search, boostDocument: () => 1 })), before); eq(index.executionMode, 'javascript');
+  eq(rows(index.search('app', { ...search, boostDocument: () => 1 })), before); eq(index.executionMode, 'wasm');
+  eq(rows(index.search(transferQuery('app'), search)), before); eq(index.executionMode, 'javascript');
   index.free();
 }
 
@@ -169,6 +179,8 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   queries.forEach((query, i) => eq(rows(index.search(query, { filter: () => true, prefix: () => false })), before[i]));
   eq(index.executionMode, 'wasm');
   queries.forEach((query, i) => eq(rows(index.search(query, { boostDocument: () => 1 })), before[i]));
+  eq(index.executionMode, 'wasm');
+  queries.forEach((query, i) => eq(rows(index.search(transferQuery(query))), before[i]));
   eq(index.executionMode, 'javascript');
   index.free();
 }
@@ -178,7 +190,7 @@ for (const query of ['apple', 'app', { combineWith: 'OR', queries: ['apple', 'ap
   const docs = ['abcde', 'abc', 'ab', 'abcd', 'abcf', 'abce', '2024', '2023'].map((text, id) => ({ id, text }));
   const { js, wasm } = pair(options, docs);
   const query = 'ab';
-  eq(rows(wasm.search(query, { prefix: true, boostDocument: () => 1 })), rows(js.search(query, { prefix: true })));
+  eq(rows(wasm.search(transferQuery(query), { prefix: true })), rows(js.search(query, { prefix: true })));
   eq(wasm.executionMode, 'javascript');
   for (const load of [() => Wasm.loadBytes(wasm.toBytes()), () => Wasm.loadNativeJSON(wasm.toNativeJSONString())]) {
     const copy = load(); eq(rows(copy.search(query, { prefix: true })), rows(wasm.search(query, { prefix: true }))); copy.free();
@@ -229,7 +241,7 @@ for (const C of [Wasm, Core]) {
 for (const javascript of [false, true]) {
   const index = new Wasm(options);
   index.addAll([{ id: 1, text: 'apple pear' }, { id: 2, text: 'pear' }]);
-  if (javascript) index.search('apple', { boostDocument: () => 1 });
+  if (javascript) index.search(transferQuery('apple'));
   eq(index.executionMode, javascript ? 'javascript' : 'wasm');
   index.remove({ id: 1, text: 'apple' });
   const copy = Wasm.loadBytes(index.toBytes()); eq(copy.search('pear').map(row => row.id), [2]); copy.free();
@@ -242,7 +254,7 @@ for (const javascript of [false, true]) {
   const legacy = new Core(options);
   legacy.add({ id: { key: 1 }, text: 'apple' });
   for (const copy of [Wasm.loadBytes(legacy.toBytes()), Wasm.loadNativeJSON(legacy.toNativeJSONString())]) {
-    eq(copy.executionMode, 'javascript');
+    eq(copy.executionMode, 'wasm');
     const id = copy.search('apple')[0].id;
     assert.equal(copy.search('apple')[0].id, id);
     assert.equal(copy.has(id), true); assert.equal(copy.has({ key: 1 }), false);
@@ -258,7 +270,12 @@ for (const javascript of [false, true]) {
   eq(copy.executionMode, 'wasm');
   copy.discardAll([1, 2]);
   await copy.vacuum(); eq(copy.dirtCount, 0);
-  eq(JSON.parse(copy.docIdTable()), [3]);
+  // Short ids stay MiniSearch's: only an index whose ids are mostly free is
+  // renumbered after a vacuum.
+  eq(JSON.parse(copy.docIdTable()), [null, null, 3]);
+  const oracle = new Original({ ...options, autoVacuum: { minDirtCount: 2, minDirtFactor: 0.01 } });
+  oracle.addAll(documents); oracle.discardAll([1, 2]); await oracle.vacuum();
+  eq(JSON.stringify(copy), JSON.stringify(oracle));
   index.free(); copy.free();
 }
 

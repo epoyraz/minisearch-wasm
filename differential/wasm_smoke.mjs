@@ -2,9 +2,9 @@
 // JS MiniSearch: search, suggestions, mutations, vacuuming, and async indexing.
 import { readFileSync } from 'fs'
 import MiniSearch from 'minisearch'
-import init, { MiniSearchWasm } from '../pkg/minisearch_wasm_core.js'
+import init, { MiniSearchWasm } from '../target/pkg-core/minisearch_wasm_core.js'
 
-await init(readFileSync(new URL('../pkg/minisearch_wasm_bg.wasm', import.meta.url)))
+await init(readFileSync(new URL('../target/pkg-core/minisearch_wasm_bg.wasm', import.meta.url)))
 
 const documents = [
   { id: 1, title: 'Divina Commedia', text: 'Nel mezzo del cammin di nostra vita', category: 'poetry' },

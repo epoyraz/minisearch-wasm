@@ -317,6 +317,10 @@ fn remove_all_documents_resets_to_a_fresh_index_and_allows_readding() {
     let mut search = mini_search();
     search.discard(&json!(2)).unwrap();
     search.remove_all_documents();
+    // Like MiniSearch, the dirt count survives removeAll(); a vacuum clears it.
+    assert_eq!(search.dirt_count(), 1);
+    search.vacuum();
+    assert_eq!(search.dirt_count(), 0);
 
     let fresh = MiniSearch::new(mini_search_options());
     assert_eq!(search.to_bytes().unwrap(), fresh.to_bytes().unwrap());

@@ -1,12 +1,18 @@
 [package]
 name = "minisearch-wasm"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 description = "Rust and WebAssembly full-text search engine inspired by MiniSearch"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+# The engine's own JavaScript API, beyond what the public facade calls: the
+# document, search and serialization methods the engine test suites drive.
+# The published package is built without it (see scripts/build-core.mjs).
+core-api = []
 
 [dependencies]
 js-sys = "0.3"
@@ -18,7 +24,9 @@ serde = { version = "1", features = ["derive", "rc"] }
 # JS `JSON.parse`, so field values and ids stringify identically to JS.
 # `unbounded_depth`: the JSON snapshot reader bounds nesting itself, to the
 # radix depth the binary format allows (see `MAX_JSON_NESTING`).
-serde_json = { version = "1", features = ["float_roundtrip", "unbounded_depth"] }
+# `raw_value`: an externally identified index hands MiniSearch JSON's document
+# ids and stored fields to JavaScript as text, for `JSON.parse` there.
+serde_json = { version = "1", features = ["float_roundtrip", "unbounded_depth", "raw_value"] }
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

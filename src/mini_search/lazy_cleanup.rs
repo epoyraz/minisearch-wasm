@@ -33,17 +33,41 @@ impl MiniSearch {
         per_call: &PartialSearchOptions,
         include_match: bool,
     ) -> CompatTransfer {
-        self.search_query_transfer_ordered_exact(query, per_call, include_match, true)
+        self.search_query_transfer_ordered_exact(
+            query,
+            per_call,
+            RowShape {
+                include_match,
+                sort: true,
+                identity: true,
+            },
+        )
     }
 
     pub(crate) fn search_query_transfer_ordered_exact(
         &mut self,
         query: &Query,
         per_call: &PartialSearchOptions,
-        include_match: bool,
-        sort_results: bool,
+        shape: RowShape,
     ) -> CompatTransfer {
         self.stale_hit.0.set(false);
+        // Each boostDocument call happens once, in the pass that cleans up.
+        if boosting() {
+            self.invalidate_expansions();
+            let raw_results = self.execute_query_tree_lazy(query, per_call);
+            return self.transfer_from_raw(raw_results, query, per_call, shape);
+        }
+        if let Query::Text(text) = query {
+            if self.fused_rows_supported() {
+                let transfer = self.text_query_transfer(text, per_call, shape);
+                if !self.take_stale_hit() {
+                    return transfer;
+                }
+                self.invalidate_expansions();
+                let raw_results = self.execute_query_tree_lazy(query, per_call);
+                return self.transfer_from_raw(raw_results, query, per_call, shape);
+            }
+        }
         let raw_results = self.execute_query_tree(query, per_call);
         let raw_results = if self.take_stale_hit() {
             self.invalidate_expansions();
@@ -51,7 +75,7 @@ impl MiniSearch {
         } else {
             raw_results
         };
-        self.transfer_from_raw(raw_results, query, per_call, include_match, sort_results)
+        self.transfer_from_raw(raw_results, query, per_call, shape)
     }
 
     /// [`Self::search_query`] with JS MiniSearch's dirty-index behavior.
@@ -110,25 +134,37 @@ impl MiniSearch {
 
         let specs = self.query_specs(query, options);
         let ranked = self.ranked_lazy(&specs, options);
-        let mut ids = String::from("[");
+        let external = self.is_externally_identified();
+        let mut ids = String::new();
+        let mut doc_ids = Vec::with_capacity(ranked.len());
         let mut terms = String::new();
         let mut scores = Vec::with_capacity(ranked.len());
         for (index, (doc_id, score, raw)) in ranked.iter().enumerate() {
             if index > 0 {
-                ids.push(',');
                 terms.push('\n');
             }
-            match self.document_ids.get(doc_id) {
-                Some(other) => {
-                    let _ = write!(ids, "{other}");
+            doc_ids.push(*doc_id);
+            if !external {
+                ids.push(if index > 0 { ',' } else { '[' });
+                match self.document_ids.get(doc_id) {
+                    Some(other) => {
+                        let _ = write!(ids, "{other}");
+                    }
+                    None => ids.push_str("null"),
                 }
-                None => ids.push_str("null"),
             }
             terms.push_str(&raw.matches.js_keys().join(" "));
             scores.push(*score);
         }
-        ids.push(']');
-        JoinedSearchResults { ids, scores, terms }
+        if !external {
+            ids.push_str(if ranked.is_empty() { "[]" } else { "]" });
+        }
+        JoinedSearchResults {
+            ids,
+            doc_ids,
+            scores,
+            terms,
+        }
     }
 
     /// [`Self::search_raw`] with JS MiniSearch's dirty-index behavior.
@@ -381,6 +417,7 @@ impl MiniSearch {
     ) {
         let num_fields = self.options.fields.len();
         let document_count = self.document_count as f64;
+        let boosted_term = boosting().then_some(derived_term);
         let Self {
             index,
             alive,
@@ -408,6 +445,9 @@ impl MiniSearch {
                 let mut idf = bm25_idf(matching_fields as f64, document_count);
                 let avg_field_length = average_field_length[field_id];
                 let mut removed_any = false;
+                // Tombstones and stale postings get no call, as upstream.
+                let mut boosts =
+                    ListBoosts::of(boosted_term, postings, |doc_id| alive[doc_id as usize]);
 
                 for posting in postings.0.iter_mut() {
                     let (doc_id, term_freq) = *posting;
@@ -424,6 +464,14 @@ impl MiniSearch {
                         idf = bm25_idf(matching_fields as f64, document_count);
                         continue;
                     }
+                    // Upstream asks for the boost before anything else.
+                    let doc_boost = match &mut boosts {
+                        Some(boosts) => match boosts.next() {
+                            Some(boost) => boost,
+                            None => continue,
+                        },
+                        None => 1.0,
+                    };
 
                     let length = field_length
                         .get(doc_id as usize * num_fields + field_id)
@@ -440,7 +488,9 @@ impl MiniSearch {
                             avg_field_length,
                             bm25_params,
                         );
-                    let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
+                    // Upstream's product, in its order; a boost of 1 is exact.
+                    let weighted_score =
+                        term_weight * term_boost * field_boost.boost * doc_boost * raw_score;
                     let result = results.entry_or_insert_with(doc_id, || RawResultValue {
                         score: 0.0,
                         terms: Vec::new(),

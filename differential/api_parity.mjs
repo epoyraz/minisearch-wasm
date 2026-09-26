@@ -6,9 +6,9 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import MiniSearch from 'minisearch'
-import init, { MiniSearchWasm } from '../pkg/minisearch_wasm_core.js'
+import init, { MiniSearchWasm } from '../target/pkg-core/minisearch_wasm_core.js'
 
-await init({ module_or_path: readFileSync(new URL('../pkg/minisearch_wasm_bg.wasm', import.meta.url)) })
+await init({ module_or_path: readFileSync(new URL('../target/pkg-core/minisearch_wasm_bg.wasm', import.meta.url)) })
 let checks = 0
 const equal = (actual, expected, label) => { assert.deepEqual(actual, expected, label); checks++ }
 const key = id => JSON.stringify(id)
@@ -173,7 +173,7 @@ console.log(`ok tokenizer matches Node's Unicode ${process.versions.unicode} tab
   }
   equal(wasmFromJs.getStoredFields(1), full.getStoredFields(1), 'stored fields survive loadJSON')
   const native = wasmFull.toNativeJSONString()
-  assert.ok(JSON.parse(native).snapshot_version === 4, 'native JSON is the engine format')
+  assert.ok(JSON.parse(native).snapshot_version === 5, 'native JSON is the engine format')
   equal(MiniSearchWasm.loadNativeJSON(native).search('apple').map(r => key(r.id)), wasmFull.search('apple').map(r => key(r.id)), 'native round trip')
   await assert.rejects(MiniSearchWasm.loadJSONAsync('{"serializationVersion":9}', options), error => error instanceof Error)
   checks++

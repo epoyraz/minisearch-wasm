@@ -4,9 +4,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import Original from 'minisearch';
-import { initSync, MiniSearchWasm as Core } from '../pkg/minisearch_wasm_core.js';
+import { initSync, MiniSearchWasm as Core } from '../target/pkg-core/minisearch_wasm_core.js';
 
-const wasm = initSync({ module: readFileSync(new URL('../pkg/minisearch_wasm_bg.wasm', import.meta.url)) });
+const wasm = initSync({ module: readFileSync(new URL('../target/pkg-core/minisearch_wasm_bg.wasm', import.meta.url)) });
 let checks = 0;
 const same = (actual, expected, label = '') => { assert.deepEqual(actual, expected, label); checks++; };
 // A trap is an Error too: a refusal has to be a thrown MiniSearch error.

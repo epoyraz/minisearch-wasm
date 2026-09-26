@@ -4,7 +4,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import Original from 'minisearch';
 import MiniSearch from '../pkg/minisearch_wasm_node.js';
-import { MiniSearchWasm as Core } from '../pkg/minisearch_wasm_core.js';
+import { readFileSync } from 'node:fs';
+// The engine's own API, from the test build that has it (see scripts/build-core.mjs).
+import { initSync as initCore, MiniSearchWasm as Core } from '../target/pkg-core/minisearch_wasm_core.js';
+initCore({ module: readFileSync(new URL('../target/pkg-core/minisearch_wasm_bg.wasm', import.meta.url)) });
 
 const options = { fields: ['text'], autoVacuum: false };
 const documents = [{ id: 1, text: 'apple pear pear pear pear pear' }, { id: 2, text: 'apple' }];
@@ -62,11 +65,14 @@ await test('compact queries evaluate shadowed-field callbacks and dirty cleanup 
       assert.deepEqual(index.search('apple'), original.search('apple'), 'same lazy-cleanup state after one query');
       index.free();
     }
-    // A native filter also must not cause speculative per-term evaluation.
+    // A native filter or boostDocument also must not cause speculative
+    // per-term evaluation.
     const index = new MiniSearch(options); index.addAll(documents);
-    let calls = 0;
-    const actual = index[method]('apple', { prefix: () => { calls++; return true; }, filter: () => true });
-    assert.equal(actual.count, 2); assert.equal(calls, 1);
+    for (const rowCallback of [{ filter: () => true }, { boostDocument: () => 1 }]) {
+      let calls = 0;
+      const actual = index[method]('apple', { prefix: () => { calls++; return true; }, ...rowCallback });
+      assert.equal(actual.count, 2); assert.equal(calls, 1, Object.keys(rowCallback)[0]);
+    }
     assert.equal(index.executionMode, 'wasm'); index.free();
   }
 });
@@ -128,8 +134,11 @@ await test('async JSON reconstruction yields repeatedly and remains native', asy
   await assert.rejects(Core.loadJSONAsync(JSON.stringify(bad), options), /invalid term frequency/);
   const good = await Core.loadJSONAsync(JSON.stringify(source), options);
   assert.equal(good.search('apple').length, 3500); good.free();
+  // Ids are read with JSON.parse, as upstream: an object id stays native.
   const objectIndex = new Original(options); objectIndex.add({ id: { key: 1 }, text: 'apple' });
-  const fallback = await MiniSearch.loadJSONAsync(JSON.stringify(objectIndex), options);
-  assert.equal(fallback.executionMode, 'javascript');
-  assert.deepEqual(fallback.search('apple'), objectIndex.search('apple')); fallback.free();
+  const loaded = await MiniSearch.loadJSONAsync(JSON.stringify(objectIndex), options);
+  assert.equal(loaded.executionMode, 'wasm');
+  assert.deepEqual(loaded.search('apple'), objectIndex.search('apple'));
+  const [{ id }] = loaded.search('apple');
+  assert.equal(loaded.search('apple')[0].id, id); assert.equal(loaded.has(id), true); loaded.free();
 });

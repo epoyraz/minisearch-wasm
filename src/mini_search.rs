@@ -1,5 +1,5 @@
 use crate::SearchableMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value};
 use std::borrow::Cow;
@@ -9,9 +9,13 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+mod external;
 mod interop;
 mod lazy_cleanup;
 mod snapshot;
+
+pub use external::EXTERNAL_ID_FIELD;
+pub(crate) use interop::JsonIdentity;
 
 type FieldId = usize;
 type ShortId = u32;
@@ -181,6 +185,21 @@ impl Postings {
     }
 
     fn increment(&mut self, doc_id: ShortId) {
+        // Indexing appends: the document is the last one, or comes after it.
+        match self.0.last_mut() {
+            Some((last, frequency)) if *last == doc_id => {
+                if *frequency == 0 {
+                    self.1 -= 1;
+                }
+                *frequency += 1;
+                return;
+            }
+            Some((last, _)) if *last > doc_id => {}
+            _ => {
+                self.0.push((doc_id, 1));
+                return;
+            }
+        }
         match self.0.binary_search_by_key(&doc_id, |(doc, _)| *doc) {
             Ok(index) => {
                 if self.0[index].1 == 0 {
@@ -395,11 +414,24 @@ struct Scratch {
     /// digits, canonical); `Object.keys` lists such terms first.
     table_index: Vec<Option<u32>>,
     lookup: FxHashMap<String, u32>,
+    /// Whether this pass also records what MiniSearch-shaped rows need (the
+    /// `match` fields and `queryTerms` below). Off for the compact paths.
+    track_rows: bool,
+    /// Per doc, parallel to `terms`: the fields a derived term was found in by
+    /// the last spec that reached it, as `(spec index, field bit mask)`. JS
+    /// merges specs with `Object.assign(existing.match, match)`, so a later
+    /// spec's field list replaces an earlier one while the key keeps its place.
+    term_fields: Vec<Vec<(u32, u64)>>,
+    /// Per doc, the index in `terms` of `last_term`.
+    last_pos: Vec<u32>,
+    /// Per doc, the distinct query-term slots in first-match order: JS
+    /// `queryTerms`, built by `assignUniqueTerms` across the merged specs.
+    query_slots: Vec<Vec<u32>>,
 }
 
 impl Scratch {
     /// Grow to hold `len` docs and start a fresh query pass.
-    fn begin_query(&mut self, len: usize) {
+    fn begin_query(&mut self, len: usize, track_rows: bool) {
         if self.score.len() < len {
             self.score.resize(len, 0.0);
             self.spec_score.resize(len, 0.0);
@@ -411,6 +443,12 @@ impl Scratch {
             self.last_term.resize(len, u32::MAX);
             self.generation.resize(len, 0);
             self.spec_generation.resize(len, 0);
+        }
+        self.track_rows = track_rows;
+        if track_rows && self.term_fields.len() < len {
+            self.term_fields.resize_with(len, Vec::new);
+            self.last_pos.resize(len, 0);
+            self.query_slots.resize_with(len, Vec::new);
         }
         self.query_counter = self.query_counter.wrapping_add(1);
         if self.query_counter == 0 {
@@ -471,6 +509,10 @@ impl Scratch {
             self.term_mask[i] = 0;
             self.first_spec[i] = spec_index;
             self.last_term[i] = u32::MAX;
+            if self.track_rows {
+                self.term_fields[i].clear();
+                self.query_slots[i].clear();
+            }
             self.touched.push(doc);
         }
         if self.spec_generation[i] != self.spec_counter {
@@ -486,9 +528,42 @@ impl Scratch {
                 None => self.wide_terms.insert((doc, term_slot)),
             };
             self.term_count[i] += u32::from(first_match);
+            if first_match && self.track_rows {
+                self.query_slots[i].push(term_slot);
+            }
             self.spec_touched.push(doc);
         }
         i
+    }
+
+    /// Record that `term_id` matched doc slot `i` in `field_id` during spec
+    /// `spec_index`: the doc's derived-term list (first-match order, like the
+    /// keys of JS `match`) and, when tracking rows, that term's field set.
+    #[inline]
+    fn record_term(&mut self, i: usize, term_id: u32, spec_index: u32, field_id: FieldId) {
+        if self.last_term[i] != term_id {
+            self.last_term[i] = term_id;
+            let position = match self.terms[i].iter().position(|&id| id == term_id) {
+                Some(position) => position,
+                None => {
+                    self.terms[i].push(term_id);
+                    if self.track_rows {
+                        self.term_fields[i].push((spec_index, 0));
+                    }
+                    self.terms[i].len() - 1
+                }
+            };
+            if self.track_rows {
+                self.last_pos[i] = position as u32;
+            }
+        }
+        if self.track_rows {
+            let entry = &mut self.term_fields[i][self.last_pos[i] as usize];
+            if entry.0 != spec_index {
+                *entry = (spec_index, 0);
+            }
+            entry.1 |= 1u64 << field_id;
+        }
     }
 }
 
@@ -508,6 +583,26 @@ struct FusedHits<'a> {
     /// Whether any interned term is array-index-like; when false every
     /// `term_ids` call is a plain borrow.
     has_index_terms: bool,
+    /// Per doc, parallel to `terms` (see `Scratch::term_fields`); empty
+    /// unless the pass tracked rows.
+    term_fields: &'a [Vec<(u32, u64)>],
+    /// Per doc, distinct query-term slots in first-match order; empty unless
+    /// the pass tracked rows. Slots index [`term_slot_table`].
+    query_slots: &'a [Vec<u32>],
+    /// Interned derived term -> id in `table`.
+    lookup: &'a FxHashMap<String, u32>,
+}
+
+/// The distinct terms of `specs` in order of first appearance: the slot
+/// numbering [`MiniSearch::run_fused_query`] gives query terms.
+fn term_slot_table(specs: &[QuerySpec]) -> Vec<&str> {
+    let mut slots: Vec<&str> = Vec::new();
+    for spec in specs {
+        if !slots.contains(&spec.term.as_str()) {
+            slots.push(spec.term.as_str());
+        }
+    }
+    slots
 }
 
 impl FusedHits<'_> {
@@ -1125,7 +1220,10 @@ pub struct PackedSearchResults {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompatTransfer {
     pub ids: String,
+    /// Short ids of the hits, row by row.
+    pub doc_ids: Vec<u32>,
     pub scores: Vec<f64>,
+    /// The interned terms, as a JSON array of strings.
     pub table: String,
     pub term_ids: Vec<u32>,
     pub term_offsets: Vec<u32>,
@@ -1135,6 +1233,17 @@ pub struct CompatTransfer {
     pub field_offsets: Vec<u32>,
     pub field_names: String,
     pub stored: String,
+}
+
+/// What a transfer of full rows carries: the `match` fields, sorted rows
+/// (else JS `Map` order, which a `filter` callback observes), and each hit's
+/// external id and stored fields (for an index with its own ids; the facade
+/// keeps them itself and needs only short ids).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowShape {
+    pub include_match: bool,
+    pub sort: bool,
+    pub identity: bool,
 }
 
 fn intern_term<'a>(
@@ -1156,7 +1265,10 @@ fn intern_term<'a>(
 /// is newline-joined (terms space-joined within a row). Scores are one vector.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JoinedSearchResults {
+    /// The ids as a JSON array; empty for an externally identified index,
+    /// whose caller maps `doc_ids` itself.
     pub ids: String,
+    pub doc_ids: Vec<ShortId>,
     pub scores: Vec<f64>,
     pub terms: String,
 }
@@ -1336,8 +1448,78 @@ pub struct MiniSearch {
     id_table_version: u64,
 }
 
+/// A query's `boostDocument`, called once per posting list the query scores,
+/// in MiniSearch's order, with the derived term and the list's live documents
+/// in order (for a wildcard: `""` and every live document). It returns each
+/// document's boost, `None` skipping the posting as a falsy boost does
+/// upstream. Upstream calls the callback per posting, in the same sequence.
+pub type BoostDocument = Box<dyn FnMut(&str, &[ShortId]) -> Vec<Option<f64>>>;
+
+thread_local! {
+    static BOOST_DOCUMENT: RefCell<Option<BoostDocument>> = const { RefCell::new(None) };
+}
+
+/// The boosts of one posting list, consumed in the list's order.
+struct ListBoosts {
+    boosts: std::vec::IntoIter<Option<f64>>,
+}
+
+impl ListBoosts {
+    /// With a `boostDocument` running, the boosts of the postings of `list`
+    /// that `live` keeps.
+    fn of(term: Option<&str>, list: &Postings, live: impl Fn(ShortId) -> bool) -> Option<Self> {
+        let term = term?;
+        let docs: Vec<ShortId> = list
+            .iter()
+            .map(|(doc_id, _)| doc_id)
+            .filter(|&doc_id| live(doc_id))
+            .collect();
+        Some(Self {
+            boosts: document_boosts(term, &docs).into_iter(),
+        })
+    }
+
+    /// The next live posting's boost; `None` skips it.
+    fn next(&mut self) -> Option<f64> {
+        self.boosts.next().flatten()
+    }
+}
+
+/// Run `query` with `boost` as its `boostDocument`.
+pub fn with_boost_document<R>(boost: BoostDocument, query: impl FnOnce() -> R) -> R {
+    BOOST_DOCUMENT.with(|slot| *slot.borrow_mut() = Some(boost));
+    let result = query();
+    BOOST_DOCUMENT.with(|slot| *slot.borrow_mut() = None);
+    result
+}
+
+fn boosting() -> bool {
+    BOOST_DOCUMENT.with(|slot| slot.try_borrow().is_ok_and(|boost| boost.is_some()))
+}
+
+/// The active `boostDocument`'s boosts. The hook is out of its slot while it
+/// runs, so a query it starts (it calls into JavaScript) runs without it.
+fn document_boosts(term: &str, docs: &[ShortId]) -> Vec<Option<f64>> {
+    let Some(mut boost) = BOOST_DOCUMENT.with(|slot| slot.try_borrow_mut().ok()?.take()) else {
+        return vec![None; docs.len()];
+    };
+    let mut boosts = boost(term, docs);
+    boosts.resize(docs.len(), None);
+    BOOST_DOCUMENT.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = Some(boost);
+        }
+    });
+    boosts
+}
+
+/// Marks a query text whose terms were tokenized and processed by the caller
+/// (see [`MiniSearch::query_terms`]); it also separates them.
+pub const GIVEN_TERMS: char = '\u{0}';
+
 /// Binary snapshot format version. Bump when the layout in `to_bytes` changes.
-const SNAPSHOT_VERSION: u64 = 4;
+/// Version 4 is still read; JSON snapshots of versions 4 and 5 are the same.
+const SNAPSHOT_VERSION: u64 = 5;
 const DEFAULT_VACUUM_BATCH_SIZE: usize = 1000;
 const DEFAULT_VACUUM_BATCH_WAIT: u32 = 10;
 const DEFAULT_AUTO_VACUUM_MIN_DIRT_COUNT: usize = 20;
@@ -1421,9 +1603,11 @@ impl MiniSearch {
             else {
                 continue;
             };
-            let tokens = tokenize(tokenizer, &stringify_value(field_value));
-            let unique_terms = u32::try_from(tokens.iter().collect::<HashSet<_>>().len())
+            let text = stringify_value(field_value);
+            let tokens = tokenize(tokenizer, &text);
+            let unique_terms = u32::try_from(unique_count(&tokens))
                 .map_err(|_| "field has too many unique tokens")?;
+            let tokens = tokens.into_iter().map(str::to_owned).collect();
             field_tokens.push((self.field_ids[field], unique_terms, tokens));
         }
 
@@ -1485,13 +1669,14 @@ impl MiniSearch {
                 continue;
             };
 
-            let tokens = tokenize(self.options.tokenizer, &stringify_value(field_value));
+            let text = stringify_value(field_value);
+            let tokens = tokenize(self.options.tokenizer, &text);
             let field_id = self.field_ids[&field];
-            let unique_terms = tokens.iter().collect::<HashSet<_>>().len();
+            let unique_terms = unique_count(&tokens);
             self.remove_field_length(short_id, field_id, self.document_count, unique_terms);
 
             for token in tokens {
-                let term = process_term(self.options.tokenizer, &token);
+                let term = process_term(self.options.tokenizer, token);
                 if !term.is_empty() && !self.remove_term(field_id, short_id, &term) {
                     warnings.push(format!(
                         "MiniSearch: document with ID {} has changed before removal: term \"{term}\" was not present in field \"{field}\". Removing a document after it has changed can corrupt the index!",
@@ -1529,11 +1714,15 @@ impl MiniSearch {
         self.remove_all_with_warnings(documents, &mut Vec::new())
     }
 
+    /// `removeAll()`: an empty index. Like MiniSearch, it keeps the dirt count,
+    /// which the next vacuum clears.
     pub fn remove_all_documents(&mut self) {
         let options = self.options.clone();
         let version = self.id_table_version + 1;
+        let dirt_count = self.dirt_count;
         *self = Self::new(options);
         self.id_table_version = version;
+        self.dirt_count = dirt_count;
     }
 
     pub fn discard(&mut self, id: &Value) -> Result<(), String> {
@@ -1926,18 +2115,30 @@ impl MiniSearch {
         per_call: &PartialSearchOptions,
         include_match: bool,
     ) -> CompatTransfer {
-        self.search_query_transfer_ordered(query, per_call, include_match, true)
+        self.search_query_transfer_ordered(
+            query,
+            per_call,
+            RowShape {
+                include_match,
+                sort: true,
+                identity: true,
+            },
+        )
     }
 
     pub(crate) fn search_query_transfer_ordered(
         &self,
         query: &Query,
         per_call: &PartialSearchOptions,
-        include_match: bool,
-        sort_results: bool,
+        shape: RowShape,
     ) -> CompatTransfer {
+        if let Query::Text(text) = query {
+            if self.fused_rows_supported() {
+                return self.text_query_transfer(text, per_call, shape);
+            }
+        }
         let raw_results = self.execute_query_tree(query, per_call);
-        self.transfer_from_raw(raw_results, query, per_call, include_match, sort_results)
+        self.transfer_from_raw(raw_results, query, per_call, shape)
     }
 
     fn transfer_from_raw(
@@ -1945,17 +2146,18 @@ impl MiniSearch {
         raw_results: RawResult,
         query: &Query,
         per_call: &PartialSearchOptions,
-        include_match: bool,
-        sort_results: bool,
+        shape: RowShape,
     ) -> CompatTransfer {
         use std::fmt::Write;
 
-        let sort_by_score = sort_results && !matches!(query, Query::Wildcard);
+        let include_match = shape.include_match;
+        let sort_by_score = shape.sort && !matches!(query, Query::Wildcard);
         let filter = apply_partial_options(&self.options.search_options, per_call).filter;
         let ranked = self.ranked_raw_results(raw_results, sort_by_score, filter.as_ref());
 
         let mut transfer = CompatTransfer {
             ids: String::from("["),
+            doc_ids: Vec::with_capacity(ranked.len()),
             scores: Vec::with_capacity(ranked.len()),
             table: String::new(),
             term_ids: Vec::new(),
@@ -1972,16 +2174,19 @@ impl MiniSearch {
         let mut any_stored = false;
 
         for (index, (doc_id, score, raw)) in ranked.iter().enumerate() {
-            if index > 0 {
-                transfer.ids.push(',');
-                transfer.stored.push(',');
-            }
-            match self.document_ids.get(doc_id) {
-                Some(id) => {
-                    let _ = write!(transfer.ids, "{id}");
+            if shape.identity {
+                if index > 0 {
+                    transfer.ids.push(',');
+                    transfer.stored.push(',');
                 }
-                None => transfer.ids.push_str("null"),
+                match self.document_ids.get(doc_id) {
+                    Some(id) => {
+                        let _ = write!(transfer.ids, "{id}");
+                    }
+                    None => transfer.ids.push_str("null"),
+                }
             }
+            transfer.doc_ids.push(*doc_id);
             transfer.scores.push(*score);
             for (term, fields) in raw.matches.js_ordered() {
                 let term_id = intern_term(&mut interned, &mut table, term);
@@ -2003,7 +2208,7 @@ impl MiniSearch {
             transfer
                 .query_term_offsets
                 .push(transfer.query_term_ids.len() as u32);
-            match self.stored_fields.get(doc_id) {
+            match self.stored_fields.get(doc_id).filter(|_| shape.identity) {
                 Some(fields) if !fields.is_empty() => {
                     any_stored = true;
                     transfer
@@ -2015,10 +2220,146 @@ impl MiniSearch {
         }
         transfer.ids.push(']');
         transfer.stored.push(']');
-        if !any_stored {
+        if !any_stored || !shape.identity {
             transfer.stored.clear();
         }
-        transfer.table = table.join("\n");
+        transfer.table = serde_json::to_string(&table).unwrap_or_else(|_| "[]".into());
+        transfer
+    }
+
+    /// Whether a string query can take the fused full-row path: field sets are
+    /// tracked as a 64-bit mask per (document, term).
+    fn fused_rows_supported(&self) -> bool {
+        self.options.fields.len() <= 64
+    }
+
+    /// [`Self::search_query_transfer_ordered`] for a string query on the fused
+    /// dense path: the same rows, scores and order as the per-spec maps of
+    /// `execute_query`, without allocating a map entry, a term list and a
+    /// `match` object per (document, spec).
+    pub(crate) fn text_query_transfer(
+        &self,
+        text: &str,
+        per_call: &PartialSearchOptions,
+        shape: RowShape,
+    ) -> CompatTransfer {
+        let options = apply_partial_options(&self.options.search_options, per_call);
+        let specs = self.query_specs(text, &options);
+        let field_boosts = self.field_boosts(&options);
+        self.run_fused_query_with(&specs, &options, true, shape.sort, |fused| {
+            self.transfer_from_fused(&fused, &specs, &field_boosts, shape)
+        })
+    }
+
+    fn transfer_from_fused(
+        &self,
+        fused: &FusedHits<'_>,
+        specs: &[QuerySpec],
+        field_boosts: &[FieldBoost],
+        shape: RowShape,
+    ) -> CompatTransfer {
+        let include_match = shape.include_match;
+        use std::fmt::Write;
+
+        let hit_count = fused.hits.len();
+        let mut transfer = CompatTransfer {
+            ids: String::from("["),
+            doc_ids: Vec::with_capacity(hit_count),
+            scores: Vec::with_capacity(hit_count),
+            table: String::new(),
+            term_ids: Vec::new(),
+            term_offsets: Vec::with_capacity(hit_count + 1),
+            query_term_ids: Vec::new(),
+            query_term_offsets: Vec::with_capacity(hit_count + 1),
+            field_ids: Vec::new(),
+            field_offsets: vec![0],
+            field_names: self.options.fields.join("\n"),
+            stored: String::from("["),
+        };
+        transfer.term_offsets.push(0);
+        transfer.query_term_offsets.push(0);
+
+        // The output table is the fused table of derived terms, followed by
+        // any query term that matched no document exactly.
+        let mut table: Vec<&str> = fused.table.iter().map(String::as_str).collect();
+        let slot_ids: Vec<u32> = term_slot_table(specs)
+            .into_iter()
+            .map(|term| match fused.lookup.get(term) {
+                Some(&id) => id,
+                None => {
+                    table.push(term);
+                    table.len() as u32 - 1
+                }
+            })
+            .collect();
+
+        let mut any_stored = false;
+        for (index, &(doc_id, score)) in fused.hits.iter().enumerate() {
+            if shape.identity {
+                if index > 0 {
+                    transfer.ids.push(',');
+                    transfer.stored.push(',');
+                }
+                match self.document_ids.get(&doc_id) {
+                    Some(id) => {
+                        let _ = write!(transfer.ids, "{id}");
+                    }
+                    None => transfer.ids.push_str("null"),
+                }
+            }
+            transfer.doc_ids.push(doc_id);
+            transfer.scores.push(score);
+
+            let doc = doc_id as usize;
+            let first_match = &fused.terms[doc];
+            let order = fused.term_ids(doc_id);
+            let reordered = matches!(order, Cow::Owned(_));
+            for (k, &term_id) in order.iter().enumerate() {
+                transfer.term_ids.push(term_id);
+                if include_match {
+                    let position = if reordered {
+                        first_match
+                            .iter()
+                            .position(|&id| id == term_id)
+                            .unwrap_or(k)
+                    } else {
+                        k
+                    };
+                    let mask = fused.term_fields[doc][position].1;
+                    // JS pushes a term's fields in `Object.keys(boosts)` order.
+                    for field_boost in field_boosts {
+                        if mask & (1u64 << field_boost.field_id) != 0 {
+                            transfer.field_ids.push(field_boost.field_id as u32);
+                        }
+                    }
+                    transfer.field_offsets.push(transfer.field_ids.len() as u32);
+                }
+            }
+            transfer.term_offsets.push(transfer.term_ids.len() as u32);
+
+            for &slot in &fused.query_slots[doc] {
+                transfer.query_term_ids.push(slot_ids[slot as usize]);
+            }
+            transfer
+                .query_term_offsets
+                .push(transfer.query_term_ids.len() as u32);
+
+            match self.stored_fields.get(&doc_id).filter(|_| shape.identity) {
+                Some(fields) if !fields.is_empty() => {
+                    any_stored = true;
+                    transfer
+                        .stored
+                        .push_str(&serde_json::to_string(fields).unwrap_or_else(|_| "null".into()));
+                }
+                _ => transfer.stored.push_str("null"),
+            }
+        }
+        transfer.ids.push(']');
+        transfer.stored.push(']');
+        if !any_stored || !shape.identity {
+            transfer.stored.clear();
+        }
+        transfer.table = serde_json::to_string(&table).unwrap_or_else(|_| "[]".into());
         transfer
     }
 
@@ -2132,11 +2473,7 @@ impl MiniSearch {
 
         // Like `query_specs`, but with per-term prefix expansion: `None`
         // prefix-expands only the last term (the JS auto-suggest default).
-        let terms: Vec<String> = tokenize(self.options.tokenizer, query)
-            .into_iter()
-            .map(|term| process_term(self.options.tokenizer, &term))
-            .filter(|term| !term.is_empty())
-            .collect();
+        let terms = self.query_terms(query);
         let last_index = terms.len().saturating_sub(1);
         let specs: Vec<QuerySpec> = terms
             .into_iter()
@@ -2364,21 +2701,26 @@ impl MiniSearch {
         use std::fmt::Write;
 
         let specs = self.query_specs(query, options);
+        let external = self.is_externally_identified();
         self.run_fused_query(&specs, options, |fused| {
-            let mut ids = String::from("[");
+            let mut ids = String::new();
+            let mut doc_ids = Vec::with_capacity(fused.hits.len());
             let mut terms = String::new();
             let mut scores = Vec::with_capacity(fused.hits.len());
 
             for (index, &(doc_id, score)) in fused.hits.iter().enumerate() {
                 if index > 0 {
-                    ids.push(',');
                     terms.push('\n');
                 }
-                match self.document_ids.get(&doc_id) {
-                    Some(other) => {
-                        let _ = write!(ids, "{other}");
+                doc_ids.push(doc_id);
+                if !external {
+                    ids.push(if index > 0 { ',' } else { '[' });
+                    match self.document_ids.get(&doc_id) {
+                        Some(other) => {
+                            let _ = write!(ids, "{other}");
+                        }
+                        None => ids.push_str("null"),
                     }
-                    None => ids.push_str("null"),
                 }
                 for (term_index, &id) in fused.term_ids(doc_id).iter().enumerate() {
                     if term_index > 0 {
@@ -2389,8 +2731,15 @@ impl MiniSearch {
                 scores.push(score);
             }
 
-            ids.push(']');
-            JoinedSearchResults { ids, scores, terms }
+            if !external {
+                ids.push_str(if fused.hits.is_empty() { "[]" } else { "]" });
+            }
+            JoinedSearchResults {
+                ids,
+                doc_ids,
+                scores,
+                terms,
+            }
         })
     }
 
@@ -2436,6 +2785,20 @@ impl MiniSearch {
         options: &SearchOptions,
         finish: impl FnOnce(FusedHits<'_>) -> R,
     ) -> R {
+        self.run_fused_query_with(specs, options, false, true, finish)
+    }
+
+    /// [`Self::run_fused_query`], optionally recording what full rows need
+    /// (`track_rows`) and optionally leaving the hits in JS `Map` order, the
+    /// order a `filter` callback observes (`sort`).
+    fn run_fused_query_with<R>(
+        &self,
+        specs: &[QuerySpec],
+        options: &SearchOptions,
+        track_rows: bool,
+        sort: bool,
+        finish: impl FnOnce(FusedHits<'_>) -> R,
+    ) -> R {
         let field_boosts = self.field_boosts(options);
 
         SCRATCH.with(|cell| {
@@ -2444,7 +2807,7 @@ impl MiniSearch {
             // scratch instead of a borrow that is never released.
             let mut taken = cell.take();
             let scratch = &mut taken;
-            scratch.begin_query(self.next_id as usize);
+            scratch.begin_query(self.next_id as usize, track_rows);
 
             let mut term_slots: FxHashMap<&str, u32> = FxHashMap::default();
             for (spec_index, spec) in specs.iter().enumerate() {
@@ -2490,11 +2853,13 @@ impl MiniSearch {
                 hits.retain(|(doc_id, _)| self.matches_filter(*doc_id, filter));
             }
 
-            hits.sort_by(|(_, left_score), (_, right_score)| {
-                right_score
-                    .partial_cmp(left_score)
-                    .unwrap_or(Ordering::Equal)
-            });
+            if sort {
+                hits.sort_by(|(_, left_score), (_, right_score)| {
+                    right_score
+                        .partial_cmp(left_score)
+                        .unwrap_or(Ordering::Equal)
+                });
+            }
 
             let result = finish(FusedHits {
                 hits,
@@ -2502,6 +2867,17 @@ impl MiniSearch {
                 table: &scratch.table,
                 table_index: &scratch.table_index,
                 has_index_terms: scratch.table_index.iter().any(Option::is_some),
+                term_fields: if track_rows {
+                    &scratch.term_fields
+                } else {
+                    &[]
+                },
+                query_slots: if track_rows {
+                    &scratch.query_slots
+                } else {
+                    &[]
+                },
+                lookup: &scratch.lookup,
             });
             cell.replace(taken);
             result
@@ -2583,11 +2959,17 @@ impl MiniSearch {
         let mut doc_ids: Vec<ShortId> = self.document_ids.keys().copied().collect();
         doc_ids.sort_unstable();
         let mut results = RawResult::default();
+        // With `boostDocument`, the score is the boost, whatever it is.
+        let mut boosts = boosting().then(|| document_boosts("", &doc_ids).into_iter());
         for doc_id in doc_ids {
+            let score = match &mut boosts {
+                Some(boosts) => boosts.next().flatten().unwrap_or(0.0),
+                None => 1.0,
+            };
             results.insert(
                 doc_id,
                 RawResultValue {
-                    score: 1.0,
+                    score,
                     terms: Vec::new(),
                     matches: MatchInfo::default(),
                 },
@@ -2597,19 +2979,27 @@ impl MiniSearch {
     }
 
     /// The processed, non-empty terms of a query string, in query order.
+    /// The processed terms of a query text. A text that starts with
+    /// [`GIVEN_TERMS`] holds terms the caller tokenized and processed itself
+    /// (with JavaScript callbacks), separated by that character.
     pub fn query_terms(&self, query: &str) -> Vec<String> {
+        if let Some(terms) = query.strip_prefix(GIVEN_TERMS) {
+            return terms
+                .split(GIVEN_TERMS)
+                .filter(|term| !term.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
         tokenize(self.options.tokenizer, query)
             .into_iter()
-            .map(|term| process_term(self.options.tokenizer, &term))
+            .map(|term| process_term(self.options.tokenizer, term).into_owned())
             .filter(|term| !term.is_empty())
             .collect()
     }
 
     fn query_specs(&self, query: &str, options: &SearchOptions) -> Vec<QuerySpec> {
-        tokenize(self.options.tokenizer, query)
+        self.query_terms(query)
             .into_iter()
-            .map(|term| process_term(self.options.tokenizer, &term))
-            .filter(|term| !term.is_empty())
             .enumerate()
             .map(|(index, term)| QuerySpec {
                 term,
@@ -2803,6 +3193,7 @@ impl MiniSearch {
         // per-posting liveness check is pure overhead we can skip.
         let clean = self.dirt_count == 0;
         let num_fields = self.options.fields.len();
+        let boosted_term = boosting().then_some(derived_term);
 
         for field_boost in field_boosts {
             let field_id = field_boost.field_id;
@@ -2824,12 +3215,23 @@ impl MiniSearch {
             // Hoist it out of the per-posting loop instead of recomputing it for
             // every document. Bit-identical to the inlined form.
             let idf = bm25_idf(matching_fields as f64, self.document_count as f64);
+            let mut boosts = ListBoosts::of(boosted_term, field_term_freqs, |doc_id| {
+                clean || self.alive[doc_id as usize]
+            });
 
             for (doc_id, term_freq) in field_term_freqs.iter() {
                 if !clean && !self.alive[doc_id as usize] {
                     self.stale_hit.0.set(true);
                     continue;
                 }
+                // Upstream asks for the boost before anything else.
+                let doc_boost = match &mut boosts {
+                    Some(boosts) => match boosts.next() {
+                        Some(boost) => boost,
+                        None => continue,
+                    },
+                    None => 1.0,
+                };
 
                 let field_length = self
                     .field_length
@@ -2848,7 +3250,9 @@ impl MiniSearch {
                         avg_field_length,
                         bm25_params,
                     );
-                let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
+                // Upstream's product, in its order; a boost of 1 is exact.
+                let weighted_score =
+                    term_weight * term_boost * field_boost.boost * doc_boost * raw_score;
                 let result = results.entry_or_insert_with(doc_id, || RawResultValue {
                     score: 0.0,
                     terms: Vec::new(),
@@ -2887,6 +3291,7 @@ impl MiniSearch {
         // per-posting liveness check is pure overhead we can skip.
         let clean = self.dirt_count == 0;
         let num_fields = self.options.fields.len();
+        let boosted_term = boosting().then(|| scratch.table[term_id as usize].clone());
 
         for field_boost in field_boosts {
             let field_id = field_boost.field_id;
@@ -2908,12 +3313,23 @@ impl MiniSearch {
             // Hoist it out of the per-posting loop instead of recomputing it for
             // every document. Bit-identical to the inlined form.
             let idf = bm25_idf(matching_fields as f64, self.document_count as f64);
+            let mut boosts = ListBoosts::of(boosted_term.as_deref(), field_term_freqs, |doc_id| {
+                clean || self.alive[doc_id as usize]
+            });
 
             for (doc_id, term_freq) in field_term_freqs.iter() {
                 if !clean && !self.alive[doc_id as usize] {
                     self.stale_hit.0.set(true);
                     continue;
                 }
+                // Upstream asks for the boost before anything else.
+                let doc_boost = match &mut boosts {
+                    Some(boosts) => match boosts.next() {
+                        Some(boost) => boost,
+                        None => continue,
+                    },
+                    None => 1.0,
+                };
 
                 let field_length = self
                     .field_length
@@ -2932,16 +3348,13 @@ impl MiniSearch {
                         avg_field_length,
                         bm25_params,
                     );
-                let weighted_score = term_weight * term_boost * field_boost.boost * raw_score;
+                // Upstream's product, in its order; a boost of 1 is exact.
+                let weighted_score =
+                    term_weight * term_boost * field_boost.boost * doc_boost * raw_score;
 
                 let i = scratch.touch(doc_id, spec_index, term_slot);
                 scratch.spec_score[i] += weighted_score;
-                if scratch.last_term[i] != term_id {
-                    scratch.last_term[i] = term_id;
-                    if !scratch.terms[i].contains(&term_id) {
-                        scratch.terms[i].push(term_id);
-                    }
-                }
+                scratch.record_term(i, term_id, spec_index, field_id);
             }
         }
     }
@@ -3023,11 +3436,18 @@ impl MiniSearch {
     }
 
     fn field_boosts(&self, options: &SearchOptions) -> Vec<FieldBoost> {
-        options
-            .fields
-            .as_ref()
-            .unwrap_or(&self.options.fields)
-            .iter()
+        let fields = options.fields.as_ref().unwrap_or(&self.options.fields);
+        // MiniSearch reduces the fields to an object, `{ [field]: boost }`, and
+        // scores its keys: each field once, array-index-like names first.
+        let mut names: Vec<&String> = Vec::with_capacity(fields.len());
+        for field in fields {
+            if !names.contains(&field) {
+                names.push(field);
+            }
+        }
+        names.sort_by_key(|name| js_key_rank(name));
+        names
+            .into_iter()
             .filter_map(|field| {
                 self.field_ids.get(field).map(|field_id| FieldBoost {
                     field_id: *field_id,
@@ -3390,38 +3810,51 @@ fn assign_unique_many(target: &mut Vec<String>, source: &[String]) {
     }
 }
 
-fn tokenize(tokenizer: TokenizerMode, text: &str) -> Vec<String> {
+fn tokenize(tokenizer: TokenizerMode, text: &str) -> Vec<&str> {
     let separator = match tokenizer {
         TokenizerMode::Default => is_space_or_punctuation,
         TokenizerMode::Jobboard => is_jobboard_separator,
     };
 
-    let mut tokens: Vec<String> = text
-        .split(separator)
-        .filter(|term| !term.is_empty())
-        .map(str::to_owned)
-        .collect();
-    if tokenizer == TokenizerMode::Default {
+    let leading = tokenizer == TokenizerMode::Default
+        && (text.is_empty() || text.chars().next().is_some_and(separator));
+    let mut tokens: Vec<&str> = Vec::new();
+    if leading {
         // JS splits on a *run* of separators. Interior empties disappear,
         // but the boundary empty token participates in field-length counting.
-        if text.is_empty() {
-            tokens.push(String::new());
-        } else {
-            if text.chars().next().is_some_and(separator) {
-                tokens.insert(0, String::new());
-            }
-            if text.chars().next_back().is_some_and(separator) {
-                tokens.push(String::new());
-            }
-        }
+        tokens.push("");
+    }
+    tokens.extend(text.split(separator).filter(|term| !term.is_empty()));
+    if tokenizer == TokenizerMode::Default
+        && !text.is_empty()
+        && text.chars().next_back().is_some_and(separator)
+    {
+        tokens.push("");
     }
     tokens
 }
 
-fn process_term(tokenizer: TokenizerMode, term: &str) -> String {
+/// How many distinct tokens a field has: MiniSearch's field length.
+fn unique_count(tokens: &[&str]) -> usize {
+    tokens.iter().collect::<FxHashSet<_>>().len()
+}
+
+fn process_term(tokenizer: TokenizerMode, term: &str) -> Cow<'_, str> {
+    // Most tokens are lowercase ASCII already: nothing to allocate.
+    let lower = if term
+        .bytes()
+        .all(|byte| byte.is_ascii() && !byte.is_ascii_uppercase())
+    {
+        Cow::Borrowed(term)
+    } else {
+        Cow::Owned(term.to_lowercase())
+    };
     match tokenizer {
-        TokenizerMode::Default => term.to_lowercase(),
-        TokenizerMode::Jobboard => term.to_lowercase().trim_end_matches('.').to_owned(),
+        TokenizerMode::Default => lower,
+        TokenizerMode::Jobboard => match lower {
+            Cow::Borrowed(term) => Cow::Borrowed(term.trim_end_matches('.')),
+            Cow::Owned(term) => Cow::Owned(term.trim_end_matches('.').to_owned()),
+        },
     }
 }
 
