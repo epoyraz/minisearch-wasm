@@ -1,0 +1,36 @@
+README.md
+  s_298311d2958204::t_f02deb8e3f153d 406-411
+  s_298311d2958204::t_26c08016fc5d5f 4-10,13-15,25-26,44-60,225-227,242,246-252,254-262,377-383,389-393,395-398,532,543
+  s_298311d2958204::t_4b9664514c63bb 65-73,75-104,253
+PORTING.md
+  s_298311d2958204::t_d57d6a8ab9eae8 5,11-66
+RELEASE_NOTES.md
+  s_298311d2958204::t_0a424afcbcd16e 19-22
+  s_298311d2958204::t_c49f0eccc25693 1,3-5,9-18,23-29,33-37,39-43,45-47,51-57,59
+differential/results/2026-09-27-0.12.0-vs-original.md
+  s_298311d2958204::t_ab29e6d8fedbbc 1-61
+COMPATIBILITY.md
+  s_298311d2958204::t_273e53a6bf9b3d 3-9,19,24-27,29-33,45-58,83-85,146-154,183-184,197-201
+CHANGELOG.md
+  s_298311d2958204::t_0a424afcbcd16e 29,34,36-37,39-42,52-55,58-60
+  s_298311d2958204::t_89cab1df4038b9 7-28,30-33,35,38,43-51,56-57,61-81
+TODO.md
+  s_298311d2958204::t_984e5aea71fa75 5-6,8,10,32-34,67-69,71-73,79
+  s_298311d2958204::t_809546e33919f2 7,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5cceda0a6bbf487bbc610e91474d380072aaf287",
+  "prompts": {},
+  "sessions": {
+    "s_298311d2958204": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c5a8b43-dec2-4ca9-9c9d-3c085b589fb9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
