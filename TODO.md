@@ -2,11 +2,11 @@
 
 What is left after the third review. Item numbers refer to [IMPROVEMENTS-3.md](IMPROVEMENTS-3.md), whose status notes say what was done for each item; [CHANGELOG.md](CHANGELOG.md) lists the changes.
 
-## State (27 September 2026): 0.12.0 on branch `next`
+## State (27 September 2026): 0.12.0 released
 
-0.12.0 is published (npm `latest`, shasum `ebd3adc5`, the tarball `npm test` passed on). Its work is committed on branch `next` and pushed to `origin/next`; it is not merged into `main` or tagged yet: ids and stored fields on the JavaScript side, `tokenize`/`processTerm` and `boostDocument` in Wasm, faster `search()`/`addAll`/`loadJSON`, snapshot version 5, `toJSON()` byte-identical to MiniSearch's, the `core-api` build split. [CHANGELOG.md](CHANGELOG.md) has the list, [PORTING.md](PORTING.md) the design, [differential/results/2026-09-27-0.12.0-vs-original.md](differential/results/2026-09-27-0.12.0-vs-original.md) the benchmark. `npm run build` now builds `pkg/` and the engine test package `target/pkg-core`; `npm test` passed on Windows (Node 24.21, Rust 1.96.0, wasm-pack 0.15.0).
+0.12.0 is published (npm `latest`, shasum `ebd3adc5`, the tarball `npm test` passed on), merged into `main` and tagged `v0.12.0`: ids and stored fields on the JavaScript side, `tokenize`/`processTerm` and `boostDocument` in Wasm, faster `search()`/`addAll`/`loadJSON`, snapshot version 5, `toJSON()` byte-identical to MiniSearch's, the `core-api` build split. [CHANGELOG.md](CHANGELOG.md) has the list, [PORTING.md](PORTING.md) the design, [differential/results/2026-09-27-0.12.0-vs-original.md](differential/results/2026-09-27-0.12.0-vs-original.md) the benchmark. `npm run build` now builds `pkg/` and the engine test package `target/pkg-core`; `npm test` passed on Windows (Node 24.21, Rust 1.96.0, wasm-pack 0.15.0).
 
-Still to do: merge `next` into `main` and tag `v0.12.0` (the release notes link to files by that tag). Publishing needs the maintainer's second factor: `npm publish ./pkg` from Claude Code stops with EOTP and a browser URL, and completes once that URL is approved. Snapshots written by 0.12.0 cannot be read by 0.11.0: consumers that ship prebuilt snapshots (jobboard-web) rebuild them with 0.12.0.
+Publishing needs the maintainer's second factor: `npm publish ./pkg` from Claude Code stops with EOTP and a browser URL, and completes once that URL is approved. Snapshots written by 0.12.0 cannot be read by 0.11.0: consumers that ship prebuilt snapshots (jobboard-web) rebuild them with 0.12.0.
 
 ## State (19 September 2026)
 
